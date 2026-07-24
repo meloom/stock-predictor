@@ -123,7 +123,7 @@ money at every threshold when run in the real pipeline.
 | | |
 |---|---|
 | **Input** | S2 feature matrix |
-| **Output** | Market regime score → CASH / trade decision; per-ticker score + confidence tier (HIGH/MID/LOW/NO_TRADE); event-risk level (LOW/MED/HIGH) |
+| **Output** | Market regime score → CASH / trade decision; per-ticker score + confidence tier (HIGH/MID/LOW/NO_TRADE); event-risk level (LOW/MED/HIGH). **Every output record carries a data-lineage stamp** (timestamp of the S1 snapshot it was computed from) so S8 can distinguish model error from stale-input error |
 | **Metrics** | **Regime gate**: % of gated (cash) days where universe median return was negative (gate precision); opportunity cost of gated days · **Scorer (the gate to go live, per §5)**: Spearman IC vs. excess returns on purged OOS ≥ 0.03 sustained; top-vs-bottom decile spread > 0 with p < 0.05 on **non-overlapping** windows; hit rate vs. 50% null · **Event veto**: % of vetoed names with realized |move| > 2× universe median on event day |
 | **Hard rules** | Scorer is **disabled for live sizing** until §5 passes — currently informational-only in reports, labeled with its measured (lack of) skill. Deterministic facts (days-to-earnings) and LLM classifications must agree before either triggers real-money action alone. |
 
@@ -167,10 +167,10 @@ money at every threshold when run in the real pipeline.
 
 | | |
 |---|---|
-| **Input** | Trade logs, IBKR fills (ground truth), full-universe prediction records, missed-opportunity scans |
-| **Output** | Nightly retrospective (root cause → ≤1 fix proposal → backtest → gated deploy or DEFER); refreshed rank calibration (monthly); prediction-quality time series |
-| **Metrics** | **Daily IC**: Spearman(prediction, realized excess return) across the full universe — not just held names · Realized-vs-backtest gap per deployed change · Fix survival rate (proposed → validated → still-positive after 30 live days) |
-| **Hard rules** | A fix with no historical data to test against isn't general enough — reformulate into a mechanically testable rule, up to 3 iterations; if none beat baseline, **DEFER is a valid outcome**. Never re-validate a fix on the same trades used to derive it. Same-day anecdote replay is not a backtest. |
+| **Input** | Trade logs, IBKR fills (ground truth), full-universe prediction records **with per-prediction data-lineage stamps**, S1 ingestion logs (fetch timestamps, coverage), S4 sizing logs (target vs. realized dollars), S5 execution logs (orders, fills, rejections), missed-opportunity scans |
+| **Output** | Nightly retrospective (root cause → ≤1 fix proposal → backtest → gated deploy or DEFER); **nightly cross-stage audit report** (data-freshness lineage, sizing fidelity, execution quality — see below); refreshed rank calibration (monthly); prediction-quality time series |
+| **Metrics** | **Daily IC**: Spearman(prediction, realized excess return) across the full universe — not just held names · Realized-vs-backtest gap per deployed change · Fix survival rate (proposed → validated → still-positive after 30 live days) · **Stale-input prediction rate**: % of the day's predictions whose lineage stamp shows input data older than the trading session (target 0; every stale prediction excluded from IC scoring and flagged) · **Sizing fidelity aggregate**: distribution of S4 allocation deviation across the day's orders (flag any position that breached tolerance or inverted the intended weight ordering) · **Execution quality aggregate**: fill rate, slippage vs. limit, rejections, reconciliation mismatches — from logs vs. IBKR fills, not from in-memory state |
+| **Hard rules** | **Every prediction record must stamp the timestamp of the data snapshot it used — no lineage, no evaluation** (predictions made on placeholder/stale inputs are a data-pipeline defect, not model error, and must be attributed as such; the predecessor ran 22 consecutive regime cycles on a pre-market placeholder value with nothing detecting it). The nightly audit closes the loop on S1/S4/S5, not just S3 — a correct prediction sized wrongly or filled badly is still a system failure and must land in the retrospective with the right stage attribution. A fix with no historical data to test against isn't general enough — reformulate into a mechanically testable rule, up to 3 iterations; if none beat baseline, **DEFER is a valid outcome**. Never re-validate a fix on the same trades used to derive it. Same-day anecdote replay is not a backtest. |
 
 ---
 
