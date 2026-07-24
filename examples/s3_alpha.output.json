@@ -9,23 +9,23 @@
       "vix": 0.7613,
       "spy_trend": 0.258
     },
-    "inputs_max_ingested_at": "2026-07-24T21:42:10.184612+00:00"
+    "inputs_max_ingested_at": "<ingested_at>"
   },
   "event_risk": {
     "INTC": {
       "level": "LOW",
       "days_to_earnings": 90,
-      "inputs_max_ingested_at": "2026-07-24T21:42:10.178538+00:00"
+      "inputs_max_ingested_at": "<ingested_at>"
     },
     "MRVL": {
       "level": "LOW",
       "days_to_earnings": 34,
-      "inputs_max_ingested_at": "2026-07-24T21:42:10.179194+00:00"
+      "inputs_max_ingested_at": "<ingested_at>"
     },
     "TSLA": {
       "level": "LOW",
       "days_to_earnings": 89,
-      "inputs_max_ingested_at": "2026-07-24T21:42:10.179773+00:00"
+      "inputs_max_ingested_at": "<ingested_at>"
     }
   },
   "scorer_status": "DISABLED"

@@ -42,15 +42,28 @@ INPUT = {
 # ── run REAL S3 ────────────────────────────────────────────────────────────
 metrics = run_alpha(UNIVERSE, event_date, store=store)
 
+
+def _stable(obj):
+    """Replace wall-clock ingested_at stamps with a placeholder so the saved
+    snapshot only changes when real content changes — not on every re-run.
+    The stamps are real in the live store; they're just noise in a committed
+    example."""
+    if isinstance(obj, dict):
+        return {k: ("<ingested_at>" if k.endswith("ingested_at") and v else _stable(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stable(x) for x in obj]
+    return obj
+
 # ── OUTPUT snapshot: the real decision ────────────────────────────────────
 regime = store.read_asof("alpha.regime", MARKET_SCOPE, event_date)["value"]
-OUTPUT = {
+OUTPUT = _stable({
     "event_date": event_date,
     "regime": regime,
     "event_risk": {t: store.read_asof("alpha.event_risk", t, event_date)["value"]
                    for t in UNIVERSE},
     "scorer_status": score_stocks()["status"],
-}
+})
 (HERE / "s3_alpha.output.json").write_text(json.dumps(OUTPUT, indent=2))
 
 print(f"as_of {event_date}: regime {regime['decision']} (score {regime['score']}), "

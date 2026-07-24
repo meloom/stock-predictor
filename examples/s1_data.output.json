@@ -24,21 +24,21 @@
   "price_current_vs_close": {
     "INTC": {
       "current": {
-        "price": 92.05,
+        "price": 92.0774,
         "session": "post"
       },
       "close": 92.31999969482422
     },
     "MRVL": {
       "current": {
-        "price": 193.19,
+        "price": 193.01,
         "session": "post"
       },
       "close": 194.22999572753906
     },
     "TSLA": {
       "current": {
-        "price": 312.79,
+        "price": 312.5,
         "session": "post"
       },
       "close": 313.0299987792969

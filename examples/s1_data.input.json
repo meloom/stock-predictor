@@ -163,15 +163,15 @@
   },
   "live_current_quotes": {
     "INTC": {
-      "price": 92.05,
+      "price": 92.0774,
       "session": "post"
     },
     "MRVL": {
-      "price": 193.19,
+      "price": 193.01,
       "session": "post"
     },
     "TSLA": {
-      "price": 312.79,
+      "price": 312.5,
       "session": "post"
     }
   },
