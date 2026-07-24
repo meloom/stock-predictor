@@ -11,14 +11,14 @@ credentials*
 *.key
 
 # ── Market data & account artifacts (private: contains real account/trade history) ──
-data/
-results/
-trades/
-logs/
+/data/
+/results/
+/trades/
+/logs/
 *.log
 
 # ── Trained model binaries (rebuild from source; large + not reviewable) ──
-models/
+/models/
 *.pkl
 *.joblib
 catboost_info/
@@ -37,4 +37,4 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
-runtime/
+/runtime/
