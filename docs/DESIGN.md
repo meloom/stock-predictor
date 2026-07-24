@@ -190,8 +190,50 @@ money at every threshold when run in the real pipeline.
 |---|---|
 | **Input** | Trade logs, IBKR fills (ground truth), full-universe prediction records **with per-prediction data-lineage stamps**, S1 ingestion logs (fetch timestamps, coverage), S4 sizing logs (target vs. realized dollars), S5 execution logs (orders, fills, rejections), missed-opportunity scans |
 | **Output** | Nightly retrospective (root cause → ≤1 fix proposal → backtest → gated deploy or DEFER); **nightly cross-stage audit report** (data-freshness lineage, sizing fidelity, execution quality — see below); refreshed rank calibration (monthly); prediction-quality time series |
-| **Metrics** | **Daily IC**: Spearman(prediction, realized excess return) across the full universe — not just held names · Realized-vs-backtest gap per deployed change · Fix survival rate (proposed → validated → still-positive after 30 live days) · **Stale-input prediction rate**: % of the day's predictions whose lineage stamp shows input data older than the trading session (target 0; every stale prediction excluded from IC scoring and flagged) · **Sizing fidelity aggregate**: distribution of S4 allocation deviation across the day's orders (flag any position that breached tolerance or inverted the intended weight ordering) · **Execution quality aggregate**: fill rate, slippage vs. limit, rejections, reconciliation mismatches — from logs vs. IBKR fills, not from in-memory state |
+| **Metrics** | **Daily IC**: Spearman(prediction, realized excess return) across the full universe — not just held names · Realized-vs-backtest gap per deployed change · Fix survival rate (proposed → validated → still-positive after 30 live days) · **Stale-input prediction rate**: % of the day's predictions whose lineage stamp shows input data older than the trading session (target 0; every stale prediction excluded from IC scoring and flagged) · **Sizing fidelity aggregate**: distribution of S4 allocation deviation across the day's orders (flag any position that breached tolerance or inverted the intended weight ordering) · **Execution quality aggregate**: fill rate, slippage vs. limit, rejections, reconciliation mismatches — from logs vs. IBKR fills, not from in-memory state · **Cost-per-trigger regressions** from the cost ledger (see cross-cutting metric): flag any trigger type > 2× its trailing-median cost |
 | **Hard rules** | **Every prediction record must stamp the timestamp of the data snapshot it used — no lineage, no evaluation** (predictions made on placeholder/stale inputs are a data-pipeline defect, not model error, and must be attributed as such; the predecessor ran 22 consecutive regime cycles on a pre-market placeholder value with nothing detecting it). The nightly audit closes the loop on S1/S4/S5, not just S3 — a correct prediction sized wrongly or filled badly is still a system failure and must land in the retrospective with the right stage attribution. A fix with no historical data to test against isn't general enough — reformulate into a mechanically testable rule, up to 3 iterations; if none beat baseline, **DEFER is a valid outcome**. Never re-validate a fix on the same trades used to derive it. Same-day anecdote replay is not a backtest. |
+
+---
+
+### Cross-cutting metric (all stages): cost per trigger
+
+Every pipeline invocation starts from a **trigger** — a cron entry firing, a
+15-min review cycle, a morning-report run, a nightly retrospective, a manual
+invocation. The metric is the **fully-loaded cost attributed to that trigger**,
+counting every billable action it transitively initiates:
+
+- **Trace ID propagation**: each trigger mints a `trigger_id`; every spawned
+  action (LLM API call, web search, data fetch, broker order) carries it. If
+  one trigger initiates two LLM calls inside earnings extraction, both calls'
+  token costs land on that trigger — no orphan spend.
+- **Cost ledger**: one append-only record per billable action:
+  `{trigger_id, trigger_type, stage, provider, tokens_in, tokens_out,
+  web_searches, unit_cost, commission, timestamp}`. Broker commissions
+  attribute to the execution trigger that placed the order, so fee drag and
+  API spend are readable in the same ledger.
+- **Reported metrics**: cost per trigger instance · cost per trigger *type*
+  per day (the actionable series) · cost per stage per day · day-over-day
+  regression alert when a trigger type's cost jumps > 2× its trailing median.
+
+Why this is a first-class metric and not an afterthought — all three of these
+burned real money in the predecessor and were only found by manually reading a
+billing dashboard after the fact:
+
+1. A morning-report script ran its full compute twice per trigger (compute
+   pass + render pass), silently doubling ~25 grounded LLM calls to ~50 every
+   day. Cost-per-trigger would have shown the report trigger at 2× its
+   expected cost from day one.
+2. A health check invoked a full LLM CLI call every 15 minutes — 52 calls/day
+   from a trigger whose job was a boolean auth probe.
+3. A cost-*saving* gate then over-corrected and silently skipped
+   decision-relevant earnings checks on no-trade days. Per-trigger cost
+   visibility is what allows cutting real waste **without** blind gating that
+   drops information — you cut the duplicated calls, not the informative ones.
+
+S8's nightly audit consumes this ledger: cost-per-trigger-type regressions are
+surfaced next to prediction quality and execution quality, and any proposed
+"optimization" must show which trigger's cost it reduces and prove it drops no
+decision-relevant output.
 
 ---
 
