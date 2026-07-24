@@ -146,9 +146,9 @@ done, regardless of whether its happy path works:
 | | |
 |---|---|
 | **Input** | Ticker universe (~140–150 names, price ≥ $25); yfinance OHLCV (daily + 5-min); macro series (VIX, 10Y, curve, DXY, Fed rate, FOMC calendar); earnings calendar (yfinance `earnings_dates`, requires `lxml` — silently degrades without it); grounded LLM extraction of the most recent earnings report per ticker (Claude API + real web search) |
-| **Output** | (1) Immutable raw source data (OHLCV bars, macro series, raw LLM responses) retained for reproducibility; (2) **features registered in the feature store** (contract below) — everything downstream-consumable is a store feature, no bespoke side-channel artifacts. Namespaced registry, e.g. `price.*` (close, volume, intraday bars), `macro.*` (vix, yield10y, curve, …), `calendar.days_to_earnings`, `fundamental.*` (guidance_direction, capex_trend, capex_framing, adj_eps_surprise_pct, revenue_surprise_pct, net_signal, confidence) |
+| **Output** | (1) Immutable raw source data (OHLCV bars, macro series, raw LLM responses) retained for reproducibility; (2) **features registered in the feature store** (contract below) — everything downstream-consumable is a store feature, no bespoke side-channel artifacts. Namespaced registry, e.g. `price.*` (**`price.current`** = live session-aware quote {price, session: pre/regular/post/closed} — THE price for display/sizing/decisions; plus `price.close`, `price.volume` for history/indicators), `macro.*` (vix, yield10y, curve, …), `calendar.days_to_earnings`, `fundamental.*` (guidance_direction, capex_trend, capex_framing, adj_eps_surprise_pct, revenue_surprise_pct, net_signal, confidence) |
 | **Metrics** | Data freshness (hours since last bar; alert > 24h on a trading day) · Coverage (tickers with today's data / universe; alert < 95%) · Registry conformance: % of downstream reads served from registered features (target 100%; any bespoke-artifact read is a defect) · Earnings-signal grounding rate (% of calls returning `has_recent_report` with cited evidence vs. errors) · LLM call budget (calls/day; cap and monitor — a duplicated compute path once silently doubled daily spend) |
-| **Hard rules** | LLM extraction must be **grounded** (real search results) — an ungrounded classifier flip-flopped HIGH/LOW on a stable non-event and caused real whipsaw trades. Fails closed (`insufficient_data`), never guesses. Extended-hours prices come from fields that actually carry them — `fast_info.lastPrice` does not (stale-close bug, caught live). |
+| **Hard rules** | LLM extraction must be **grounded** (real search results) — an ungrounded classifier flip-flopped HIGH/LOW on a stable non-event and caused real whipsaw trades. Fails closed (`insufficient_data`), never guesses. **Current price is always the live, session-aware quote** (`price.current`, picked by `marketState` from pre/regular/post fields) — never `price.close` (the prior bar). `fast_info.lastPrice` does NOT carry extended-hours data and returns a stale close (INTC $100.23-vs-$103 bug); use `.info` pre/postMarketPrice. This is wired into ingestion, not just defined. |
 
 #### Feature store contract (consumed by S2–S8)
 
@@ -196,6 +196,10 @@ done, regardless of whether its happy path works:
   `calendar.days_to_earnings`, `fundamental.earnings_signal`) with per-feature
   point-in-time rules. This file IS the ingestion contract — the store rejects
   anything not declared here.
+- `price.current`: session-aware live quote wired into the ingestion loop
+  (not merely defined — it was defined-but-unwired once, reproducing the
+  stale-close bug). Metrics report `current_prices_ok` and a per-session
+  breakdown; the S1 example prints current-vs-close side by side.
 - `src/s1_data.py` (fetchers section): the only network I/O in the data layer (plus the LLM
   call in the earnings-extraction section); everything else takes fetchers as injected
   callables so tests run offline. Unknown values return `None`, never sentinel

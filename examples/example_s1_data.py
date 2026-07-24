@@ -14,7 +14,7 @@ sys.path.insert(0, str(HERE.parent / "src"))
 
 from core import FeatureStore, MARKET_SCOPE
 from s1_data import (run_daily_ingestion, fetch_daily_bars, fetch_macro,
-                     fetch_days_to_earnings)
+                     fetch_days_to_earnings, fetch_current_quote)
 
 UNIVERSE = ["INTC", "MRVL", "TSLA"]
 
@@ -22,6 +22,7 @@ UNIVERSE = ["INTC", "MRVL", "TSLA"]
 real_bars = fetch_daily_bars(UNIVERSE, period="90d")
 real_macro = fetch_macro(period="90d")
 real_dte = {t: fetch_days_to_earnings(t) for t in UNIVERSE}
+real_quotes = {t: fetch_current_quote(t) for t in UNIVERSE}   # LIVE, session-aware
 
 INPUT = {
     "note": "REAL yfinance data, snapshot. Bars/macro trimmed to last 5 rows "
@@ -30,6 +31,7 @@ INPUT = {
     "bars_tail": {t: rows[-5:] for t, rows in real_bars.items()},
     "macro_tail": {k: s[-5:] for k, s in real_macro.items()},
     "days_to_earnings": real_dte,
+    "live_current_quotes": real_quotes,   # the real current price + session
 }
 (HERE / "s1_data.input.json").write_text(json.dumps(INPUT, indent=2))
 
@@ -38,7 +40,8 @@ store = FeatureStore(Path(tempfile.mkdtemp()) / "example.db")
 metrics = run_daily_ingestion(
     UNIVERSE, store=store,
     fetch_bars=lambda t: real_bars, fetch_macro=lambda: real_macro,
-    fetch_dte=lambda t, asof=None: real_dte.get(t))
+    fetch_dte=lambda t, asof=None: real_dte.get(t),
+    fetch_quote=lambda t: real_quotes.get(t))
 
 # latest date actually present, to read back the freshest stored values
 latest = max(r["date"] for rows in real_bars.values() for r in rows)
@@ -50,9 +53,14 @@ def latest_val(feature, scope):
 OUTPUT = {
     "as_of_date": latest,
     "run_metrics": {k: v for k, v in metrics.items() if k != "trigger_id"},
+    # side-by-side so the difference is unmistakable: current (live, session-
+    # aware) vs. close (the prior bar). Current is THE price for decisions.
+    "price_current_vs_close": {
+        t: {"current": latest_val("price.current", t),
+            "close": latest_val("price.close", t)}
+        for t in UNIVERSE
+    },
     "latest_stored_values": {
-        f"price.close {t}": latest_val("price.close", t) for t in UNIVERSE
-    } | {
         "macro.vix": latest_val("macro.vix", MARKET_SCOPE),
         "macro.spy_close": latest_val("macro.spy_close", MARKET_SCOPE),
         **{f"days_to_earnings {t}": latest_val("calendar.days_to_earnings", t)
@@ -63,5 +71,8 @@ OUTPUT = {
 (HERE / "s1_data.output.json").write_text(json.dumps(OUTPUT, indent=2))
 
 print(f"as_of {latest}: coverage {metrics['coverage_pct']}%, "
-      f"{store.outputs_of(metrics['trigger_id'])['total_values']} real values stored")
+      f"current-price sessions {metrics['current_price_sessions']}")
+for t in UNIVERSE:
+    cur, close = latest_val("price.current", t), latest_val("price.close", t)
+    print(f"  {t:5s} current={cur}  close={close}")
 print("wrote examples/s1_data.input.json + s1_data.output.json (REAL data)")

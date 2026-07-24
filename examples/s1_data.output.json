@@ -4,6 +4,10 @@
     "universe_size": 3,
     "tickers_with_bars": 3,
     "coverage_pct": 100.0,
+    "current_prices_ok": 3,
+    "current_price_sessions": {
+      "post": 3
+    },
     "macro_series": [
       "spy_close",
       "vix",
@@ -14,10 +18,30 @@
     "earnings_checked": 0,
     "earnings_signals_written": 0
   },
+  "price_current_vs_close": {
+    "INTC": {
+      "current": {
+        "price": 92.1696,
+        "session": "post"
+      },
+      "close": 92.31999969482422
+    },
+    "MRVL": {
+      "current": {
+        "price": 193.09,
+        "session": "post"
+      },
+      "close": 194.22999572753906
+    },
+    "TSLA": {
+      "current": {
+        "price": 313.0,
+        "session": "post"
+      },
+      "close": 313.0299987792969
+    }
+  },
   "latest_stored_values": {
-    "price.close INTC": 92.31999969482422,
-    "price.close MRVL": 194.22999572753906,
-    "price.close TSLA": 313.0299987792969,
     "macro.vix": 18.579999923706055,
     "macro.spy_close": 738.9299926757812,
     "days_to_earnings INTC": 90,
@@ -53,6 +77,12 @@
       "feature": "price.close",
       "n_values": 270,
       "event_time_min": "2026-03-17",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "price.current",
+      "n_values": 3,
+      "event_time_min": "2026-07-24",
       "event_time_max": "2026-07-24"
     },
     {

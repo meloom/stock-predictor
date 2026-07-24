@@ -72,6 +72,12 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
     def fake_dte(ticker, asof=None):
         return None if ticker == "DEAD" else 30  # None stays None, no sentinels
 
+    def fake_quote(ticker):
+        # AAPL trades post-market at a price different from its close (100.0);
+        # MSFT quote missing; DEAD absent
+        return {"AAPL": {"price": 103.0, "session": "post"},
+                "MSFT": None, "DEAD": None}.get(ticker)
+
     def fake_signal(ticker, trig):
         trig.record_cost("claude-sonnet", tokens_in=500, tokens_out=200, web_searches=1)
         return {"ticker": ticker, "has_recent_report": True,
@@ -80,12 +86,21 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
     metrics = run_daily_ingestion(
         universe=["AAPL", "MSFT", "DEAD"], store=store,
         fetch_bars=fake_bars, fetch_macro=fake_macro, fetch_dte=fake_dte,
+        fetch_quote=fake_quote,
         earnings_signal_fn=fake_signal, earnings_check_tickers=["AAPL"])
 
     # coverage metrics are honest about the dead ticker
     assert metrics["tickers_with_bars"] == 2
     assert metrics["calendar_unknown"] == 1
     assert metrics["earnings_signals_written"] == 1
+
+    # LIVE current price stored, session-aware, DISTINCT from the close
+    assert metrics["current_prices_ok"] == 1
+    assert metrics["current_price_sessions"] == {"post": 1}
+    cur = store.read_asof("price.current", "AAPL", "2026-07-24")["value"]
+    assert cur == {"price": 103.0, "session": "post"}     # the real current price
+    assert store.read_asof("price.close", "AAPL", "2026-07-24")["value"] == 100.0  # NOT this
+    assert store.read_asof("price.current", "MSFT", "2026-07-24") is None  # no fake fallback
 
     # store contents + lineage
     rec = store.read_asof("price.close", "AAPL", "2026-07-24")

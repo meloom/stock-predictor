@@ -22,6 +22,10 @@ S1_FEATURES = [
      "Known after the trading session close it describes."),
     ("price.volume", "float", "ticker", "daily",
      "Known after the trading session close it describes."),
+    ("price.current", "json", "ticker", "intraday",
+     "Live current price WITH trading session {price, session: pre|regular|"
+     "post|closed}. THE price for display/sizing/decisions — never price.close "
+     "(the prior bar). Session-aware: reflects pre- and post-market."),
     ("macro.vix",    "float", "market", "daily",
      "Known after the session close it describes."),
     ("macro.yield10y", "float", "market", "daily",
@@ -115,20 +119,34 @@ def fetch_days_to_earnings(ticker: str, asof: date | None = None) -> int | None:
     return None
 
 
-def fetch_current_price(ticker: str) -> float | None:
-    """Real current quote including extended hours — .info fields, NOT
-    fast_info.lastPrice (which silently returns the stale regular-session
-    close outside RTH; caught live 2026-07-24)."""
+def fetch_current_quote(ticker: str) -> dict | None:
+    """Real CURRENT price WITH its trading session — the price the user has
+    repeatedly (and rightly) insisted on: pre-market / regular / post-market
+    aware, NEVER the stale prior close.
+
+    Picks the field by marketState, NOT fast_info.lastPrice (which returns the
+    stale regular-session close outside RTH — the INTC $100.23-vs-$103 bug).
+    Returns {"price": float, "session": "pre"|"regular"|"post"|"closed"} or None.
+    """
     import yfinance as yf
     try:
         info = yf.Ticker(ticker).info
-        for field in ("postMarketPrice", "preMarketPrice",
-                      "regularMarketPrice", "currentPrice"):
-            v = info.get(field)
-            if v:
-                return float(v)
     except Exception:
-        pass
+        return None
+    state = (info.get("marketState") or "").upper()
+    pre, post = info.get("preMarketPrice"), info.get("postMarketPrice")
+    reg = info.get("regularMarketPrice") or info.get("currentPrice")
+    if state.startswith("PRE") and pre:
+        return {"price": float(pre), "session": "pre"}
+    if state.startswith("POST") and post:
+        return {"price": float(post), "session": "post"}
+    if reg:
+        return {"price": float(reg), "session": "regular" if state == "REGULAR" else "closed"}
+    # last resort: any extended-hours quote beats nothing (still never a stale bar)
+    if post:
+        return {"price": float(post), "session": "post"}
+    if pre:
+        return {"price": float(pre), "session": "pre"}
     return None
 
 # ═══════════════ Grounded LLM earnings extraction ═══════════════
@@ -224,6 +242,7 @@ def run_daily_ingestion(universe: list[str],
                         fetch_bars=fetch_daily_bars,
                         fetch_macro=fetch_macro,
                         fetch_dte=fetch_days_to_earnings,
+                        fetch_quote=fetch_current_quote,
                         earnings_signal_fn=None,
                         earnings_check_tickers: list[str] | None = None) -> dict:
     """One full S1 pass. Returns the metrics dict (also logged to runs.jsonl).
@@ -250,6 +269,18 @@ def run_daily_ingestion(universe: list[str],
                 rows.append(("price.close", t, bar["date"], bar["close"]))
                 rows.append(("price.volume", t, bar["date"], bar["volume"]))
         store.write_many(rows, trigger_id=trig.trigger_id)
+
+        # -- LIVE current price, session-aware (pre/regular/post) ------------
+        # THE price for display/sizing/decisions — never price.close. Wired
+        # here so it can't be "defined but forgotten" again.
+        current_ok, current_by_session = 0, {}
+        for t in universe:
+            q = fetch_quote(t) if fetch_quote else None
+            if q is None:
+                continue
+            store.write("price.current", t, today, q, trigger_id=trig.trigger_id)
+            current_ok += 1
+            current_by_session[q["session"]] = current_by_session.get(q["session"], 0) + 1
 
         # -- macro (with history — S3's regime gate needs 20d of SPY) --------
         macro = fetch_macro()
@@ -285,6 +316,8 @@ def run_daily_ingestion(universe: list[str],
             universe_size=len(universe),
             tickers_with_bars=tickers_ok,
             coverage_pct=round(coverage, 1),
+            current_prices_ok=current_ok,
+            current_price_sessions=current_by_session,
             macro_series=sorted(k for k, s in macro.items() if s),
             calendar_ok=cal_ok,
             calendar_unknown=cal_unknown,
