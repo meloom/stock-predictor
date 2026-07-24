@@ -1,0 +1,65 @@
+{
+  "as_of_date": "2026-07-24",
+  "run_metrics": {
+    "universe_size": 3,
+    "tickers_with_bars": 3,
+    "coverage_pct": 100.0,
+    "macro_series": [
+      "spy_close",
+      "vix",
+      "yield10y"
+    ],
+    "calendar_ok": 3,
+    "calendar_unknown": 0,
+    "earnings_checked": 0,
+    "earnings_signals_written": 0
+  },
+  "latest_stored_values": {
+    "price.close INTC": 92.31999969482422,
+    "price.close MRVL": 194.22999572753906,
+    "price.close TSLA": 313.0299987792969,
+    "macro.vix": 18.579999923706055,
+    "macro.spy_close": 738.9299926757812,
+    "days_to_earnings INTC": 90,
+    "days_to_earnings MRVL": 34,
+    "days_to_earnings TSLA": 89
+  },
+  "outputs_of_trigger": [
+    {
+      "feature": "calendar.days_to_earnings",
+      "n_values": 3,
+      "event_time_min": "2026-07-24",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "macro.spy_close",
+      "n_values": 90,
+      "event_time_min": "2026-03-17",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "macro.vix",
+      "n_values": 87,
+      "event_time_min": "2026-03-23",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "macro.yield10y",
+      "n_values": 90,
+      "event_time_min": "2026-03-17",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "price.close",
+      "n_values": 270,
+      "event_time_min": "2026-03-17",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "price.volume",
+      "n_values": 270,
+      "event_time_min": "2026-03-17",
+      "event_time_max": "2026-07-24"
+    }
+  ]
+}

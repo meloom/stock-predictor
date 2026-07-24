@@ -1,53 +1,67 @@
-"""Example — S1 data ingestion: one concrete input, confirmed output.
+"""Example — S1 data ingestion, on REAL market data (not fakes).
 
-Runs OFFLINE with injected fake fetchers so it is deterministic and always
-reproducible (the real network path is the default: run_daily_ingestion(universe)).
+Fetches real bars + macro + earnings calendar via yfinance, runs the real
+ingestion, and saves:
+    examples/s1_data.input.json    what was actually fetched (real)
+    examples/s1_data.output.json   what was actually stored (real)
+This is a dated snapshot — real data moves, so values differ by run day.
 Run:  PYTHONPATH=src python3 examples/example_s1_data.py
 """
-import sys, tempfile
+import sys, json, tempfile
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "src"))
 
 from core import FeatureStore, MARKET_SCOPE
-from s1_data import run_daily_ingestion
+from s1_data import (run_daily_ingestion, fetch_daily_bars, fetch_macro,
+                     fetch_days_to_earnings)
 
-# ── INPUT ────────────────────────────────────────────────────────────────
-UNIVERSE = ["AAPL", "MSFT", "DEAD"]          # DEAD: a ticker whose fetch fails
+UNIVERSE = ["INTC", "MRVL", "TSLA"]
 
-def fake_bars(tickers):
-    print(f"  fetch_bars called for {tickers}")
-    return {"AAPL": [{"date": "2026-07-24", "close": 100.0, "volume": 1e6}],
-            "MSFT": [{"date": "2026-07-24", "close": 380.0, "volume": 2e6}],
-            "DEAD": []}                       # failed ticker -> empty, never fabricated
+# ── fetch REAL data, capture it as the input snapshot ─────────────────────
+real_bars = fetch_daily_bars(UNIVERSE, period="90d")
+real_macro = fetch_macro(period="90d")
+real_dte = {t: fetch_days_to_earnings(t) for t in UNIVERSE}
 
-def fake_macro():
-    return {"vix": [{"date": "2026-07-24", "value": 18.5}],
-            "yield10y": [{"date": "2026-07-24", "value": 4.6}],
-            "spy_close": [{"date": "2026-07-23", "value": 740.0},
-                          {"date": "2026-07-24", "value": 738.0}]}
+INPUT = {
+    "note": "REAL yfinance data, snapshot. Bars/macro trimmed to last 5 rows "
+            "for display; full history was ingested (see output counts).",
+    "universe": UNIVERSE,
+    "bars_tail": {t: rows[-5:] for t, rows in real_bars.items()},
+    "macro_tail": {k: s[-5:] for k, s in real_macro.items()},
+    "days_to_earnings": real_dte,
+}
+(HERE / "s1_data.input.json").write_text(json.dumps(INPUT, indent=2))
 
-def fake_dte(ticker, asof=None):
-    return {"AAPL": 90, "MSFT": 1}.get(ticker)   # DEAD -> None (no 999 sentinel)
-
-# ── RUN ──────────────────────────────────────────────────────────────────
+# ── run the REAL ingestion ────────────────────────────────────────────────
 store = FeatureStore(Path(tempfile.mkdtemp()) / "example.db")
-print("INPUT: universe =", UNIVERSE)
-metrics = run_daily_ingestion(UNIVERSE, store=store, fetch_bars=fake_bars,
-                              fetch_macro=fake_macro, fetch_dte=fake_dte)
+metrics = run_daily_ingestion(
+    UNIVERSE, store=store,
+    fetch_bars=lambda t: real_bars, fetch_macro=lambda: real_macro,
+    fetch_dte=lambda t, asof=None: real_dte.get(t))
 
-# ── OUTPUT ───────────────────────────────────────────────────────────────
-print("\nOUTPUT metrics:", {k: v for k, v in metrics.items() if k != "trigger_id"})
-print("outputs_of(trigger):")
-for f in store.outputs_of(metrics["trigger_id"])["features"]:
-    print(f"  {f['feature']:28s} {f['n_values']} values")
+# latest date actually present, to read back the freshest stored values
+latest = max(r["date"] for rows in real_bars.values() for r in rows)
 
-# ── CONFIRM ──────────────────────────────────────────────────────────────
-assert metrics["tickers_with_bars"] == 2,        "DEAD must not count as covered"
-assert metrics["coverage_pct"] == 66.7,          "coverage must reflect the failure"
-assert metrics["calendar_unknown"] == 1,         "DEAD's unknown dte counted, not faked"
-assert store.read_asof("price.close", "AAPL", "2026-07-24")["value"] == 100.0
-assert store.read_asof("macro.vix", MARKET_SCOPE, "2026-07-24")["value"] == 18.5
-assert store.read_asof("calendar.days_to_earnings", "MSFT", "2026-07-24")["value"] == 1
-assert store.read_asof("price.close", "DEAD", "2026-07-24") is None
-print("\nCONFIRMED: coverage metrics honest about the failed ticker; "
-      "all fetched values stored with lineage; nothing fabricated.")
+def latest_val(feature, scope):
+    rec = store.read_asof(feature, scope, latest)
+    return None if rec is None else rec["value"]
+
+OUTPUT = {
+    "as_of_date": latest,
+    "run_metrics": {k: v for k, v in metrics.items() if k != "trigger_id"},
+    "latest_stored_values": {
+        f"price.close {t}": latest_val("price.close", t) for t in UNIVERSE
+    } | {
+        "macro.vix": latest_val("macro.vix", MARKET_SCOPE),
+        "macro.spy_close": latest_val("macro.spy_close", MARKET_SCOPE),
+        **{f"days_to_earnings {t}": latest_val("calendar.days_to_earnings", t)
+           for t in UNIVERSE},
+    },
+    "outputs_of_trigger": store.outputs_of(metrics["trigger_id"])["features"],
+}
+(HERE / "s1_data.output.json").write_text(json.dumps(OUTPUT, indent=2))
+
+print(f"as_of {latest}: coverage {metrics['coverage_pct']}%, "
+      f"{store.outputs_of(metrics['trigger_id'])['total_values']} real values stored")
+print("wrote examples/s1_data.input.json + s1_data.output.json (REAL data)")

@@ -1,0 +1,39 @@
+{
+  "event_date": "2026-07-24",
+  "run_metrics": {
+    "event_date": "2026-07-24",
+    "universe_size": 3,
+    "features_written": 22,
+    "skipped": {}
+  },
+  "per_ticker": {
+    "INTC": {
+      "tech.rsi14": 26.865903,
+      "tech.mom5": -0.02862,
+      "tech.mom20": -0.305185,
+      "tech.hvol20": 0.050404,
+      "tech.vr20": 1.624721,
+      "xsec.rank_rsi14": 0.5,
+      "xsec.rank_mom5": 0.5
+    },
+    "MRVL": {
+      "tech.rsi14": 29.684587,
+      "tech.mom5": 0.029415,
+      "tech.mom20": -0.309259,
+      "tech.hvol20": 0.056592,
+      "tech.vr20": 0.723097,
+      "xsec.rank_rsi14": 1.0,
+      "xsec.rank_mom5": 1.0
+    },
+    "TSLA": {
+      "tech.rsi14": 15.722536,
+      "tech.mom5": -0.178054,
+      "tech.mom20": -0.16552,
+      "tech.hvol20": 0.048596,
+      "tech.vr20": 1.397443,
+      "xsec.rank_rsi14": 0.0,
+      "xsec.rank_mom5": 0.0
+    }
+  },
+  "regime.breadth5": 0.3333
+}

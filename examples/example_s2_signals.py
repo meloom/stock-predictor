@@ -1,49 +1,57 @@
-"""Example — S2 signal generation: one concrete input, confirmed output.
+"""Example — S2 signal generation, on REAL market data.
 
-Input: 25 days of hand-made closes for two tickers (one rising, one falling).
-Every expected value below is hand-computable from the input.
-Run:  PYTHONPATH=src python3 examples/example_s2_signals.py
+Runs real S1 ingestion first, then real S2 signal computation, and saves:
+    examples/s2_signals.input.json    the real close/volume series S2 read
+    examples/s2_signals.output.json   the real signals S2 computed
+Dated snapshot. Run:  PYTHONPATH=src python3 examples/example_s2_signals.py
 """
-import sys, tempfile
+import sys, json, tempfile
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "src"))
 
 from core import FeatureStore, MARKET_SCOPE
-from s2_signals import run_signal_generation
+from s1_data import run_daily_ingestion, fetch_daily_bars, fetch_macro
+from s2_signals import run_signal_generation, S2_FEATURES
 
-# ── INPUT ────────────────────────────────────────────────────────────────
-UP = [100 + i for i in range(25)]        # 100,101,...,124  (rises 1/day)
-DOWN = [124 - i for i in range(25)]      # 124,123,...,100  (falls 1/day)
-DAYS = [f"2026-06-{i+1:02d}" for i in range(25)]
-LAST = DAYS[-1]                          # 2026-06-25
+UNIVERSE = ["INTC", "MRVL", "TSLA"]
 
+# ── real S1 ingestion into a shared store ─────────────────────────────────
+real_bars = fetch_daily_bars(UNIVERSE, period="90d")
 store = FeatureStore(Path(tempfile.mkdtemp()) / "example.db")
-store.register("price.close", "float", "ticker", "S1", "daily", "post-close")
-store.register("price.volume", "float", "ticker", "S1", "daily", "post-close")
-rows = []
-for d, u, dn in zip(DAYS, UP, DOWN):
-    rows += [("price.close", "UP", d, float(u)), ("price.volume", "UP", d, 1e6),
-             ("price.close", "DOWN", d, float(dn)), ("price.volume", "DOWN", d, 1e6)]
-store.write_many(rows, trigger_id="example-seed")
-print(f"INPUT: 25 daily closes  UP: 100→124 rising  DOWN: 124→100 falling  last day {LAST}")
+run_daily_ingestion(UNIVERSE, store=store,
+                    fetch_bars=lambda t: real_bars,
+                    fetch_macro=lambda: fetch_macro(period="90d"),
+                    fetch_dte=lambda t, asof=None: None)
+event_date = max(r["date"] for rows in real_bars.values() for r in rows)
 
-# ── RUN ──────────────────────────────────────────────────────────────────
-metrics = run_signal_generation(["UP", "DOWN"], LAST, store=store)
+# ── INPUT snapshot: the real series S2 will read (last 25 closes/ticker) ───
+INPUT = {
+    "note": "REAL closes/volumes ingested by S1; last 25 rows/ticker shown.",
+    "event_date": event_date,
+    "closes_tail": {t: [r["close"] for r in real_bars[t][-25:]] for t in UNIVERSE},
+}
+(HERE / "s2_signals.input.json").write_text(json.dumps(INPUT, indent=2))
 
-# ── OUTPUT ───────────────────────────────────────────────────────────────
-up_mom5 = store.read_asof("tech.mom5", "UP", LAST)["value"]
-up_rsi = store.read_asof("tech.rsi14", "UP", LAST)["value"]
-down_rsi = store.read_asof("tech.rsi14", "DOWN", LAST)["value"]
-rank_up = store.read_asof("xsec.rank_mom5", "UP", LAST)["value"]
-breadth = store.read_asof("regime.breadth5", MARKET_SCOPE, LAST)["value"]
-print(f"\nOUTPUT: UP mom5={up_mom5}  UP rsi14={up_rsi}  DOWN rsi14={down_rsi}")
-print(f"        xsec.rank_mom5(UP)={rank_up}  regime.breadth5={breadth}")
+# ── run REAL S2 ────────────────────────────────────────────────────────────
+metrics = run_signal_generation(UNIVERSE, event_date, store=store)
 
-# ── CONFIRM (hand-computed expectations) ─────────────────────────────────
-assert abs(up_mom5 - (124/119 - 1)) < 1e-6,  "mom5 = 124/119-1 = +4.2017%"
-assert up_rsi == 100.0,                      "monotonic riser -> RSI 100"
-assert down_rsi == 0.0,                      "monotonic faller -> RSI 0"
-assert rank_up == 1.0,                       "UP is the best of 2 -> rank 1.0"
-assert breadth == 0.5,                       "1 of 2 tickers positive -> 0.5"
-assert metrics["features_written"] == 15,    "5 tech x2 + 2 xsec ranks x2 + 1 breadth = 15"
-print("\nCONFIRMED: every output matches its hand-computed expectation.")
+# ── OUTPUT snapshot: the real computed signals ────────────────────────────
+tech_feats = [n for n, *_ in S2_FEATURES if n.startswith("tech.")]
+OUTPUT = {
+    "event_date": event_date,
+    "run_metrics": {k: v for k, v in metrics.items() if k != "trigger_id"},
+    "per_ticker": {
+        t: {f: (store.read_asof(f, t, event_date) or {}).get("value")
+            for f in tech_feats + ["xsec.rank_rsi14", "xsec.rank_mom5"]}
+        for t in UNIVERSE
+    },
+    "regime.breadth5": (store.read_asof("regime.breadth5", MARKET_SCOPE, event_date) or {}).get("value"),
+}
+(HERE / "s2_signals.output.json").write_text(json.dumps(OUTPUT, indent=2))
+
+print(f"as_of {event_date}: {metrics['features_written']} real signals computed")
+for t in UNIVERSE:
+    o = OUTPUT["per_ticker"][t]
+    print(f"  {t:5s} rsi14={o['tech.rsi14']}  mom5={o['tech.mom5']}  rank_mom5={o['xsec.rank_mom5']}")
+print("wrote examples/s2_signals.input.json + s2_signals.output.json (REAL data)")

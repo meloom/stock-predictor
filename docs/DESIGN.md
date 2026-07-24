@@ -355,12 +355,13 @@ stock-predictor/
 │   ├── s5_execution.py       #   (s2+ are future; only core+s1 exist today)
 │   └── ...
 ├── tests/                    # tests may be separate files (test_core, test_s1_data, ...)
-├── examples/                 # one runnable file per stage: concrete input →
-│                             #   printed output → asserted expectations.
-│                             #   Deterministic/offline. A stage without its
-│                             #   example is not done. (Convention added at
-│                             #   owner request 2026-07-24; example_s2 caught
-│                             #   a wrong hand-count on its first run.)
+├── examples/                 # per stage: a runnable script that runs the
+│                             #   stage on REAL market data and SAVES the
+│                             #   actual input + output as committed .json
+│                             #   snapshots (sX.input.json / sX.output.json)
+│                             #   — real data you can read without running.
+│                             #   (Deterministic exact-value checks live in
+│                             #   tests/, which use synthetic inputs.)
 └── ops/                      # cron entries, runbooks
 ```
 
