@@ -14,7 +14,9 @@ sys.path.insert(0, str(HERE.parent / "src"))
 
 from core import FeatureStore, MARKET_SCOPE
 from s1_data import (run_daily_ingestion, fetch_daily_bars, fetch_macro,
-                     fetch_days_to_earnings, fetch_current_quote)
+                     fetch_days_to_earnings, fetch_current_quote,
+                     fetch_shares_outstanding, fetch_latest_statements,
+                     fetch_analyst_snapshot)
 
 UNIVERSE = ["INTC", "MRVL", "TSLA"]
 
@@ -23,6 +25,9 @@ real_bars = fetch_daily_bars(UNIVERSE, period="90d")
 real_macro = fetch_macro(period="90d")
 real_dte = {t: fetch_days_to_earnings(t) for t in UNIVERSE}
 real_quotes = {t: fetch_current_quote(t) for t in UNIVERSE}   # LIVE, session-aware
+real_shares = {t: fetch_shares_outstanding(t) for t in UNIVERSE}
+real_statements = {t: fetch_latest_statements(t) for t in UNIVERSE}
+real_analyst = {t: fetch_analyst_snapshot(t) for t in UNIVERSE}
 
 INPUT = {
     "note": "REAL yfinance data, snapshot. Bars/macro trimmed to last 5 rows "
@@ -32,6 +37,9 @@ INPUT = {
     "macro_tail": {k: s[-5:] for k, s in real_macro.items()},
     "days_to_earnings": real_dte,
     "live_current_quotes": real_quotes,   # the real current price + session
+    "shares_outstanding": real_shares,
+    "latest_statements": real_statements,  # note event_time = announcement date
+    "analyst_snapshot": real_analyst,
 }
 (HERE / "s1_data.input.json").write_text(json.dumps(INPUT, indent=2))
 
@@ -41,7 +49,10 @@ metrics = run_daily_ingestion(
     UNIVERSE, store=store,
     fetch_bars=lambda t: real_bars, fetch_macro=lambda: real_macro,
     fetch_dte=lambda t, asof=None: real_dte.get(t),
-    fetch_quote=lambda t: real_quotes.get(t))
+    fetch_quote=lambda t: real_quotes.get(t),
+    fetch_shares=lambda t: real_shares.get(t),
+    fetch_statements=lambda t, asof=None: real_statements.get(t),
+    fetch_analyst=lambda t: real_analyst.get(t))
 
 # latest date actually present, to read back the freshest stored values
 latest = max(r["date"] for rows in real_bars.values() for r in rows)
@@ -65,6 +76,12 @@ OUTPUT = {
         "macro.spy_close": latest_val("macro.spy_close", MARKET_SCOPE),
         **{f"days_to_earnings {t}": latest_val("calendar.days_to_earnings", t)
            for t in UNIVERSE},
+    },
+    "fundamentals": {
+        t: {"shares_outstanding": latest_val("fundamental.shares_outstanding", t),
+            "statements": latest_val("fundamental.statements", t),
+            "analyst": latest_val("fundamental.analyst_snapshot", t)}
+        for t in UNIVERSE
     },
     "outputs_of_trigger": store.outputs_of(metrics["trigger_id"])["features"],
 }

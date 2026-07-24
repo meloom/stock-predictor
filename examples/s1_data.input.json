@@ -163,16 +163,97 @@
   },
   "live_current_quotes": {
     "INTC": {
-      "price": 92.1696,
+      "price": 92.05,
       "session": "post"
     },
     "MRVL": {
-      "price": 193.09,
+      "price": 193.19,
       "session": "post"
     },
     "TSLA": {
-      "price": 313.0,
+      "price": 312.79,
       "session": "post"
+    }
+  },
+  "shares_outstanding": {
+    "INTC": 5026000000.0,
+    "MRVL": 875766423.0,
+    "TSLA": 3949547394.0
+  },
+  "latest_statements": {
+    "INTC": {
+      "period_end": "2026-06-30",
+      "event_time": "2026-07-23",
+      "publish_source": "announcement",
+      "revenue": 16128000000.0,
+      "gross_profit": 6509000000.0,
+      "operating_income": 1966000000.0,
+      "net_income": -11033000000.0,
+      "ebitda": -7274000000.0,
+      "total_assets": 202439000000.0,
+      "total_equity": 87542000000.0,
+      "total_debt": 50537000000.0,
+      "cash": 12874000000.0,
+      "operating_cash_flow": 7006000000.0,
+      "capex": -2556000000.0,
+      "free_cash_flow": 4450000000.0
+    },
+    "MRVL": {
+      "period_end": "2026-04-30",
+      "event_time": "2026-05-27",
+      "publish_source": "announcement",
+      "revenue": 2417800000.0,
+      "gross_profit": 1260800000.0,
+      "operating_income": 350100000.0,
+      "net_income": 34500000.0,
+      "ebitda": 660000000.0,
+      "total_assets": 26944500000.0,
+      "total_equity": 18215800000.0,
+      "total_debt": 5277200000.0,
+      "cash": 3843600000.0,
+      "operating_cash_flow": 638800000.0,
+      "capex": -156200000.0,
+      "free_cash_flow": 482600000.0
+    },
+    "TSLA": {
+      "period_end": "2026-06-30",
+      "event_time": "2026-07-22",
+      "publish_source": "announcement",
+      "revenue": 28236000000.0,
+      "gross_profit": 4751000000.0,
+      "operating_income": 398000000.0,
+      "net_income": 1114000000.0,
+      "ebitda": 3029000000.0,
+      "total_assets": 148524000000.0,
+      "total_equity": 86858000000.0,
+      "total_debt": 16080000000.0,
+      "cash": 15219000000.0,
+      "operating_cash_flow": 4697000000.0,
+      "capex": -5796000000.0,
+      "free_cash_flow": -1099000000.0
+    }
+  },
+  "analyst_snapshot": {
+    "INTC": {
+      "forward_eps": 1.74873,
+      "trailing_eps": -0.6,
+      "n_analysts": 40,
+      "recommendation_mean": 2.59574,
+      "target_mean_price": 115.4
+    },
+    "MRVL": {
+      "forward_eps": 6.24094,
+      "trailing_eps": 2.91,
+      "n_analysts": 40,
+      "recommendation_mean": 1.44186,
+      "target_mean_price": 256.9142
+    },
+    "TSLA": {
+      "forward_eps": 2.23997,
+      "trailing_eps": 0.93,
+      "n_analysts": 40,
+      "recommendation_mean": 2.34783,
+      "target_mean_price": 402.76276
     }
   }
 }

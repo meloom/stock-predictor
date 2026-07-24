@@ -38,7 +38,27 @@ S1_FEATURES = [
     ("fundamental.earnings_signal", "json", "ticker", "event",
      "Extracted from the most recent PUBLISHED earnings report via grounded "
      "search; event_time = report date; only valid after publication."),
+    ("fundamental.shares_outstanding", "float", "ticker", "daily",
+     "Shares outstanding snapshot — needed for market cap and any per-share "
+     "ratio. event_time = ingestion day (current-state snapshot)."),
+    ("fundamental.statements", "json", "ticker", "event",
+     "Latest quarterly income/balance/cashflow line items. CRITICAL: "
+     "event_time = the actual earnings ANNOUNCEMENT date (not fiscal period "
+     "end), falling back to period_end + REPORTING_LAG_DAYS. This is the "
+     "publication-date discipline that prevents fundamentals lookahead — a "
+     "statement is only 'known' once filed, weeks after the quarter closes."),
+    ("fundamental.analyst_snapshot", "json", "ticker", "daily",
+     "Daily snapshot of consensus {forward_eps, n_analysts, "
+     "recommendation_mean, target_mean_price}. Snapshotted daily so a REVISION "
+     "time series accrues going forward — analyst revisions cannot be "
+     "backfilled from yfinance, they must be collected from now on."),
 ]
+
+# Conservative reporting lag: a quarterly statement is treated as knowable this
+# many days after the fiscal period end, UNLESS we have the real announcement
+# date (which we prefer). 60d safely covers the 10-Q filing window (~40-45d for
+# large caps). Erring late never creates lookahead; erring early would.
+REPORTING_LAG_DAYS = 60
 
 
 def register_all(store: FeatureStore) -> None:
@@ -149,6 +169,108 @@ def fetch_current_quote(ticker: str) -> dict | None:
         return {"price": float(pre), "session": "pre"}
     return None
 
+# ═══════════════ Fundamentals: raw statement data for S2 ═══════════════
+# S2's value/quality/growth features are price ÷ statement-item. S2 can only
+# DERIVE — S1 must collect the raw items first. The one thing that makes this
+# valid rather than lookahead-riddled is the publication date (below).
+
+
+def fetch_shares_outstanding(ticker: str) -> float | None:
+    import yfinance as yf
+    try:
+        v = yf.Ticker(ticker).info.get("sharesOutstanding")
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
+def _last_earnings_announcement(tk, asof: date) -> date | None:
+    """The most recent PAST earnings announcement date — the real publication
+    date of the latest statements. Far better than a lag guess when available."""
+    try:
+        cal = tk.earnings_dates
+        if cal is not None and len(cal):
+            past = sorted(d.date() if hasattr(d, "date") else d
+                          for d in cal.index
+                          if (d.date() if hasattr(d, "date") else d) <= asof)
+            return past[-1] if past else None
+    except Exception:
+        pass
+    return None
+
+
+def _row(df, *labels) -> float | None:
+    """First matching row's most-recent-column value from a yfinance statement
+    DataFrame (row labels vary across versions, so try several)."""
+    if df is None or len(df.columns) == 0:
+        return None
+    for label in labels:
+        if label in df.index:
+            try:
+                v = df.loc[label].iloc[0]  # columns are newest-first
+                return float(v) if v == v else None  # NaN -> None
+            except Exception:
+                continue
+    return None
+
+
+def fetch_latest_statements(ticker: str, asof: date | None = None) -> dict | None:
+    """Latest quarterly income/balance/cashflow line items, stamped with the
+    real earnings-announcement date (fallback: period_end + REPORTING_LAG_DAYS).
+    Returns None if nothing usable. Missing individual line items are None,
+    never fabricated."""
+    import yfinance as yf
+    asof = asof or datetime.now(ET).date()
+    try:
+        tk = yf.Ticker(ticker)
+        inc, bal, cf = tk.quarterly_income_stmt, tk.quarterly_balance_sheet, tk.quarterly_cashflow
+    except Exception:
+        return None
+    if inc is None or len(getattr(inc, "columns", [])) == 0:
+        return None
+    period_end = inc.columns[0]
+    period_end = period_end.date() if hasattr(period_end, "date") else period_end
+
+    announced = _last_earnings_announcement(tk, asof)
+    from datetime import timedelta
+    event_time = (announced or (period_end + timedelta(days=REPORTING_LAG_DAYS)))
+
+    return {
+        "period_end": period_end.isoformat(),
+        "event_time": event_time.isoformat(),
+        "publish_source": "announcement" if announced else f"period_end+{REPORTING_LAG_DAYS}d",
+        "revenue": _row(inc, "Total Revenue", "Operating Revenue"),
+        "gross_profit": _row(inc, "Gross Profit"),
+        "operating_income": _row(inc, "Operating Income", "Total Operating Income As Reported"),
+        "net_income": _row(inc, "Net Income", "Net Income Common Stockholders"),
+        "ebitda": _row(inc, "EBITDA", "Normalized EBITDA"),
+        "total_assets": _row(bal, "Total Assets"),
+        "total_equity": _row(bal, "Stockholders Equity", "Total Equity Gross Minority Interest"),
+        "total_debt": _row(bal, "Total Debt"),
+        "cash": _row(bal, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"),
+        "operating_cash_flow": _row(cf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities"),
+        "capex": _row(cf, "Capital Expenditure"),
+        "free_cash_flow": _row(cf, "Free Cash Flow"),
+    }
+
+
+def fetch_analyst_snapshot(ticker: str) -> dict | None:
+    """Today's consensus snapshot. Snapshotted DAILY so a revision time series
+    accrues going forward (yfinance can't backfill revision history)."""
+    import yfinance as yf
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception:
+        return None
+    snap = {
+        "forward_eps": info.get("forwardEps"),
+        "trailing_eps": info.get("trailingEps"),
+        "n_analysts": info.get("numberOfAnalystOpinions"),
+        "recommendation_mean": info.get("recommendationMean"),
+        "target_mean_price": info.get("targetMeanPrice"),
+    }
+    return snap if any(v is not None for v in snap.values()) else None
+
 # ═══════════════ Grounded LLM earnings extraction ═══════════════
 
 SIGNAL_MODEL = "claude-sonnet-4-5"
@@ -243,6 +365,9 @@ def run_daily_ingestion(universe: list[str],
                         fetch_macro=fetch_macro,
                         fetch_dte=fetch_days_to_earnings,
                         fetch_quote=fetch_current_quote,
+                        fetch_shares=fetch_shares_outstanding,
+                        fetch_statements=fetch_latest_statements,
+                        fetch_analyst=fetch_analyst_snapshot,
                         earnings_signal_fn=None,
                         earnings_check_tickers: list[str] | None = None) -> dict:
     """One full S1 pass. Returns the metrics dict (also logged to runs.jsonl).
@@ -299,6 +424,29 @@ def run_daily_ingestion(universe: list[str],
                         trigger_id=trig.trigger_id)
             cal_ok += 1
 
+        # -- fundamentals: raw statement data for S2's value/quality features -
+        # Publication-date discipline lives in fetch_latest_statements: a
+        # statement's event_time is the real announcement date (or a
+        # conservative lag), so backtests never see it before it was filed.
+        shares_ok, stmts_ok, analyst_ok = 0, 0, 0
+        for t in universe:
+            sh = fetch_shares(t) if fetch_shares else None
+            if sh is not None:
+                store.write("fundamental.shares_outstanding", t, today, sh,
+                            trigger_id=trig.trigger_id)
+                shares_ok += 1
+            st = fetch_statements(t) if fetch_statements else None
+            if st is not None:
+                # event_time = publication date, NOT the fiscal period end
+                store.write("fundamental.statements", t, st["event_time"], st,
+                            trigger_id=trig.trigger_id)
+                stmts_ok += 1
+            an = fetch_analyst(t) if fetch_analyst else None
+            if an is not None:
+                store.write("fundamental.analyst_snapshot", t, today, an,
+                            trigger_id=trig.trigger_id)
+                analyst_ok += 1
+
         # -- earnings signals (LLM, cost-attributed to this trigger) --------
         signals_written = 0
         check_list = earnings_check_tickers or []
@@ -318,6 +466,9 @@ def run_daily_ingestion(universe: list[str],
             coverage_pct=round(coverage, 1),
             current_prices_ok=current_ok,
             current_price_sessions=current_by_session,
+            shares_ok=shares_ok,
+            statements_ok=stmts_ok,
+            analyst_snapshots_ok=analyst_ok,
             macro_series=sorted(k for k, s in macro.items() if s),
             calendar_ok=cal_ok,
             calendar_unknown=cal_unknown,

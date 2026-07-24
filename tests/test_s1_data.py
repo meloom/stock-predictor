@@ -114,3 +114,46 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
     ledger = _read_jsonl(isolated_runtime / "logs" / "cost_ledger.jsonl")
     assert len(ledger) == 1
     assert ledger[0]["trigger_id"] == metrics["trigger_id"]
+
+
+def test_fundamentals_publication_date_prevents_lookahead(isolated_runtime, tmp_path):
+    """The make-or-break fundamentals rule: a statement is stored at its
+    PUBLICATION date, not the fiscal period end — so a backtest cannot see it
+    before it was filed."""
+    from core import FeatureStore
+    store = FeatureStore(tmp_path / "f.db")
+
+    def fake_bars(tickers):
+        return {t: [{"date": "2026-07-24", "close": 100.0, "volume": 1e6}] for t in tickers}
+
+    def fake_statements(ticker, asof=None):
+        # Q ending 2026-03-31 but ANNOUNCED 2026-05-01 (5 weeks later)
+        return {"period_end": "2026-03-31", "event_time": "2026-05-01",
+                "publish_source": "announcement", "revenue": 5e9,
+                "net_income": 1e9, "total_equity": 2e10}
+
+    metrics = run_daily_ingestion(
+        universe=["AAPL"], store=store,
+        fetch_bars=fake_bars, fetch_macro=lambda: {},
+        fetch_dte=lambda t, asof=None: None, fetch_quote=lambda t: None,
+        fetch_shares=lambda t: 1.5e9,
+        fetch_statements=fake_statements,
+        fetch_analyst=lambda t: {"forward_eps": 6.5, "n_analysts": 30})
+
+    assert metrics["shares_ok"] == 1
+    assert metrics["statements_ok"] == 1
+    assert metrics["analyst_snapshots_ok"] == 1
+
+    # stored at the ANNOUNCEMENT date, not the period end
+    st = store.read_asof("fundamental.statements", "AAPL", "2026-12-31")
+    assert st["event_time"] == "2026-05-01"
+    assert st["value"]["period_end"] == "2026-03-31"
+
+    # THE lookahead guard: a backtest standing on 2026-04-15 (after quarter
+    # end, before the filing) must NOT see it
+    assert store.read_asof("fundamental.statements", "AAPL", "2026-04-15") is None
+    # but on 2026-05-02 (after filing) it IS visible
+    assert store.read_asof("fundamental.statements", "AAPL", "2026-05-02") is not None
+
+    assert store.read_asof("fundamental.shares_outstanding", "AAPL", "2026-07-24")["value"] == 1.5e9
+    assert store.read_asof("fundamental.analyst_snapshot", "AAPL", "2026-07-24")["value"]["n_analysts"] == 30

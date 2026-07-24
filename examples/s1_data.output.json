@@ -8,6 +8,9 @@
     "current_price_sessions": {
       "post": 3
     },
+    "shares_ok": 3,
+    "statements_ok": 3,
+    "analyst_snapshots_ok": 3,
     "macro_series": [
       "spy_close",
       "vix",
@@ -21,21 +24,21 @@
   "price_current_vs_close": {
     "INTC": {
       "current": {
-        "price": 92.1696,
+        "price": 92.05,
         "session": "post"
       },
       "close": 92.31999969482422
     },
     "MRVL": {
       "current": {
-        "price": 193.09,
+        "price": 193.19,
         "session": "post"
       },
       "close": 194.22999572753906
     },
     "TSLA": {
       "current": {
-        "price": 313.0,
+        "price": 312.79,
         "session": "post"
       },
       "close": 313.0299987792969
@@ -48,12 +51,113 @@
     "days_to_earnings MRVL": 34,
     "days_to_earnings TSLA": 89
   },
+  "fundamentals": {
+    "INTC": {
+      "shares_outstanding": 5026000000.0,
+      "statements": {
+        "period_end": "2026-06-30",
+        "event_time": "2026-07-23",
+        "publish_source": "announcement",
+        "revenue": 16128000000.0,
+        "gross_profit": 6509000000.0,
+        "operating_income": 1966000000.0,
+        "net_income": -11033000000.0,
+        "ebitda": -7274000000.0,
+        "total_assets": 202439000000.0,
+        "total_equity": 87542000000.0,
+        "total_debt": 50537000000.0,
+        "cash": 12874000000.0,
+        "operating_cash_flow": 7006000000.0,
+        "capex": -2556000000.0,
+        "free_cash_flow": 4450000000.0
+      },
+      "analyst": {
+        "forward_eps": 1.74873,
+        "trailing_eps": -0.6,
+        "n_analysts": 40,
+        "recommendation_mean": 2.59574,
+        "target_mean_price": 115.4
+      }
+    },
+    "MRVL": {
+      "shares_outstanding": 875766423.0,
+      "statements": {
+        "period_end": "2026-04-30",
+        "event_time": "2026-05-27",
+        "publish_source": "announcement",
+        "revenue": 2417800000.0,
+        "gross_profit": 1260800000.0,
+        "operating_income": 350100000.0,
+        "net_income": 34500000.0,
+        "ebitda": 660000000.0,
+        "total_assets": 26944500000.0,
+        "total_equity": 18215800000.0,
+        "total_debt": 5277200000.0,
+        "cash": 3843600000.0,
+        "operating_cash_flow": 638800000.0,
+        "capex": -156200000.0,
+        "free_cash_flow": 482600000.0
+      },
+      "analyst": {
+        "forward_eps": 6.24094,
+        "trailing_eps": 2.91,
+        "n_analysts": 40,
+        "recommendation_mean": 1.44186,
+        "target_mean_price": 256.9142
+      }
+    },
+    "TSLA": {
+      "shares_outstanding": 3949547394.0,
+      "statements": {
+        "period_end": "2026-06-30",
+        "event_time": "2026-07-22",
+        "publish_source": "announcement",
+        "revenue": 28236000000.0,
+        "gross_profit": 4751000000.0,
+        "operating_income": 398000000.0,
+        "net_income": 1114000000.0,
+        "ebitda": 3029000000.0,
+        "total_assets": 148524000000.0,
+        "total_equity": 86858000000.0,
+        "total_debt": 16080000000.0,
+        "cash": 15219000000.0,
+        "operating_cash_flow": 4697000000.0,
+        "capex": -5796000000.0,
+        "free_cash_flow": -1099000000.0
+      },
+      "analyst": {
+        "forward_eps": 2.23997,
+        "trailing_eps": 0.93,
+        "n_analysts": 40,
+        "recommendation_mean": 2.34783,
+        "target_mean_price": 402.76276
+      }
+    }
+  },
   "outputs_of_trigger": [
     {
       "feature": "calendar.days_to_earnings",
       "n_values": 3,
       "event_time_min": "2026-07-24",
       "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "fundamental.analyst_snapshot",
+      "n_values": 3,
+      "event_time_min": "2026-07-24",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "fundamental.shares_outstanding",
+      "n_values": 3,
+      "event_time_min": "2026-07-24",
+      "event_time_max": "2026-07-24"
+    },
+    {
+      "feature": "fundamental.statements",
+      "n_values": 3,
+      "event_time_min": "2026-05-27",
+      "event_time_max": "2026-07-23"
     },
     {
       "feature": "macro.spy_close",
