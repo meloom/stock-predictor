@@ -1,7 +1,7 @@
 """Feature store contract tests — the guarantees DESIGN.md promises."""
 import pytest
 
-from feature_store.store import FeatureStore, UnregisteredFeatureError
+from core import FeatureStore, UnregisteredFeatureError
 
 
 @pytest.fixture

@@ -3,10 +3,10 @@ import json
 
 import pytest
 
-import common.trigger as trigger_mod
-from common.trigger import Trigger
-from feature_store.store import FeatureStore
-from data.ingest import run_daily_ingestion
+import core as trigger_mod
+from core import Trigger
+from core import FeatureStore
+from s1_data import run_daily_ingestion
 
 
 @pytest.fixture(autouse=True)

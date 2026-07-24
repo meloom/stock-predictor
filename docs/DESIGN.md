@@ -172,7 +172,7 @@ done, regardless of whether its happy path works:
   matched live.
 
 **Implementation notes (landed 2026-07-24)**
-- `src/feature_store/store.py`: SQLite at `runtime/features.db` (stdlib,
+- `src/core.py` (feature-store half): SQLite at `runtime/features.db` (stdlib,
   single file, zero infra — the contract is the point, the backend is
   deliberately boring). `register()` is idempotent but raises on spec change:
   semantic changes get a NEW feature name, meaning is never mutated under an
@@ -185,19 +185,19 @@ done, regardless of whether its happy path works:
   everything that invocation wrote. Paired with its runs.jsonl record
   (status/metrics/cost), every trigger has complete observability: what ran,
   what it cost, what it produced.
-- `src/common/trigger.py`: `Trigger` context manager mints `trigger_id`,
+- `src/core.py` (trigger half): `Trigger` context manager mints `trigger_id`,
   appends to `runtime/logs/cost_ledger.jsonl` (per billable action) and
   `runtime/logs/runs.jsonl` (per run — **including crashed runs**, logged with
   `status="error"`; silence must never be indistinguishable from success).
   Ledger prices are estimates for regression detection; the billing dashboard
   stays ground truth for absolute spend.
-- `src/data/registry.py`: the declared S1 feature set (`price.close`,
+- `src/s1_data.py` (registry section): the declared S1 feature set (`price.close`,
   `price.volume`, `macro.vix`, `macro.yield10y`, `macro.spy_close`,
   `calendar.days_to_earnings`, `fundamental.earnings_signal`) with per-feature
   point-in-time rules. This file IS the ingestion contract — the store rejects
   anything not declared here.
-- `src/data/sources.py`: the only network I/O in the data layer (plus the LLM
-  call in `earnings_signal.py`); everything else takes fetchers as injected
+- `src/s1_data.py` (fetchers section): the only network I/O in the data layer (plus the LLM
+  call in the earnings-extraction section); everything else takes fetchers as injected
   callables so tests run offline. Unknown values return `None`, never sentinel
   numbers (the predecessor's `days_to_earnings=999` sentinel leaked into
   model features as a plausible-looking number).
@@ -316,17 +316,13 @@ decision-relevant output.
 ```
 stock-predictor/
 ├── docs/DESIGN.md            # this file
-├── src/
-│   ├── feature_store/        # registry + bitemporal storage + the one read API
-│   ├── data/                 # S1 ingestion (prices, macro, earnings, LLM signals)
-│   ├── signals/              # S2 derived features (point-in-time tested)
-│   ├── alpha/                # S3 regime gate, scorer (gated), event risk
-│   ├── portfolio/            # S4 sizing with value-vs-target verification
-│   ├── execution/            # S5 IBKR adapter: orders, fills, sync, cooldown
-│   ├── risk/                 # S6 stops, time-stop, circuit breaker, decision gate
-│   ├── reporting/            # S7 emails, morning report, health checks
-│   └── evaluation/           # S8 retrospective, calibration, IC tracking
-├── tests/                    # unit tests; money-touching paths are mandatory
+├── src/                      # flat by design — project style: as few files
+│   ├── core.py               #   as possible; simple, working. One file for
+│   ├── s1_data.py            #   cross-cutting infra (trigger+store), one
+│   ├── s2_signals.py         #   file per stage as each stage lands.
+│   ├── s5_execution.py       #   (s2+ are future; only core+s1 exist today)
+│   └── ...
+├── tests/                    # tests may be separate files (test_core, test_s1_data, ...)
 └── ops/                      # cron entries, runbooks
 ```
 
@@ -358,8 +354,8 @@ model binaries (see `.gitignore`).
 
 | Layer | Status |
 |---|---|
-| Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/feature_store`, `src/common`; 11 passing contract tests; smoke-tested on live data |
-| Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/data` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
+| Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/core.py`; 11 passing contract tests; smoke-tested on live data |
+| Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/s1_data.py` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
 | Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
 | Ops/reporting (S7) | Migrate after execution, with cost fixes retained |
 | Alpha scorer (S3-A2) | **Not migrated as-is** — measured no-edge; rebuild around fundamentals/earnings features and pass §5 first |

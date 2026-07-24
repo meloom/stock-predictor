@@ -1,34 +1,129 @@
-"""Feature store: registry + bitemporal storage + the one read API.
+"""core.py — cross-cutting infrastructure: trigger context + feature store.
 
-Implements the contract in docs/DESIGN.md §S1:
-  - Registry-first: writes to unregistered features are rejected.
-  - Bitemporal keys (feature, scope, event_time, ingested_at):
-      * event_time  = when the value is *about* (backtests join on this —
-                      lookahead-impossible by construction via as_known_at)
-      * ingested_at = when we learned it (S8's stale-input audit checks this)
-  - Append-only: corrections append a new ingested_at version; history is
-    never rewritten, so any past prediction is exactly reproducible.
-  - One read API for research and production — no separate code paths.
+Two things every stage depends on, in one file (project style: as few files
+as possible; simple, working):
 
-Storage is SQLite (stdlib, single file, zero infra). The contract is the
-point; the backend is deliberately boring.
+  1. Trigger — the unit of cost attribution and run logging. Mints a
+     trigger_id carried by every billable action and feature write it
+     initiates. Logs: runtime/logs/runs.jsonl (per run, INCLUDING crashes)
+     and runtime/logs/cost_ledger.jsonl (per billable action).
+  2. FeatureStore — registry-first bitemporal store (DESIGN.md contract):
+     (event_time, ingested_at) keys, as_known_at reads make backtest
+     lookahead impossible by construction, outputs_of(trigger_id) answers
+     "we triggered it — what was the output?".
 """
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 RUNTIME_DIR = Path(os.environ.get(
     "STOCK_PREDICTOR_RUNTIME",
-    Path(__file__).resolve().parents[2] / "runtime",
+    Path(__file__).resolve().parents[1] / "runtime",
 ))
+LOGS_DIR = RUNTIME_DIR / "logs"
 DEFAULT_DB = RUNTIME_DIR / "features.db"
 
 MARKET_SCOPE = "_market"  # scope value for market-level (non-per-ticker) features
+
+# ═══════════════════════════ Trigger + cost ledger ═══════════════════════════
+
+# Estimated unit prices, USD — for the *relative* cost-per-trigger regression
+# signal; the billing dashboard remains ground truth for absolute spend.
+PRICING = {
+    "claude-sonnet": {"per_m_tokens_in": 3.00, "per_m_tokens_out": 15.00},
+    "web_search": {"per_call": 0.01},
+}
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+class Trigger:
+    """Context manager for one pipeline invocation.
+
+    Usage:
+        with Trigger("daily_ingestion", stage="S1") as trig:
+            ...
+            trig.record_cost(provider="claude-sonnet", tokens_in=..., tokens_out=...)
+            trig.add_metrics(tickers_ok=140, tickers_failed=2)
+    On exit, writes the run record (status="ok" or "error" with the exception).
+    """
+
+    def __init__(self, trigger_type: str, stage: str):
+        self.trigger_id = f"{trigger_type}-{uuid.uuid4().hex[:12]}"
+        self.trigger_type = trigger_type
+        self.stage = stage
+        self.started_at = _utcnow()
+        self.metrics: dict = {}
+        self._cost_usd = 0.0
+
+    # -- cost ledger ---------------------------------------------------------
+    def record_cost(self, provider: str, tokens_in: int = 0, tokens_out: int = 0,
+                    web_searches: int = 0, commission: float = 0.0,
+                    note: str = "") -> float:
+        prices = PRICING.get(provider, {})
+        unit_cost = (
+            tokens_in / 1e6 * prices.get("per_m_tokens_in", 0.0)
+            + tokens_out / 1e6 * prices.get("per_m_tokens_out", 0.0)
+            + web_searches * PRICING["web_search"]["per_call"]
+        )
+        self._cost_usd += unit_cost + commission
+        _append_jsonl(LOGS_DIR / "cost_ledger.jsonl", {
+            "trigger_id": self.trigger_id,
+            "trigger_type": self.trigger_type,
+            "stage": self.stage,
+            "provider": provider,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "web_searches": web_searches,
+            "unit_cost": round(unit_cost, 6),
+            "commission": commission,
+            "note": note,
+            "ts": _utcnow(),
+        })
+        return unit_cost
+
+    # -- run log -------------------------------------------------------------
+    def add_metrics(self, **kwargs) -> None:
+        self.metrics.update(kwargs)
+
+    def _log_run(self, status: str, error: str = "") -> None:
+        _append_jsonl(LOGS_DIR / "runs.jsonl", {
+            "trigger_id": self.trigger_id,
+            "trigger_type": self.trigger_type,
+            "stage": self.stage,
+            "started_at": self.started_at,
+            "finished_at": _utcnow(),
+            "status": status,
+            "error": error,
+            "cost_usd": round(self._cost_usd, 6),
+            "metrics": self.metrics,
+        })
+
+    # -- context manager -----------------------------------------------------
+    def __enter__(self) -> "Trigger":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc is None:
+            self._log_run("ok")
+        else:
+            self._log_run("error", error=f"{exc_type.__name__}: {exc}")
+        return False  # never swallow exceptions
+
+# ═══════════════════════════════ Feature store ═══════════════════════════════
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS registry (
