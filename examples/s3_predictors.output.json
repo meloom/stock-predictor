@@ -1,31 +1,96 @@
 {
-  "note": "REAL data. Technical features carry historical variation; the fundamental features are ~flat here (only the latest statement is ingested), so this is honestly a TECHNICAL-feature result until the S1 statement-history backfill lands.",
+  "what_this_is": "A stock PRICE predictor: for each stock it predicts the close 1 day(s) ahead. Judged on predicted-vs-actual PRICE error, AND against the naive 'tomorrow=today' baseline \u2014 the honest test of whether it beats a random walk.",
   "model": "end_of_day_price / Ridge",
-  "horizon_days": 20,
+  "horizon_days": 1,
   "universe_size": 38,
-  "panel_rows": 3268,
-  "train_rows": 1976,
-  "test_rows": 418,
-  "purged_split": {
-    "train_end": "2025-10-13",
-    "test_start": "2026-04-07",
-    "purge_days": 15,
-    "embargo_days": 7
+  "test_rows": 1444,
+  "sample_predictions_predicted_vs_actual_price": [
+    {
+      "date": "2026-02-09",
+      "ticker": "AAPL",
+      "todays_close": 274.37,
+      "predicted_price": 273.71,
+      "actual_price": 273.43,
+      "naive_price(=today)": 274.37
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "MSFT",
+      "todays_close": 411.77,
+      "predicted_price": 413.08,
+      "actual_price": 411.44,
+      "naive_price(=today)": 411.77
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "NVDA",
+      "todays_close": 189.81,
+      "predicted_price": 189.77,
+      "actual_price": 188.31,
+      "naive_price(=today)": 189.81
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "AMD",
+      "todays_close": 216.0,
+      "predicted_price": 216.89,
+      "actual_price": 213.57,
+      "naive_price(=today)": 216.0
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "INTC",
+      "todays_close": 50.24,
+      "predicted_price": 50.22,
+      "actual_price": 47.13,
+      "naive_price(=today)": 50.24
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "MRVL",
+      "todays_close": 82.29,
+      "predicted_price": 82.23,
+      "actual_price": 81.95,
+      "naive_price(=today)": 82.29
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "AVGO",
+      "todays_close": 342.68,
+      "predicted_price": 342.61,
+      "actual_price": 339.19,
+      "naive_price(=today)": 342.68
+    },
+    {
+      "date": "2026-02-09",
+      "ticker": "QCOM",
+      "todays_close": 137.54,
+      "predicted_price": 138.26,
+      "actual_price": 138.68,
+      "naive_price(=today)": 137.54
+    }
+  ],
+  "price_error_metrics": {
+    "n": 1444,
+    "model": {
+      "rmse": 10.53988996664572,
+      "mae": 4.920978699993664,
+      "mape_pct": 1.964505629358198
+    },
+    "naive_persistence": {
+      "rmse": 10.580603894835196,
+      "mae": 4.955965380259168,
+      "mape_pct": 1.9756971174990645
+    },
+    "model_beats_naive_rmse": true,
+    "rmse_improvement_pct": 0.38479777330431747
   },
-  "test_metrics": {
-    "n": 418,
-    "ic": 0.06546523523892514,
-    "mse": 0.03385637883084378,
-    "null_mse": 0.03494278710064436,
-    "r2_vs_null": 0.031091059412960864,
+  "return_metrics_cross_sectional": {
+    "n": 1444,
+    "ic": 0.0728894354655169,
+    "mse": 0.0008913107048836674,
+    "null_mse": 0.0008940196121069851,
+    "r2_vs_null": 0.003030031093986363,
     "beats_null": true
-  },
-  "top_factor_loadings": {
-    "tech.hvol20": 0.017071921067990763,
-    "tech.mom20": 0.010724439578767495,
-    "tech.rsi14": -0.006324888264933478,
-    "tech.vr20": 0.0013564715640359997,
-    "tech.mom5": -0.000547785183435147,
-    "fund.book_to_price": 0.0
   }
 }

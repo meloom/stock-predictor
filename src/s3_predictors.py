@@ -127,8 +127,9 @@ def _predict_vec(trained, X):
 
 
 def evaluate(trained, X, y) -> dict:
-    """Held-out test metrics — the §5 evidence. IC (rank corr) + MSE vs. the
-    predict-the-mean null. A model that doesn't beat the null doesn't ship."""
+    """Held-out RETURN metrics — the cross-sectional view. IC (rank corr) +
+    MSE vs. the predict-the-mean null. A model that doesn't beat the null
+    doesn't ship."""
     import numpy as np
     pred = _predict_vec(trained, X)
     mse = float(np.mean((pred - y) ** 2))
@@ -137,6 +138,34 @@ def evaluate(trained, X, y) -> dict:
             "mse": mse, "null_mse": null_mse,
             "r2_vs_null": (1 - mse / null_mse) if null_mse else None,
             "beats_null": bool(mse < null_mse)}
+
+
+def evaluate_price(pred_returns, actual_returns, base_prices) -> dict:
+    """PRICE-prediction view — what a price predictor is actually judged on.
+    predicted_price = base * (1 + pred_return); actual = base * (1 + actual);
+    naive persistence = base (tomorrow == today). Reports RMSE/MAE/MAPE for the
+    MODEL and the NAIVE baseline, and whether the model beats naive.
+
+    This baseline is non-negotiable: on a near-random-walk series, naive
+    persistence gives tiny error that looks like skill. A price model that does
+    not beat naive has learned nothing, however pretty its predicted-vs-actual
+    chart. (machinelearningmastery.com random-walk forecasting.)"""
+    import numpy as np
+    base = np.asarray(base_prices, float)
+    actual_px = base * (1 + np.asarray(actual_returns, float))
+    model_px = base * (1 + np.asarray(pred_returns, float))
+    naive_px = base                                        # persistence
+
+    def metrics(px):
+        err = px - actual_px
+        return {"rmse": float(np.sqrt(np.mean(err ** 2))),
+                "mae": float(np.mean(np.abs(err))),
+                "mape_pct": float(np.mean(np.abs(err / actual_px)) * 100)}
+
+    m, nv = metrics(model_px), metrics(naive_px)
+    return {"n": int(len(base)), "model": m, "naive_persistence": nv,
+            "model_beats_naive_rmse": bool(m["rmse"] < nv["rmse"]),
+            "rmse_improvement_pct": float((nv["rmse"] - m["rmse"]) / nv["rmse"] * 100)}
 
 
 # ═══════════════ Live prediction + orchestrator ═══════════════

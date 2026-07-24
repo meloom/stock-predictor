@@ -6,8 +6,23 @@ import pytest
 
 import core as core_mod
 from core import FeatureStore
-from s3_predictors import (assemble_panel, train, evaluate, run_predictors,
-                           predict_eod, PREDICTOR_FEATURES)
+from s3_predictors import (assemble_panel, train, evaluate, evaluate_price,
+                           run_predictors, predict_eod, PREDICTOR_FEATURES)
+
+
+def test_price_eval_vs_naive_baseline():
+    # base 100; actual return +2% -> actual price 102.
+    base = [100.0, 200.0, 50.0]
+    actual = [0.02, -0.01, 0.04]
+    # a model that predicts the actual return exactly -> zero error, beats naive
+    perfect = evaluate_price(actual, actual, base)
+    assert perfect["model"]["rmse"] == 0.0
+    assert perfect["model_beats_naive_rmse"] is True
+    # a model that predicts zero return == naive persistence -> NO improvement
+    naive_like = evaluate_price([0.0, 0.0, 0.0], actual, base)
+    assert naive_like["model"]["rmse"] == naive_like["naive_persistence"]["rmse"]
+    assert naive_like["model_beats_naive_rmse"] is False
+    assert abs(naive_like["rmse_improvement_pct"]) < 1e-9
 
 
 @pytest.fixture(autouse=True)

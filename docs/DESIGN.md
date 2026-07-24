@@ -272,7 +272,7 @@ into decisions. S3 is a FRAMEWORK for multiple predictors; it starts with one.
 |---|---|
 | **Input** | The S2 feature vector per (date, ticker) from the store |
 | **Output** | `predict.*` features. First predictor `end_of_day_price`: `predict.eod_return` (forecast forward return over horizon H) + `predict.eod_price` (implied close). Model is trained, versioned, and its held-out `test_metrics` recorded |
-| **Metrics** | **IC** (rank corr of prediction vs. realized return) on a purged, touched-once test — the headline · **MSE vs. the predict-the-mean null** (a model that doesn't beat the null doesn't ship) · factor loadings (Ridge coefficients — interpretable) · coverage (tickers predicted / universe) |
+| **Metrics** | Two views. **Price view** (what a price predictor is judged on): predicted-vs-actual PRICE RMSE/MAE/MAPE, always reported **against the naive persistence baseline** (tomorrow=today) — on a near-random-walk series a low MAPE means nothing unless it beats naive. **Cross-sectional view**: **IC** (rank corr) + MSE vs. predict-the-mean null. Plus factor loadings (Ridge coefs) + coverage. |
 | **Hard rules** | The model **exists, trains, and is MEASURED daily** — §5 governs whether its output sizes REAL CAPITAL, not whether it runs. "Don't deploy unvalidated" ≠ "don't build." Runs in **OBSERVATION mode**: predictions recorded + scored (S9 computes daily IC) so it accumulates the evidence to earn the gate. Training panel is POINT-IN-TIME correct: features `event_time <= d`, target from `event_time > d`; purge 15d / embargo 7d; non-overlapping-window significance before any §5 claim. Missing features mean-imputed, never sentineled. |
 
 **Implementation notes (landed 2026-07-24)**
@@ -283,9 +283,14 @@ into decisions. S3 is a FRAMEWORK for multiple predictors; it starts with one.
 - First real measured result (38-ticker universe, 2y, 20-day horizon,
   technical features — fundamentals ~flat until S1 statement-history backfill):
   held-out **IC ≈ 0.065, beats the predict-the-mean null (R² vs null ≈ +3%)**.
-  Small, single-split, pooled total-return (conflates some market direction
-  with selection) — NOT a §5 pass, but a real, non-zero, honestly-measured
-  starting point. Top loadings: hvol20 (+), mom20 (+), rsi14 (−, mean-reversion).
+  Small, single-split, pooled total-return — NOT a §5 pass.
+- **Price view, next-day (h=1), the honest reckoning**: model MAPE 1.96% vs
+  naive-persistence MAPE 1.98% — model beats naive by only 0.38% on RMSE. The
+  "impressive" sub-2% MAPE is a mirage: the model essentially predicts
+  tomorrow ≈ today (AAPL: today $274.37, predicted $273.71; INTC: today
+  $50.24, predicted $50.22, actual $47.13 — a real move it entirely missed).
+  This is why the naive baseline is mandatory, not optional. Top loadings:
+  hvol20 (+), mom20 (+), rsi14 (−, mean-reversion).
 
 ### S4 · Alpha
 
