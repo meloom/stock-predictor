@@ -67,6 +67,26 @@ def test_freshness_reports_latest(store):
     assert fr["latest_event_time"] == "2026-07-24"
 
 
+def test_read_series_correction_shadowing_and_as_known_at(store):
+    _register_close(store)
+    store.write("price.close", "AAPL", "2026-07-21", 100.0, trigger_id="t",
+                ingested_at="2026-07-21T21:00:00+00:00")
+    store.write("price.close", "AAPL", "2026-07-22", 101.0, trigger_id="t",
+                ingested_at="2026-07-22T21:00:00+00:00")
+    # correction of the 07-21 bar, ingested later
+    store.write("price.close", "AAPL", "2026-07-21", 99.0, trigger_id="t2",
+                ingested_at="2026-07-23T09:00:00+00:00")
+
+    series = store.read_series("price.close", "AAPL", "2026-07-22", 5)
+    assert series == [("2026-07-21", 99.0), ("2026-07-22", 101.0)]  # correction wins
+
+    known_early = store.read_series("price.close", "AAPL", "2026-07-22", 5,
+                                    as_known_at="2026-07-22T22:00:00+00:00")
+    assert known_early == [("2026-07-21", 100.0), ("2026-07-22", 101.0)]  # not yet
+
+    assert store.read_series("price.close", "AAPL", "2026-07-22", 1) == [("2026-07-22", 101.0)]
+
+
 def test_outputs_of_trigger(store):
     """Trigger→output traceability: given a trigger_id, the store answers
     exactly what that invocation produced."""

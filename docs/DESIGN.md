@@ -128,7 +128,7 @@ done, regardless of whether its happy path works:
 | Link | Required log artifact | What S8 checks with it | Status |
 |---|---|---|---|
 | S1 → S8 | `runs.jsonl` run record (status incl. crashes, coverage %, calendar unknowns) + store lineage (`ingested_at`, `trigger_id` on every value) + `outputs_of(trigger_id)` | Did ingestion run and complete? Is today's data actually fresh? What exactly did each run produce? | **Implemented** |
-| S2 → S8 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | Specced |
+| S2 → S8 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | **Implemented** |
 | S3 → S8 | Prediction record per (date, ticker): score, tier, model version, **data-lineage stamp** (max `ingested_at` of inputs used) | Daily IC vs. realized excess returns; stale-input prediction rate (predictions on old data are pipeline defects, not model error) | Specced |
 | S4 → S8 | Sizing log per order: target-$, realized-$, deviation %, skip reasons | Allocation-deviation distribution; weight-order inversions; overshoot rejections | Specced |
 | S5 → S8 | Order/fill log (`trigger_id` on every order) reconciled against broker fills — broker is ground truth, not in-memory state | Fill rate, slippage, rejections, reconciliation mismatches (target: zero) | Specced |
@@ -212,6 +212,21 @@ done, regardless of whether its happy path works:
 | **Output** | **Derived features written back to the feature store** under their own namespaces — `tech.*` (RSI, BB, ATR, momentum 3–60d, volume ratios), `xsec.*` (per-day cross-sectional ranks/z-scores), `regime.*` (market-level) — same registry, bitemporal keys, and point-in-time rules as S1 outputs. Model-ready matrices are assembled from store reads at query time, not maintained as separate artifacts |
 | **Metrics** | Feature NaN rate per column (alert on regression) · Lookahead audit: every feature reproducible using only data available at its timestamp (tested, not asserted) · Feature-target leak check on any new feature before it enters a model |
 | **Hard rules** | Raw next-day return targets conflate market drift with stock selection — in a trending window every decile of a useless ranker shows positive "returns." All cross-sectional evaluation uses **market-excess** (and where relevant sector-excess) returns. |
+
+**Implementation notes (landed 2026-07-24)**
+- `src/s2_signals.py`: registry (`tech.rsi14/mom5/mom20/hvol20/vr20`,
+  `xsec.rank_rsi14/rank_mom5`, `regime.breadth5`) · pure computation functions
+  · orchestrator. All input reads go through `core.py`'s `read_series(...,
+  end_event_time=event_date)`, so lookahead is impossible by construction —
+  and the property is TESTED: appending future bars must not change a past
+  day's computed signals (`test_future_data_cannot_change_past_computation`).
+- A ticker with no bar ON the event date is skipped and counted
+  (`no_bar_on_date`) — never computed from an old bar and presented as fresh
+  (that is the 22-cycle placeholder failure in per-ticker form).
+- Insufficient history skips that feature only, counted per feature in run
+  metrics. No sentinels.
+- `core.py` gained `read_series()` (bitemporal history reads: corrections
+  shadow, `as_known_at` filters) — tested for both properties.
 
 ### S3 · Alpha
 
@@ -355,6 +370,7 @@ model binaries (see `.gitignore`).
 | Layer | Status |
 |---|---|
 | Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/core.py`; 11 passing contract tests; smoke-tested on live data |
+| Signal generation (S2) | **Migrated 2026-07-24** — `src/s2_signals.py`; PIT property tested; real-trigger confirmed (36 features, 5 tickers) |
 | Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/s1_data.py` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
 | Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
 | Ops/reporting (S7) | Migrate after execution, with cost fixes retained |

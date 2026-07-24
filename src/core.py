@@ -220,6 +220,27 @@ class FeatureStore:
         return len(rows)
 
     # -- read (the one API) --------------------------------------------------
+    def read_series(self, feature: str, scope: str, end_event_time: str,
+                    n: int, as_known_at: Optional[str] = None) -> list[tuple]:
+        """Last n values with event_time <= end_event_time, ascending, one
+        (latest-ingested) version per event_time. History reads for derived-
+        feature computation (S2) go through this — same as_known_at semantics
+        as read_asof, so a signal computed 'as known at T' is lookahead-free
+        by construction. Returns [(event_time, value), ...]."""
+        # SQLite documented behavior: with a single MAX() aggregate, bare
+        # columns come from the max row — newest ingested_at per event_time
+        # wins (bitemporal: corrections shadow older versions).
+        q = ("SELECT event_time, value, MAX(ingested_at) FROM feature_values "
+             "WHERE feature=? AND scope=? AND event_time<=?")
+        params: list = [feature, scope, end_event_time]
+        if as_known_at is not None:
+            q += " AND ingested_at<=?"
+            params.append(as_known_at)
+        q += " GROUP BY event_time ORDER BY event_time DESC LIMIT ?"
+        params.append(n)
+        rows = self._conn.execute(q, params).fetchall()
+        return [(et, json.loads(v)) for et, v, _ in reversed(rows)]
+
     def read_asof(self, feature: str, scope: str, event_time: str,
                   as_known_at: Optional[str] = None) -> Optional[dict]:
         """Latest value with event_time <= the requested time; if as_known_at
