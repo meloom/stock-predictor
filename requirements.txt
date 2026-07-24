@@ -1,0 +1,5 @@
+pandas>=2.0
+yfinance>=0.2.40
+lxml>=5.0          # REQUIRED: yfinance earnings_dates silently degrades without it
+anthropic>=0.40
+pytest>=8.0

@@ -5,6 +5,12 @@ Predecessor: a working prototype (now archived off-repo) that traded real
 capital and paid for every lesson encoded here. Where this doc states a rule,
 there is a dated, real-money incident behind it.
 
+**Sync rule: this document is the source of truth and changes in the same
+commit as the behavior it describes.** A design doc that trails the code is
+how the predecessor ended up with "non-negotiable" purge gaps that existed
+only in documentation. Implementation-level decisions are recorded in the
+*Implementation notes* blocks below as modules land.
+
 ---
 
 ## 1. Goal and honest constraints
@@ -129,6 +135,34 @@ money at every threshold when run in the real pipeline.
   lists, no separate research/production code paths — the train/serve skew
   that let the predecessor validate components in configurations that never
   matched live.
+
+**Implementation notes (landed 2026-07-24)**
+- `src/feature_store/store.py`: SQLite at `runtime/features.db` (stdlib,
+  single file, zero infra — the contract is the point, the backend is
+  deliberately boring). `register()` is idempotent but raises on spec change:
+  semantic changes get a NEW feature name, meaning is never mutated under an
+  old one. Reads: `read_asof(feature, scope, event_time, as_known_at)` and
+  `read_panel(...)`; `as_known_at` filters on `ingested_at`, which is what
+  makes backtests lookahead-impossible by construction. `freshness()` serves
+  S8's staleness audit. Every write carries `trigger_id` (lineage → cost ledger).
+- `src/common/trigger.py`: `Trigger` context manager mints `trigger_id`,
+  appends to `runtime/logs/cost_ledger.jsonl` (per billable action) and
+  `runtime/logs/runs.jsonl` (per run — **including crashed runs**, logged with
+  `status="error"`; silence must never be indistinguishable from success).
+  Ledger prices are estimates for regression detection; the billing dashboard
+  stays ground truth for absolute spend.
+- `src/data/registry.py`: the declared S1 feature set (`price.close`,
+  `price.volume`, `macro.vix`, `macro.yield10y`, `macro.spy_close`,
+  `calendar.days_to_earnings`, `fundamental.earnings_signal`) with per-feature
+  point-in-time rules. This file IS the ingestion contract — the store rejects
+  anything not declared here.
+- `src/data/sources.py`: the only network I/O in the data layer (plus the LLM
+  call in `earnings_signal.py`); everything else takes fetchers as injected
+  callables so tests run offline. Unknown values return `None`, never sentinel
+  numbers (the predecessor's `days_to_earnings=999` sentinel leaked into
+  model features as a plausible-looking number).
+- Runtime artifacts live under gitignored `runtime/` (override:
+  `STOCK_PREDICTOR_RUNTIME`).
 
 ### S2 · Signal Generation
 
@@ -284,9 +318,10 @@ model binaries (see `.gitignore`).
 
 | Layer | Status |
 |---|---|
+| Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/feature_store`, `src/common`; 11 passing contract tests; smoke-tested on live data |
+| Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/data` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
 | Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
-| Ops/reporting (S7) | Migrate second, with cost fixes retained |
-| Data + earnings signals (S1) | Migrate third; earnings extraction is observation-only |
+| Ops/reporting (S7) | Migrate after execution, with cost fixes retained |
 | Alpha scorer (S3-A2) | **Not migrated as-is** — measured no-edge; rebuild around fundamentals/earnings features and pass §5 first |
 | Regime gate (S3-A1) | Migrate with S3 scaffolding; it demonstrated correct cash calls live |
 | Automated trading cron | **Off** until cutover criteria: all above migrated + tested + §5 pass for any live signal |
