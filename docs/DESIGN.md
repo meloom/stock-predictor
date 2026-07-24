@@ -105,16 +105,37 @@ money at every threshold when run in the real pipeline.
 | | |
 |---|---|
 | **Input** | Ticker universe (~140–150 names, price ≥ $25); yfinance OHLCV (daily + 5-min); macro series (VIX, 10Y, curve, DXY, Fed rate, FOMC calendar); earnings calendar (yfinance `earnings_dates`, requires `lxml` — silently degrades without it); grounded LLM extraction of the most recent earnings report per ticker (Claude API + real web search) |
-| **Output** | Per-ticker feature frames (append-only store); `_macro` frame; per-ticker earnings-signal record: `{guidance_direction, capex_trend, capex_framing, adj_eps_surprise_pct, revenue_surprise_pct, one_time_items[], net_signal, confidence}` |
-| **Metrics** | Data freshness (hours since last bar; alert > 24h on a trading day) · Coverage (tickers with today's data / universe; alert < 95%) · Earnings-signal grounding rate (% of calls returning `has_recent_report` with cited evidence vs. errors) · LLM call budget (calls/day; cap and monitor — a duplicated compute path once silently doubled daily spend) |
+| **Output** | (1) Immutable raw source data (OHLCV bars, macro series, raw LLM responses) retained for reproducibility; (2) **features registered in the feature store** (contract below) — everything downstream-consumable is a store feature, no bespoke side-channel artifacts. Namespaced registry, e.g. `price.*` (close, volume, intraday bars), `macro.*` (vix, yield10y, curve, …), `calendar.days_to_earnings`, `fundamental.*` (guidance_direction, capex_trend, capex_framing, adj_eps_surprise_pct, revenue_surprise_pct, net_signal, confidence) |
+| **Metrics** | Data freshness (hours since last bar; alert > 24h on a trading day) · Coverage (tickers with today's data / universe; alert < 95%) · Registry conformance: % of downstream reads served from registered features (target 100%; any bespoke-artifact read is a defect) · Earnings-signal grounding rate (% of calls returning `has_recent_report` with cited evidence vs. errors) · LLM call budget (calls/day; cap and monitor — a duplicated compute path once silently doubled daily spend) |
 | **Hard rules** | LLM extraction must be **grounded** (real search results) — an ungrounded classifier flip-flopped HIGH/LOW on a stable non-event and caused real whipsaw trades. Fails closed (`insufficient_data`), never guesses. Extended-hours prices come from fields that actually carry them — `fast_info.lastPrice` does not (stale-close bug, caught live). |
+
+#### Feature store contract (consumed by S2–S8)
+
+- **Registry**: every feature is declared before first write — name (namespaced),
+  dtype, scope (per-ticker / market-level), source stage, update cadence, and
+  its **point-in-time rule** (when the value becomes knowable). Unregistered
+  writes are rejected.
+- **Bitemporal keys**: values are stored keyed by *(feature, scope, event_time,
+  ingested_at)*. `event_time` is what backtests join on (no lookahead by
+  construction); `ingested_at` is what S8's lineage audit checks (a prediction
+  reading values whose `ingested_at` predates the session is a stale-input
+  defect). This makes the predecessor's undetected 22-cycle placeholder-value
+  failure structurally impossible to miss.
+- **Append-only, versioned**: corrections append a new `ingested_at` version;
+  history is never rewritten, so any past prediction can be reproduced exactly
+  from what was known at the time.
+- **One read API for research and production**: backtests and the live trader
+  read features through the same interface. No manifest-maintained feature
+  lists, no separate research/production code paths — the train/serve skew
+  that let the predecessor validate components in configurations that never
+  matched live.
 
 ### S2 · Signal Generation
 
 | | |
 |---|---|
-| **Input** | S1 feature frames |
-| **Output** | Point-in-time-correct feature matrix per (date, ticker): technical (RSI, BB, ATR, momentum 3–60d, volume ratios), cross-sectional per-day ranks/z-scores, market-level regime features, fundamental signals from S1-D4 |
+| **Input** | Feature store reads (`price.*`, `macro.*`, `calendar.*`, `fundamental.*`) |
+| **Output** | **Derived features written back to the feature store** under their own namespaces — `tech.*` (RSI, BB, ATR, momentum 3–60d, volume ratios), `xsec.*` (per-day cross-sectional ranks/z-scores), `regime.*` (market-level) — same registry, bitemporal keys, and point-in-time rules as S1 outputs. Model-ready matrices are assembled from store reads at query time, not maintained as separate artifacts |
 | **Metrics** | Feature NaN rate per column (alert on regression) · Lookahead audit: every feature reproducible using only data available at its timestamp (tested, not asserted) · Feature-target leak check on any new feature before it enters a model |
 | **Hard rules** | Raw next-day return targets conflate market drift with stock selection — in a trending window every decile of a useless ranker shows positive "returns." All cross-sectional evaluation uses **market-excess** (and where relevant sector-excess) returns. |
 
@@ -180,8 +201,9 @@ money at every threshold when run in the real pipeline.
 stock-predictor/
 ├── docs/DESIGN.md            # this file
 ├── src/
+│   ├── feature_store/        # registry + bitemporal storage + the one read API
 │   ├── data/                 # S1 ingestion (prices, macro, earnings, LLM signals)
-│   ├── signals/              # S2 feature pipeline (point-in-time tested)
+│   ├── signals/              # S2 derived features (point-in-time tested)
 │   ├── alpha/                # S3 regime gate, scorer (gated), event risk
 │   ├── portfolio/            # S4 sizing with value-vs-target verification
 │   ├── execution/            # S5 IBKR adapter: orders, fills, sync, cooldown
