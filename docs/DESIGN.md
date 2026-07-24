@@ -43,9 +43,9 @@ flowchart TD
     end
 
     subgraph ALPHA["S3 · Alpha"]
-        A1{Regime gate\nbelow threshold → CASH, stop}
-        A2[Stock scorer - VALIDATION-GATED, currently disabled]
-        A3[Event-risk veto - earnings proximity, deterministic]
+        A1{"Regime gate: below threshold → CASH"}
+        A2["Stock scorer — VALIDATION-GATED, currently disabled"]
+        A3["Event-risk veto — earnings proximity, deterministic"]
     end
 
     subgraph PORT["S4 · Portfolio Construction"]
