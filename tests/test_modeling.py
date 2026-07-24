@@ -45,16 +45,17 @@ def test_performance_log_records_required_metadata(tmp_path, monkeypatch):
               "dev_range": ["2026-06-29", "2026-07-10"],
               "tickers": ["AAPL", "MSFT"], "features": ["tech.rsi14"],
               "label_strategy": "end_of_day_forward_return(H=1d)", "horizon_days": 1}
-    metrics = {"return": {"ic": 0.04, "beats_null": True},
-               "price": {"model": {"mape_pct": 2.0},
-                         "naive_persistence": {"mape_pct": 2.1},
+    metrics = {"return": {"ic": 0.04, "rmse": 0.03, "beats_null": True},
+               "price": {"model": {"mape_pct": 2.0, "rmse": 5.0},
+                         "naive_persistence": {"mape_pct": 2.1, "rmse": 5.1},
                          "model_beats_naive_rmse": True}}
     rec = H.log_performance("ridge", ranges, metrics, promoted=True)
     import json as _j
     logged = _j.loads((tmp_path / "performance.log").read_text().strip())
-    # every required metadata field present
+    # every required metadata field present, incl. RMSE per model
     for k in ("model", "label_strategy", "train_range", "dev_range", "tickers",
-              "features", "dev_ic", "dev_beats_naive", "promoted"):
+              "features", "dev_ic", "dev_return_rmse", "dev_price_rmse",
+              "dev_naive_price_rmse", "dev_beats_naive", "promoted"):
         assert k in logged
     assert logged["train_range"] == ["2026-06-01", "2026-06-26"]
     assert logged["dev_range"] == ["2026-06-29", "2026-07-10"]

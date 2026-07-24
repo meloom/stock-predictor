@@ -447,7 +447,15 @@ full rules in `.claude/skills/modeling-protocol/SKILL.md`):
 - **One model per file** (`modeling/model_<name>.py`).
 - Every run appends to the shared **`modeling/performance.log`** (JSON lines):
   model, label strategy, train range, dev range, tickers, features, dev
-  metrics (IC, beats-null, price MAPE vs naive), promotion outcome.
+  metrics (**RMSE per model**, IC, beats-null, price RMSE/MAPE vs naive),
+  promotion outcome.
+- **Baselines are first-class models** — `model_baseline_naive.py` (predict
+  return 0 = tomorrow's price is today's; the price-RMSE bar) and
+  `model_baseline_mean.py` (predict the mean return; the null/return-RMSE bar).
+  Every real model's RMSE sits next to theirs in the log. Baselines are never
+  promoted.
+- Features: the full engineered S1/S2 set (technical + fundamental +
+  cross-sectional ranks) via `PREDICTOR_FEATURES`.
 
 Experimentation and the live pipeline are separated:
 

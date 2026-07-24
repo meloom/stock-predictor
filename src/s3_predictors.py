@@ -40,12 +40,21 @@ S3_FEATURES = [
      "test_metrics, inputs_max_ingested_at}."),
 ]
 
-# The input feature vector: the full S2 factor set. Missing values are
-# mean-imputed (0 after standardization), never sentineled.
+# The input feature vector: AS MANY S1/S2 features as are valid model inputs.
+# Missing values are mean-imputed (0 after standardization), never sentineled.
+# (Raw price/volume LEVELS from S1 are deliberately excluded — non-stationary,
+# useless as direct features; they live inside the engineered S2 features here.
+# days_to_earnings is excluded from the training panel: yfinance can't give it
+# point-in-time for historical dates without lookahead.)
 PREDICTOR_FEATURES = [
+    # S2 technical
     "tech.rsi14", "tech.mom5", "tech.mom20", "tech.hvol20", "tech.vr20",
+    # S2 fundamental (value / quality / size) — from S1 statements/shares/analyst
     "fund.book_to_price", "fund.earnings_yield", "fund.fcf_yield",
     "fund.roe", "fund.gross_profitability", "fund.net_margin", "fund.market_cap",
+    # S2 cross-sectional ranks (the selection-relevant form)
+    "xsec.rank_rsi14", "xsec.rank_mom5", "xsec.rank_earnings_yield",
+    "xsec.rank_fcf_yield", "xsec.rank_roe", "xsec.rank_gross_profitability",
 ]
 
 EOD_HORIZON_DAYS = 1   # "end of day": next session's close. Configurable.
@@ -135,7 +144,8 @@ def evaluate(trained, X, y) -> dict:
     mse = float(np.mean((pred - y) ** 2))
     null_mse = float(np.mean((y - np.mean(y)) ** 2))
     return {"n": int(len(y)), "ic": spearman_ic(pred.tolist(), y.tolist()),
-            "mse": mse, "null_mse": null_mse,
+            "mse": mse, "rmse": float(mse ** 0.5),
+            "null_mse": null_mse, "null_rmse": float(null_mse ** 0.5),
             "r2_vs_null": (1 - mse / null_mse) if null_mse else None,
             "beats_null": bool(mse < null_mse)}
 

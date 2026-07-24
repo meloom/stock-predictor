@@ -36,12 +36,28 @@ These are owner-mandated; do not deviate without explicit direction.
   **dev-data range**, **tickers**, **features**, dev metrics (IC, beats-null,
   price MAPE vs naive), and promotion outcome.
 
-## Honesty gates (never skip)
-- Report the **cross-sectional IC** (rank corr vs realized return, beats the
-  predict-the-mean null) AND the **price error vs the naive persistence
-  baseline** (tomorrow=today). A low MAPE that doesn't beat naive is a random
-  walk in disguise — not skill.
+## Baseline models (the bar every real model must clear)
+- Two baselines are FIRST-CLASS models, each its own file, logged like any model:
+  - `model_baseline_naive.py` — predict return 0 (tomorrow's price = today's).
+    This is the price-RMSE bar.
+  - `model_baseline_mean.py` — predict the training mean return (the null).
+    This is the return-RMSE / MSE bar.
+- Baselines are never promoted (they are the bar, not candidates).
+
+## Metrics (report ALL of these per model)
+- **RMSE** — report per model: return-RMSE and price-RMSE, next to the two
+  baselines' RMSE so improvement is readable at a glance.
+- **IC** — cross-sectional rank correlation vs realized return.
+- **beats_null** — return MSE beats `baseline_mean`.
+- **beats_naive** — price RMSE beats `baseline_naive`.
+- A low MAPE/RMSE that doesn't beat naive is a random walk in disguise, not skill.
 - Missing features are mean-imputed, never sentineled.
+
+## Features — use as many valid S1/S2 inputs as possible
+- `s3_predictors.PREDICTOR_FEATURES` = the full engineered set (S2 technical +
+  fundamental + cross-sectional ranks). `prepare_window(with_fundamentals=True)`
+  populates the fund.* features. Raw price/volume LEVELS and point-in-time-
+  unsafe fields (days_to_earnings historically) are excluded on purpose.
 
 ## Promotion → the registry
 - A model reaches `models/` only via `harness.promote()` and only if

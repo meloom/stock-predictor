@@ -29,7 +29,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from core import FeatureStore                                   # noqa: E402
 from universe import UNIVERSE                                   # noqa: E402
-from s1_data import run_daily_ingestion, fetch_daily_bars, fetch_macro  # noqa: E402
+from s1_data import (run_daily_ingestion, fetch_daily_bars, fetch_macro,   # noqa: E402
+                     fetch_shares_outstanding, fetch_latest_statements,
+                     fetch_analyst_snapshot)
 from s2_signals import run_signal_generation                    # noqa: E402
 import s3_predictors as pred                                    # noqa: E402
 
@@ -45,20 +47,32 @@ LABEL_STRATEGY = "end_of_day_forward_return"   # predict close H trading days ah
 # ═══════════════ Data prep: fixed 4wk-train / 2wk-dev window, full universe ═══════════════
 
 def prepare_window(horizon_days: int = 1, universe: list[str] | None = None,
-                   period: str = "6mo") -> dict:
+                   period: str = "6mo", with_fundamentals: bool = True) -> dict:
     """Build a PIT-correct panel over the most recent 4-week-train + 2-week-dev
     window (with a `horizon_days` purge between them). Uses the full universe.
-    Returns {panel, base_prices, split, ranges}."""
+    with_fundamentals=True populates the fund.* features (slower — fetches
+    statements/shares/analyst per ticker, once). Returns {panel, base_prices,
+    split, ranges}."""
     universe = universe or UNIVERSE
     bars = fetch_daily_bars(universe, period=period)
     store = FeatureStore(Path(os.environ.get("TMPDIR", "/tmp")) /
                          f"modeling_{datetime.now(timezone.utc).timestamp()}.db")
+    if with_fundamentals:
+        sh = {t: fetch_shares_outstanding(t) for t in universe}
+        st = {t: fetch_latest_statements(t) for t in universe}
+        an = {t: fetch_analyst_snapshot(t) for t in universe}
+        fetch_shares = lambda t: sh.get(t)
+        fetch_statements = lambda t, asof=None: st.get(t)
+        fetch_analyst = lambda t: an.get(t)
+    else:
+        fetch_shares = lambda t: None
+        fetch_statements = lambda t, asof=None: None
+        fetch_analyst = lambda t: None
     run_daily_ingestion(universe, store=store, fetch_bars=lambda t: bars,
                         fetch_macro=lambda: fetch_macro(period),
                         fetch_dte=lambda t, asof=None: None, fetch_quote=lambda t: None,
-                        fetch_shares=lambda t: None,
-                        fetch_statements=lambda t, asof=None: None,
-                        fetch_analyst=lambda t: None)
+                        fetch_shares=fetch_shares, fetch_statements=fetch_statements,
+                        fetch_analyst=fetch_analyst)
 
     dates = sorted({r["date"] for rows in bars.values() for r in rows})
     usable = dates[:-horizon_days] if horizon_days > 0 else dates   # need forward price
@@ -134,7 +148,10 @@ def log_performance(model_name: str, ranges: dict, metrics: dict,
         "tickers": ranges["tickers"],
         "features": ranges["features"],
         "dev_ic": metrics["return"]["ic"],
+        "dev_return_rmse": metrics["return"]["rmse"],
         "dev_beats_null": metrics["return"]["beats_null"],
+        "dev_price_rmse": metrics["price"]["model"]["rmse"],
+        "dev_naive_price_rmse": metrics["price"]["naive_persistence"]["rmse"],
         "dev_price_mape_pct": metrics["price"]["model"]["mape_pct"],
         "dev_naive_mape_pct": metrics["price"]["naive_persistence"]["mape_pct"],
         "dev_beats_naive": metrics["price"]["model_beats_naive_rmse"],
