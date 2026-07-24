@@ -87,20 +87,55 @@ flowchart TD
         V3[Rank calibration refresh - monthly]
     end
 
-    DATA --> SIG --> ALPHA
-    A1 -- "regime OK" --> A2 --> A3 --> PORT --> EXEC --> RISK --> REPORT
+    DATA -->|"registered features: store writes w/ (event_time, ingested_at, trigger_id)"| SIG
+    SIG -->|"derived features: tech.*, xsec.*, regime.* (same store contract)"| ALPHA
+    A1 -- "regime OK" --> A2 --> A3
+    A3 -->|"scored candidates + confidence tier + data-lineage stamp"| PORT
     A1 -- "regime weak" --> CASH[(Stay in cash)]
-    RISK --> EVAL
-    REPORT --> EVAL
-    EVAL -. "validated changes only" .-> SIG
-    EVAL -. "validated changes only" .-> ALPHA
+    PORT -->|"order specs: ticker, qty, limit, target-$ + realized-$ check"| EXEC
+    EXEC -->|"verified fills w/ trigger_id"| RISK
+    RISK -->|"exit events + P&L"| REPORT
 ```
 
-**Validation gate overlay** (applies to every dashed edge and to S3-A2):
+**Validation gate overlay** (applies to S3-A2 and to every change S8 promotes):
 no component reaches live capital until it passes §5 in the exact
 configuration it will run in. "Validated in isolation" is not validated —
 the predecessor's exit-cascade deployed on isolated validation and lost
 money at every threshold when run in the real pipeline.
+
+### The audit plane: every stage feeds S8, with a defined log contract
+
+Data flow (above) and observability flow are drawn separately so each stays
+readable — but the audit edges are just as binding as the data edges:
+
+```mermaid
+flowchart LR
+    S1["S1 Data"] -.->|"runs.jsonl (coverage, freshness, calendar unknowns) + store lineage: ingested_at, trigger_id + outputs_of()"| S8["S8 Evaluation & Improvement"]
+    S2["S2 Signals"] -.->|"store writes w/ lineage (same contract as S1)"| S8
+    S3["S3 Alpha"] -.->|"prediction records w/ data-lineage stamps + regime decisions log"| S8
+    S4["S4 Portfolio"] -.->|"sizing log: target-$ vs realized-$ per position"| S8
+    S5["S5 Execution"] -.->|"order/fill log w/ trigger_id, reconciled vs broker fills"| S8
+    S6["S6 Risk"] -.->|"exit-event log: trigger rule, price, counterfactual"| S8
+    S7["S7 Reporting"] -.->|"delivery status + content-honesty flags"| S8
+    ALL["every trigger, all stages"] -.->|"cost_ledger.jsonl: per billable action"| S8
+    S8 -. "validated changes only (§5 gate)" .-> S1 & S2 & S3 & S4 & S5 & S6 & S7
+```
+
+**Per-link log contract** — each row defines what must exist for S8 to check
+and confirm that stage's behavior. A stage without its log artifact is not
+done, regardless of whether its happy path works:
+
+| Link | Required log artifact | What S8 checks with it | Status |
+|---|---|---|---|
+| S1 → S8 | `runs.jsonl` run record (status incl. crashes, coverage %, calendar unknowns) + store lineage (`ingested_at`, `trigger_id` on every value) + `outputs_of(trigger_id)` | Did ingestion run and complete? Is today's data actually fresh? What exactly did each run produce? | **Implemented** |
+| S2 → S8 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | Specced |
+| S3 → S8 | Prediction record per (date, ticker): score, tier, model version, **data-lineage stamp** (max `ingested_at` of inputs used) | Daily IC vs. realized excess returns; stale-input prediction rate (predictions on old data are pipeline defects, not model error) | Specced |
+| S4 → S8 | Sizing log per order: target-$, realized-$, deviation %, skip reasons | Allocation-deviation distribution; weight-order inversions; overshoot rejections | Specced |
+| S5 → S8 | Order/fill log (`trigger_id` on every order) reconciled against broker fills — broker is ground truth, not in-memory state | Fill rate, slippage, rejections, reconciliation mismatches (target: zero) | Specced |
+| S6 → S8 | Exit-event log: which rule fired, at what price, plus counterfactual (e.g. hold-to-EOD P&L) | Stop adherence; time-stop yield vs. counterfactual; gate accuracy | Specced |
+| S7 → S8 | Delivery log + flags for any displayed metric lacking its honesty context | Delivery success; report-honesty regressions | Specced |
+| all → S8 | `cost_ledger.jsonl`: one record per billable action with `trigger_id` | Cost per trigger type/day; >2× trailing-median regressions | **Implemented** |
+| S8 → any | Promotion record: change, validation evidence (§5), deploy confirmation | Realized-vs-backtest gap per deployed change; fix survival rate | Specced |
 
 ---
 
