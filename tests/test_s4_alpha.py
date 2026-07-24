@@ -1,11 +1,11 @@
-"""S3 tests: regime scoring exactness, fail-toward-cash on missing inputs,
-lineage stamps, deterministic event risk (UNKNOWN not LOW), disabled scorer,
-PIT stability."""
+"""S4 Alpha tests: regime scoring exactness, fail-toward-cash on missing
+inputs, lineage stamps, deterministic event risk (UNKNOWN not LOW), and the
+combine step that gates S3's prediction by regime + event veto."""
 import pytest
 
 import core as core_mod
 from core import FeatureStore, MARKET_SCOPE
-from s3_alpha import (compute_regime, classify_event_risk, score_stocks,
+from s4_alpha import (compute_regime, classify_event_risk,
                       run_alpha, REGIME_THRESHOLD)
 
 
@@ -101,27 +101,46 @@ def test_event_risk_deterministic_and_unknown(store):
     assert classify_event_risk(None) == "UNKNOWN"  # never silently LOW
 
 
-def test_scorer_is_disabled(store):
-    s = score_stocks(["AAPL"], "2026-06-30")
-    assert s["status"] == "DISABLED"
-    assert "reason" in s
+def test_run_alpha_combines_prediction_regime_event(store):
+    _seed_market(store)  # bullish -> regime TRADE
+    store.register("predict.eod_return", "float", "ticker", "S3", "daily", "pit")
+    # GOOD: positive prediction, no event risk -> actionable
+    store.write("calendar.days_to_earnings", "GOOD", "2026-06-30", 45, trigger_id="s")
+    store.write("predict.eod_return", "GOOD", "2026-06-30", 0.02, trigger_id="s")
+    # EARN: positive prediction BUT earnings in 1 day -> event veto, not actionable
+    store.write("calendar.days_to_earnings", "EARN", "2026-06-30", 1, trigger_id="s")
+    store.write("predict.eod_return", "EARN", "2026-06-30", 0.02, trigger_id="s")
+    # NEG: negative prediction -> not actionable
+    store.write("calendar.days_to_earnings", "NEG", "2026-06-30", 45, trigger_id="s")
+    store.write("predict.eod_return", "NEG", "2026-06-30", -0.01, trigger_id="s")
 
-
-def test_run_alpha_end_to_end_with_lineage(store):
-    _seed_market(store)
-    store.write("calendar.days_to_earnings", "AAPL", "2026-06-30", 1, trigger_id="seed")
-    store.write("calendar.days_to_earnings", "MSFT", "2026-06-30", 45, trigger_id="seed")
-
-    m = run_alpha(["AAPL", "MSFT", "NODATA"], "2026-06-30", store=store)
+    m = run_alpha(["GOOD", "EARN", "NEG"], "2026-06-30", store=store)
     assert m["regime_decision"] == "TRADE"
-    assert m["event_risk_counts"] == {"HIGH": 1, "LOW": 1, "UNKNOWN": 1}
-    assert m["scorer"] == "DISABLED"
+    assert m["has_predictions"] is True
+    assert m["actionable_signals"] == 1  # only GOOD
 
-    aapl = store.read_asof("alpha.event_risk", "AAPL", "2026-06-30")["value"]
-    assert aapl["level"] == "HIGH" and aapl["days_to_earnings"] == 1
-    assert aapl["inputs_max_ingested_at"] is not None
-    nodata = store.read_asof("alpha.event_risk", "NODATA", "2026-06-30")["value"]
-    assert nodata["level"] == "UNKNOWN" and nodata["inputs_max_ingested_at"] is None
+    assert store.read_asof("alpha.signal", "GOOD", "2026-06-30")["value"]["actionable"] is True
+    assert store.read_asof("alpha.signal", "EARN", "2026-06-30")["value"]["actionable"] is False
+    assert store.read_asof("alpha.signal", "NEG", "2026-06-30")["value"]["actionable"] is False
 
-    out = store.outputs_of(m["trigger_id"])
-    assert out["total_values"] == 4  # 1 regime + 3 event-risk records
+
+def test_run_alpha_cash_regime_blocks_all(store):
+    # bearish market -> regime CASH -> nothing actionable even with good predictions
+    _seed_market(store, breadth=0.1, vix=30.0,
+                 spy_closes=[710.0] * 19 + [680.0])
+    store.register("predict.eod_return", "float", "ticker", "S3", "daily", "pit")
+    store.write("calendar.days_to_earnings", "GOOD", "2026-06-30", 45, trigger_id="s")
+    store.write("predict.eod_return", "GOOD", "2026-06-30", 0.05, trigger_id="s")
+    m = run_alpha(["GOOD"], "2026-06-30", store=store)
+    assert m["regime_decision"] == "CASH"
+    assert m["actionable_signals"] == 0
+
+
+def test_run_alpha_no_predictions_still_runs(store):
+    _seed_market(store)
+    store.write("calendar.days_to_earnings", "AAPL", "2026-06-30", 45, trigger_id="s")
+    m = run_alpha(["AAPL"], "2026-06-30", store=store)
+    assert m["has_predictions"] is False
+    assert m["actionable_signals"] == 0
+    sig = store.read_asof("alpha.signal", "AAPL", "2026-06-30")["value"]
+    assert sig["predicted_return"] is None and sig["actionable"] is False

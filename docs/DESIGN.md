@@ -48,26 +48,32 @@ flowchart TD
         F4[Fundamental signals: guidance, capex framing, adj-EPS surprise]
     end
 
-    subgraph ALPHA["S3 · Alpha"]
+    subgraph PRED["S3 · Predictors (pluggable models)"]
+        M1["end_of_day_price: features → predicted forward return/price"]
+        M2["(future predictors plug in here)"]
+        M3["trained + MEASURED (IC / MSE vs null); observation mode"]
+    end
+
+    subgraph ALPHA["S4 · Alpha"]
         A1{"Regime gate: below threshold → CASH"}
-        A2["Stock scorer — VALIDATION-GATED, currently disabled"]
+        A2["Combine: gate predictions by regime + event veto"]
         A3["Event-risk veto — earnings proximity, deterministic"]
     end
 
-    subgraph PORT["S4 · Portfolio Construction"]
+    subgraph PORT["S5 · Portfolio Construction"]
         P1[Confidence-tiered dollar targets]
         P2[Whole-share sizing + value-vs-target verification]
         P3[Concentration cap ≤25% per name]
     end
 
-    subgraph EXEC["S5 · Execution"]
+    subgraph EXEC["S6 · Execution"]
         E1[Position sync vs broker ground truth]
         E2[Limit orders only, RTH/AH offsets]
         E3[Fill verification loop]
         E4[Per-ticker cooldown after loss]
     end
 
-    subgraph RISK["S6 · Intraday Risk Loop (15-min)"]
+    subgraph RISK["S7 · Intraday Risk Loop (15-min)"]
         R1[Hard stop -2%]
         R2[Time-stop: flat ±0.5% after 2h]
         R3[Soft-signal exits → LLM decision gate w/ web search]
@@ -75,67 +81,70 @@ flowchart TD
         R5[EOD close-all]
     end
 
-    subgraph REPORT["S7 · Reporting"]
+    subgraph REPORT["S8 · Reporting"]
         N1[Email on every fill]
-        N2[Morning report: regime, ranks, earnings flags, honest calibration note]
+        N2[Morning + alpha report: regime, predictions, factor loadings, honest IC]
         N3[Health checks + escalating alerts]
     end
 
-    subgraph EVAL["S8 · Evaluation & Improvement"]
+    subgraph EVAL["S9 · Evaluation & Improvement"]
         V1[Nightly retrospective: root-cause → fix → backtest → gated deploy]
         V2[Prediction-quality tracking: daily IC vs full universe]
-        V3[Rank calibration refresh - monthly]
+        V3[Model retrain + revalidation]
     end
 
     DATA -->|"registered features: store writes w/ (event_time, ingested_at, trigger_id)"| SIG
-    SIG -->|"derived features: tech.*, xsec.*, regime.* (same store contract)"| ALPHA
+    SIG -->|"derived features: tech.*, xsec.*, fund.* (same store contract)"| PRED
+    PRED -->|"predict.* per ticker + model test_metrics + lineage"| ALPHA
     A1 -- "regime OK" --> A2 --> A3
-    A3 -->|"scored candidates + confidence tier + data-lineage stamp"| PORT
+    A3 -->|"actionable alpha signals + data-lineage stamp"| PORT
     A1 -- "regime weak" --> CASH[(Stay in cash)]
     PORT -->|"order specs: ticker, qty, limit, target-$ + realized-$ check"| EXEC
     EXEC -->|"verified fills w/ trigger_id"| RISK
     RISK -->|"exit events + P&L"| REPORT
 ```
 
-**Validation gate overlay** (applies to S3-A2 and to every change S8 promotes):
+**Validation gate overlay** (applies to the S3 predictors and every change S9 promotes):
 no component reaches live capital until it passes §5 in the exact
 configuration it will run in. "Validated in isolation" is not validated —
 the predecessor's exit-cascade deployed on isolated validation and lost
 money at every threshold when run in the real pipeline.
 
-### The audit plane: every stage feeds S8, with a defined log contract
+### The audit plane: every stage feeds S9, with a defined log contract
 
 Data flow (above) and observability flow are drawn separately so each stays
 readable — but the audit edges are just as binding as the data edges:
 
 ```mermaid
 flowchart LR
-    S1["S1 Data"] -.->|"runs.jsonl (coverage, freshness, calendar unknowns) + store lineage: ingested_at, trigger_id + outputs_of()"| S8["S8 Evaluation & Improvement"]
-    S2["S2 Signals"] -.->|"store writes w/ lineage (same contract as S1)"| S8
-    S3["S3 Alpha"] -.->|"prediction records w/ data-lineage stamps + regime decisions log"| S8
-    S4["S4 Portfolio"] -.->|"sizing log: target-$ vs realized-$ per position"| S8
-    S5["S5 Execution"] -.->|"order/fill log w/ trigger_id, reconciled vs broker fills"| S8
-    S6["S6 Risk"] -.->|"exit-event log: trigger rule, price, counterfactual"| S8
-    S7["S7 Reporting"] -.->|"delivery status + content-honesty flags"| S8
-    ALL["every trigger, all stages"] -.->|"cost_ledger.jsonl: per billable action"| S8
-    S8 -. "validated changes only (§5 gate)" .-> S1 & S2 & S3 & S4 & S5 & S6 & S7
+    S1["S1 Data"] -.->|"runs.jsonl (coverage, freshness) + store lineage + outputs_of()"| S9["S9 Evaluation & Improvement"]
+    S2["S2 Signals"] -.->|"store writes w/ lineage (same contract as S1)"| S9
+    S3["S3 Predictors"] -.->|"prediction records + model test_metrics (IC/MSE) + lineage stamps"| S9
+    S4["S4 Alpha"] -.->|"regime + event-risk + alpha-signal records w/ lineage"| S9
+    S5["S5 Portfolio"] -.->|"sizing log: target-$ vs realized-$ per position"| S9
+    S6["S6 Execution"] -.->|"order/fill log w/ trigger_id, reconciled vs broker fills"| S9
+    S7["S7 Risk"] -.->|"exit-event log: trigger rule, price, counterfactual"| S9
+    S8["S8 Reporting"] -.->|"delivery status + content-honesty flags"| S9
+    ALL["every trigger, all stages"] -.->|"cost_ledger.jsonl: per billable action"| S9
+    S9 -. "validated changes only (§5 gate)" .-> S1 & S2 & S3 & S4 & S5 & S6 & S7 & S8
 ```
 
-**Per-link log contract** — each row defines what must exist for S8 to check
+**Per-link log contract** — each row defines what must exist for S9 to check
 and confirm that stage's behavior. A stage without its log artifact is not
 done, regardless of whether its happy path works:
 
-| Link | Required log artifact | What S8 checks with it | Status |
+| Link | Required log artifact | What S9 checks with it | Status |
 |---|---|---|---|
-| S1 → S8 | `runs.jsonl` run record (status incl. crashes, coverage %, calendar unknowns) + store lineage (`ingested_at`, `trigger_id` on every value) + `outputs_of(trigger_id)` | Did ingestion run and complete? Is today's data actually fresh? What exactly did each run produce? | **Implemented** |
-| S2 → S8 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | **Implemented** |
-| S3 → S8 | Prediction record per (date, ticker): score, tier, model version, **data-lineage stamp** (max `ingested_at` of inputs used) | Daily IC vs. realized excess returns; stale-input prediction rate (predictions on old data are pipeline defects, not model error) | **Implemented** for regime + event-risk records (lineage-stamped); scorer records n/a until a scorer passes §5 |
-| S4 → S8 | Sizing log per order: target-$, realized-$, deviation %, skip reasons | Allocation-deviation distribution; weight-order inversions; overshoot rejections | Specced |
-| S5 → S8 | Order/fill log (`trigger_id` on every order) reconciled against broker fills — broker is ground truth, not in-memory state | Fill rate, slippage, rejections, reconciliation mismatches (target: zero) | Specced |
-| S6 → S8 | Exit-event log: which rule fired, at what price, plus counterfactual (e.g. hold-to-EOD P&L) | Stop adherence; time-stop yield vs. counterfactual; gate accuracy | Specced |
-| S7 → S8 | Delivery log + flags for any displayed metric lacking its honesty context | Delivery success; report-honesty regressions | Specced |
-| all → S8 | `cost_ledger.jsonl`: one record per billable action with `trigger_id` | Cost per trigger type/day; >2× trailing-median regressions | **Implemented** |
-| S8 → any | Promotion record: change, validation evidence (§5), deploy confirmation | Realized-vs-backtest gap per deployed change; fix survival rate | Specced |
+| S1 → S9 | `runs.jsonl` run record (status incl. crashes, coverage %, calendar unknowns) + store lineage (`ingested_at`, `trigger_id` on every value) + `outputs_of(trigger_id)` | Did ingestion run and complete? Is today's data actually fresh? What exactly did each run produce? | **Implemented** |
+| S2 → S9 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | **Implemented** |
+| S3 → S9 | Prediction record per (date, ticker) + model `test_metrics` (IC/MSE vs null) + **data-lineage stamp** | Daily IC vs. realized return; stale-input prediction rate; realized-vs-backtest IC gap | **Implemented** (predictor trains, writes predictions + test_metrics; observation mode) |
+| S4 → S9 | Regime + event-risk + alpha-signal records, lineage-stamped | Regime-gate precision; event-veto correctness; actionable-signal counts | **Implemented** |
+| S5 → S9 | Sizing log per order: target-$, realized-$, deviation %, skip reasons | Allocation-deviation distribution; weight-order inversions; overshoot rejections | Specced |
+| S6 → S9 | Order/fill log (`trigger_id` on every order) reconciled against broker fills — broker is ground truth, not in-memory state | Fill rate, slippage, rejections, reconciliation mismatches (target: zero) | Specced |
+| S7 → S9 | Exit-event log: which rule fired, at what price, plus counterfactual (e.g. hold-to-EOD P&L) | Stop adherence; time-stop yield vs. counterfactual; gate accuracy | Specced |
+| S8 → S9 | Delivery log + flags for any displayed metric lacking its honesty context | Delivery success; report-honesty regressions | Specced |
+| all → S9 | `cost_ledger.jsonl`: one record per billable action with `trigger_id` | Cost per trigger type/day; >2× trailing-median regressions | **Implemented** |
+| S9 → any | Promotion record: change, validation evidence (§5), deploy confirmation | Realized-vs-backtest gap per deployed change; fix survival rate | Specced |
 
 ---
 
@@ -252,7 +261,33 @@ done, regardless of whether its happy path works:
 - `core.py` gained `read_series()` (bitemporal history reads: corrections
   shadow, `as_known_at` filters) — tested for both properties.
 
-### S3 · Alpha
+### S3 · Predictors
+
+**The predictive core, as its own stage** (added 2026-07-24 at owner
+direction): a stock predictor is not the same concern as alpha. A PREDICTOR
+forecasts something about a stock; ALPHA (S4) turns forecasts + regime + risk
+into decisions. S3 is a FRAMEWORK for multiple predictors; it starts with one.
+
+| | |
+|---|---|
+| **Input** | The S2 feature vector per (date, ticker) from the store |
+| **Output** | `predict.*` features. First predictor `end_of_day_price`: `predict.eod_return` (forecast forward return over horizon H) + `predict.eod_price` (implied close). Model is trained, versioned, and its held-out `test_metrics` recorded |
+| **Metrics** | **IC** (rank corr of prediction vs. realized return) on a purged, touched-once test — the headline · **MSE vs. the predict-the-mean null** (a model that doesn't beat the null doesn't ship) · factor loadings (Ridge coefficients — interpretable) · coverage (tickers predicted / universe) |
+| **Hard rules** | The model **exists, trains, and is MEASURED daily** — §5 governs whether its output sizes REAL CAPITAL, not whether it runs. "Don't deploy unvalidated" ≠ "don't build." Runs in **OBSERVATION mode**: predictions recorded + scored (S9 computes daily IC) so it accumulates the evidence to earn the gate. Training panel is POINT-IN-TIME correct: features `event_time <= d`, target from `event_time > d`; purge 15d / embargo 7d; non-overlapping-window significance before any §5 claim. Missing features mean-imputed, never sentineled. |
+
+**Implementation notes (landed 2026-07-24)**
+- `src/s3_predictors.py`: pluggable framework; first predictor `end_of_day_price`
+  (Ridge baseline — linear, regularized, coefficients ARE factor loadings).
+  `assemble_panel` (PIT-correct), `train`, `evaluate` (IC + MSE-vs-null),
+  `predict_eod`, `run_predictors` (observation mode).
+- First real measured result (38-ticker universe, 2y, 20-day horizon,
+  technical features — fundamentals ~flat until S1 statement-history backfill):
+  held-out **IC ≈ 0.065, beats the predict-the-mean null (R² vs null ≈ +3%)**.
+  Small, single-split, pooled total-return (conflates some market direction
+  with selection) — NOT a §5 pass, but a real, non-zero, honestly-measured
+  starting point. Top loadings: hvol20 (+), mom20 (+), rsi14 (−, mean-reversion).
+
+### S4 · Alpha
 
 | | |
 |---|---|
@@ -278,7 +313,7 @@ done, regardless of whether its happy path works:
 - Real-trigger confirmed: regime CASH @ 0.386 on 2026-07-24 (breadth 0.2),
   directionally matching the predecessor ensemble's live call (0.163, CASH).
 
-### S4 · Portfolio Construction
+### S5 · Portfolio Construction
 
 | | |
 |---|---|
@@ -287,7 +322,7 @@ done, regardless of whether its happy path works:
 | **Metrics** | **Allocation deviation**: `|realized_$ − target_$| / target_$` per position, logged every sizing pass; reject if overshoot > 35% · Concentration: max single-name % (cap 25%) · Total deployed vs. budget (a whole-share floor once turned a $2,000 budget into $2,232 deployed, with the two lowest-conviction names as the largest positions) · Fee drag: commissions / gross P&L per day |
 | **Hard rules** | **Dollar value is the unit of account; share count is a derived quantity.** Verify realized value against the per-position target after every sizing pass — the account-level cap alone cannot catch per-position inversion (hit twice: 2026-07-22, 2026-07-24). Undershoot (round-down) is acceptable; overshoot is not. |
 
-### S5 · Execution
+### S6 · Execution
 
 | | |
 |---|---|
@@ -296,7 +331,7 @@ done, regardless of whether its happy path works:
 | **Metrics** | Fill rate within limit window · Slippage vs. limit price · Reconciliation mismatches between internal state and `ib.positions()` (target: zero; alert on any) · Order rejection count · API client-session count (Gateway degrades under many concurrent sessions — observed full connection wedge) |
 | **Hard rules** | Limit orders only (0.3% offset RTH / 0.5% AH). Position sync against broker ground truth before every order. Fill status verified by polling, never assumed from submission. Per-ticker cooldown after any losing exit — no same-session re-entry. Internal JSON logs do not survive restarts; IBKR fills are the only cross-restart truth. |
 
-### S6 · Intraday Risk Loop (15-min cycle)
+### S7 · Intraday Risk Loop (15-min cycle)
 
 | | |
 |---|---|
@@ -305,7 +340,7 @@ done, regardless of whether its happy path works:
 | **Metrics** | Stop adherence: realized loss at exit vs. −2% trigger (gap = slippage + cycle latency) · Time-stop yield: P&L of D7 exits vs. counterfactual hold-to-EOD (validated +$5.76 net on 30 real entries; keep measuring live) · Decision-gate accuracy vs. known outcomes (predecessor best: 83%) and veto rate · Circuit-breaker activations |
 | **Hard rules** | Hard stop (−2%) is deterministic and **never** routed through the LLM gate. Soft-signal exits (sentiment/event) always are. Exit models with negative validation results stay disabled — a live-money bug gets a defensive disable, not a live patch under pressure. |
 
-### S7 · Reporting
+### S8 · Reporting
 
 | | |
 |---|---|
@@ -314,7 +349,7 @@ done, regardless of whether its happy path works:
 | **Metrics** | Delivery success rate · Alert latency for critical failures · **Honesty check**: any displayed "prediction" must carry its measured historical hit rate and sample size — a near-coin-flip signal displayed as a confident price target is a defect (shipped once; removed) |
 | **Hard rules** | Reports run every trading day regardless of regime — cost gating must never silently drop decision-relevant information (an earnings beat by a top-ranked name was once invisible because the check was skipped on a no-trade day). |
 
-### S8 · Evaluation & Continuous Improvement
+### S9 · Evaluation & Continuous Improvement
 
 | | |
 |---|---|
@@ -418,11 +453,11 @@ model binaries (see `.gitignore`).
 | Layer | Status |
 |---|---|
 | Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/core.py`; 11 passing contract tests; smoke-tested on live data |
-| Alpha (S3) | **Migrated 2026-07-24** — `src/s3_alpha.py`; rule-based regime gate (informational, fails toward cash), deterministic event risk, scorer explicitly DISABLED pending §5 |
+| Predictors (S3) | **Built 2026-07-24** — `src/s3_predictors.py`; end_of_day_price model, trained + measured (held-out IC≈0.065, beats null); observation mode pending §5 |
+| Alpha (S4) | **Built 2026-07-24** — `src/s4_alpha.py`; regime gate + event risk + combines predictions (gate/veto) into actionable signals |
 | Signal generation (S2) | **Migrated + enriched 2026-07-24** — `src/s2_signals.py`; technical + fundamental (value/quality/size) blocks; publication-date-aware; PIT tested; 55 features/3 tickers real-confirmed |
 | Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/s1_data.py` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
-| Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
-| Ops/reporting (S7) | Migrate after execution, with cost fixes retained |
-| Alpha scorer (S3-A2) | **Not migrated as-is** — measured no-edge; rebuild around fundamentals/earnings features and pass §5 first |
-| Regime gate (S3-A1) | Migrate with S3 scaffolding; it demonstrated correct cash calls live |
+| EOD price predictor (S3) | **Built, not §5-passed** — real held-out IC≈0.065 beats null, but single-split pooled total-return, technicals-only; needs fundamentals history + non-overlapping significance before any live use |
+| Execution/safety (S5–S7 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
+| Ops/reporting (S8) | Migrate after execution, with cost fixes retained |
 | Automated trading cron | **Off** until cutover criteria: all above migrated + tested + §5 pass for any live signal |

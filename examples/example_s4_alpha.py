@@ -13,7 +13,7 @@ sys.path.insert(0, str(HERE.parent / "src"))
 from core import FeatureStore, MARKET_SCOPE
 from s1_data import run_daily_ingestion, fetch_daily_bars, fetch_macro, fetch_days_to_earnings
 from s2_signals import run_signal_generation
-from s3_alpha import run_alpha, score_stocks
+from s4_alpha import run_alpha, score_stocks
 
 UNIVERSE = ["INTC", "MRVL", "TSLA"]
 

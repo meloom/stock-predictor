@@ -1,0 +1,31 @@
+{
+  "note": "REAL data. Technical features carry historical variation; the fundamental features are ~flat here (only the latest statement is ingested), so this is honestly a TECHNICAL-feature result until the S1 statement-history backfill lands.",
+  "model": "end_of_day_price / Ridge",
+  "horizon_days": 20,
+  "universe_size": 38,
+  "panel_rows": 3268,
+  "train_rows": 1976,
+  "test_rows": 418,
+  "purged_split": {
+    "train_end": "2025-10-13",
+    "test_start": "2026-04-07",
+    "purge_days": 15,
+    "embargo_days": 7
+  },
+  "test_metrics": {
+    "n": 418,
+    "ic": 0.06546523523892514,
+    "mse": 0.03385637883084378,
+    "null_mse": 0.03494278710064436,
+    "r2_vs_null": 0.031091059412960864,
+    "beats_null": true
+  },
+  "top_factor_loadings": {
+    "tech.hvol20": 0.017071921067990763,
+    "tech.mom20": 0.010724439578767495,
+    "tech.rsi14": -0.006324888264933478,
+    "tech.vr20": 0.0013564715640359997,
+    "tech.mom5": -0.000547785183435147,
+    "fund.book_to_price": 0.0
+  }
+}
