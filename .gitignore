@@ -6,6 +6,9 @@
 *apikey*
 *api_key*
 credentials*
+.credentials*
+*.pem
+*.key
 
 # ── Market data & account artifacts (private: contains real account/trade history) ──
 data/
