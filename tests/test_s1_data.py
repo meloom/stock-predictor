@@ -64,7 +64,10 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
                 for t in tickers if t != "DEAD"} | {"DEAD": []}
 
     def fake_macro():
-        return {"vix": 18.5, "yield10y": 4.6, "spy_close": 738.0}
+        return {"vix": [{"date": "2026-07-24", "value": 18.5}],
+                "yield10y": [{"date": "2026-07-24", "value": 4.6}],
+                "spy_close": [{"date": "2026-07-23", "value": 740.0},
+                              {"date": "2026-07-24", "value": 738.0}]}
 
     def fake_dte(ticker, asof=None):
         return None if ticker == "DEAD" else 30  # None stays None, no sentinels

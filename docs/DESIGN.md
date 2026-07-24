@@ -129,7 +129,7 @@ done, regardless of whether its happy path works:
 |---|---|---|---|
 | S1 → S8 | `runs.jsonl` run record (status incl. crashes, coverage %, calendar unknowns) + store lineage (`ingested_at`, `trigger_id` on every value) + `outputs_of(trigger_id)` | Did ingestion run and complete? Is today's data actually fresh? What exactly did each run produce? | **Implemented** |
 | S2 → S8 | Derived-feature store writes under the same bitemporal contract | Same lineage/freshness checks as S1, applied to derived features | **Implemented** |
-| S3 → S8 | Prediction record per (date, ticker): score, tier, model version, **data-lineage stamp** (max `ingested_at` of inputs used) | Daily IC vs. realized excess returns; stale-input prediction rate (predictions on old data are pipeline defects, not model error) | Specced |
+| S3 → S8 | Prediction record per (date, ticker): score, tier, model version, **data-lineage stamp** (max `ingested_at` of inputs used) | Daily IC vs. realized excess returns; stale-input prediction rate (predictions on old data are pipeline defects, not model error) | **Implemented** for regime + event-risk records (lineage-stamped); scorer records n/a until a scorer passes §5 |
 | S4 → S8 | Sizing log per order: target-$, realized-$, deviation %, skip reasons | Allocation-deviation distribution; weight-order inversions; overshoot rejections | Specced |
 | S5 → S8 | Order/fill log (`trigger_id` on every order) reconciled against broker fills — broker is ground truth, not in-memory state | Fill rate, slippage, rejections, reconciliation mismatches (target: zero) | Specced |
 | S6 → S8 | Exit-event log: which rule fired, at what price, plus counterfactual (e.g. hold-to-EOD P&L) | Stop adherence; time-stop yield vs. counterfactual; gate accuracy | Specced |
@@ -237,6 +237,23 @@ done, regardless of whether its happy path works:
 | **Metrics** | **Regime gate**: % of gated (cash) days where universe median return was negative (gate precision); opportunity cost of gated days · **Scorer (the gate to go live, per §5)**: Spearman IC vs. excess returns on purged OOS ≥ 0.03 sustained; top-vs-bottom decile spread > 0 with p < 0.05 on **non-overlapping** windows; hit rate vs. 50% null · **Event veto**: % of vetoed names with realized |move| > 2× universe median on event day |
 | **Hard rules** | Scorer is **disabled for live sizing** until §5 passes — currently informational-only in reports, labeled with its measured (lack of) skill. Deterministic facts (days-to-earnings) and LLM classifications must agree before either triggers real-money action alone. |
 
+**Implementation notes (landed 2026-07-24)**
+- `src/s3_alpha.py`: A1 regime gate is a transparent rule-based v1 — breadth
+  (.4) + VIX (.3) + SPY-vs-20d-trend (.3), threshold 0.6 — NOT the
+  predecessor's pickled 5-model ensemble (unreviewable binaries, excluded by
+  policy). Unvalidated per §5, therefore informational-only; on missing
+  inputs it fails TOWARD CASH naming the gap (first real trigger did exactly
+  this and exposed that S1's macro fetch had no history — fixed to 90d).
+- A2 `score_stocks()` returns an explicit DISABLED status with the measured
+  reason; enabling requires a §5 pass and a doc status change in the same commit.
+- A3 event risk is deterministic from `calendar.days_to_earnings`; missing
+  calendar → **UNKNOWN**, never silently LOW (the predecessor's 999 sentinel
+  effectively claimed "no event near" on no evidence).
+- Every decision record carries `inputs_max_ingested_at` — the data-lineage
+  stamp S8's stale-input audit reads.
+- Real-trigger confirmed: regime CASH @ 0.386 on 2026-07-24 (breadth 0.2),
+  directionally matching the predecessor ensemble's live call (0.163, CASH).
+
 ### S4 · Portfolio Construction
 
 | | |
@@ -338,6 +355,12 @@ stock-predictor/
 │   ├── s5_execution.py       #   (s2+ are future; only core+s1 exist today)
 │   └── ...
 ├── tests/                    # tests may be separate files (test_core, test_s1_data, ...)
+├── examples/                 # one runnable file per stage: concrete input →
+│                             #   printed output → asserted expectations.
+│                             #   Deterministic/offline. A stage without its
+│                             #   example is not done. (Convention added at
+│                             #   owner request 2026-07-24; example_s2 caught
+│                             #   a wrong hand-count on its first run.)
 └── ops/                      # cron entries, runbooks
 ```
 
@@ -370,6 +393,7 @@ model binaries (see `.gitignore`).
 | Layer | Status |
 |---|---|
 | Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/core.py`; 11 passing contract tests; smoke-tested on live data |
+| Alpha (S3) | **Migrated 2026-07-24** — `src/s3_alpha.py`; rule-based regime gate (informational, fails toward cash), deterministic event risk, scorer explicitly DISABLED pending §5 |
 | Signal generation (S2) | **Migrated 2026-07-24** — `src/s2_signals.py`; PIT property tested; real-trigger confirmed (36 features, 5 tickers) |
 | Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/s1_data.py` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
 | Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |

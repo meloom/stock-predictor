@@ -68,17 +68,21 @@ def fetch_daily_bars(tickers: list[str], period: str = "10d") -> dict[str, list[
     return out
 
 
-def fetch_macro() -> dict[str, float]:
-    """Market-level series, latest daily close values."""
+def fetch_macro(period: str = "90d") -> dict[str, list[dict]]:
+    """Market-level series WITH history: {name: [{date, value}, ...]}.
+    History matters: S3's regime gate needs 20 days of SPY closes — the
+    original latest-value-only fetch left the gate permanently unable to
+    compute its trend component (caught by the first real S3 trigger
+    failing toward cash with 'spy_close(1/20 days)')."""
     import yfinance as yf
-    out: dict[str, float] = {}
+    out: dict[str, list[dict]] = {}
     for name, symbol in (("vix", "^VIX"), ("yield10y", "^TNX"), ("spy_close", "SPY")):
         try:
-            h = yf.Ticker(symbol).history(period="5d", interval="1d")
-            if len(h):
-                out[name] = float(h["Close"].iloc[-1])
+            h = yf.Ticker(symbol).history(period=period, interval="1d")
+            out[name] = [{"date": idx.date().isoformat(), "value": float(row["Close"])}
+                         for idx, row in h.iterrows()]
         except Exception:
-            pass
+            out[name] = []
     return out
 
 
@@ -247,9 +251,10 @@ def run_daily_ingestion(universe: list[str],
                 rows.append(("price.volume", t, bar["date"], bar["volume"]))
         store.write_many(rows, trigger_id=trig.trigger_id)
 
-        # -- macro -----------------------------------------------------------
+        # -- macro (with history — S3's regime gate needs 20d of SPY) --------
         macro = fetch_macro()
-        macro_rows = [(f"macro.{k}", MARKET_SCOPE, today, v) for k, v in macro.items()]
+        macro_rows = [(f"macro.{k}", MARKET_SCOPE, pt["date"], pt["value"])
+                      for k, series in macro.items() for pt in series]
         store.write_many(macro_rows, trigger_id=trig.trigger_id)
 
         # -- earnings calendar ----------------------------------------------
@@ -280,7 +285,7 @@ def run_daily_ingestion(universe: list[str],
             universe_size=len(universe),
             tickers_with_bars=tickers_ok,
             coverage_pct=round(coverage, 1),
-            macro_series=sorted(macro.keys()),
+            macro_series=sorted(k for k, s in macro.items() if s),
             calendar_ok=cal_ok,
             calendar_unknown=cal_unknown,
             earnings_checked=len(check_list),
