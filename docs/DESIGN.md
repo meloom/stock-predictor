@@ -145,6 +145,11 @@ money at every threshold when run in the real pipeline.
   `read_panel(...)`; `as_known_at` filters on `ingested_at`, which is what
   makes backtests lookahead-impossible by construction. `freshness()` serves
   S8's staleness audit. Every write carries `trigger_id` (lineage → cost ledger).
+  `outputs_of(trigger_id)` answers "we triggered the component — what was the
+  output?" in one call: per-feature value counts + event-time ranges for
+  everything that invocation wrote. Paired with its runs.jsonl record
+  (status/metrics/cost), every trigger has complete observability: what ran,
+  what it cost, what it produced.
 - `src/common/trigger.py`: `Trigger` context manager mints `trigger_id`,
   appends to `runtime/logs/cost_ledger.jsonl` (per billable action) and
   `runtime/logs/runs.jsonl` (per run — **including crashed runs**, logged with

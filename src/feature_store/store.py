@@ -157,6 +157,25 @@ class FeatureStore:
         return out
 
     # -- lineage / audit (consumed by S8) ------------------------------------
+    def outputs_of(self, trigger_id: str) -> dict:
+        """Everything a trigger wrote — the answer to 'we triggered the
+        component; what was the output?'. Pairs with the run record in
+        runs.jsonl (status/metrics/cost) to give complete per-trigger
+        observability: one lookup for what happened, one for what it produced."""
+        rows = self._conn.execute(
+            "SELECT feature, COUNT(*), MIN(event_time), MAX(event_time) "
+            "FROM feature_values WHERE trigger_id=? "
+            "GROUP BY feature ORDER BY feature", (trigger_id,)).fetchall()
+        return {
+            "trigger_id": trigger_id,
+            "features": [
+                {"feature": f, "n_values": n,
+                 "event_time_min": lo, "event_time_max": hi}
+                for f, n, lo, hi in rows
+            ],
+            "total_values": sum(r[1] for r in rows),
+        }
+
     def freshness(self, feature: str) -> Optional[dict]:
         """Most recent event_time + ingested_at for a feature, for staleness checks."""
         row = self._conn.execute(

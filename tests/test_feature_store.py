@@ -67,6 +67,27 @@ def test_freshness_reports_latest(store):
     assert fr["latest_event_time"] == "2026-07-24"
 
 
+def test_outputs_of_trigger(store):
+    """Trigger→output traceability: given a trigger_id, the store answers
+    exactly what that invocation produced."""
+    _register_close(store)
+    store.register("price.volume", "float", "ticker", "S1", "daily", "post-close")
+    store.write("price.close", "AAPL", "2026-07-23", 100.0, trigger_id="trig-A")
+    store.write("price.close", "AAPL", "2026-07-24", 101.0, trigger_id="trig-A")
+    store.write("price.volume", "AAPL", "2026-07-24", 5e6, trigger_id="trig-A")
+    store.write("price.close", "MSFT", "2026-07-24", 390.0, trigger_id="trig-B")
+
+    out = store.outputs_of("trig-A")
+    assert out["total_values"] == 3
+    by_feature = {f["feature"]: f for f in out["features"]}
+    assert by_feature["price.close"]["n_values"] == 2
+    assert by_feature["price.close"]["event_time_max"] == "2026-07-24"
+    # trig-B's write is not attributed to trig-A
+    assert store.outputs_of("trig-B")["total_values"] == 1
+    # unknown trigger → empty, not error
+    assert store.outputs_of("no-such-trigger")["total_values"] == 0
+
+
 def test_read_panel_all_scopes(store):
     _register_close(store)
     store.write("price.close", "AAPL", "2026-07-24", 1.0, trigger_id="t")
