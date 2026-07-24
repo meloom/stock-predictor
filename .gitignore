@@ -17,8 +17,8 @@ credentials*
 /logs/
 *.log
 
-# ── Trained model binaries (rebuild from source; large + not reviewable) ──
-/models/
+# ── Trained model binaries (rebuild from the modeling/ experiment) ──
+# models/ registry METADATA + WRAPPER are committed; only the artifacts aren't.
 *.pkl
 *.joblib
 catboost_info/

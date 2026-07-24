@@ -418,6 +418,8 @@ stock-predictor/
 │   ├── s2_signals.py         #   file per stage as each stage lands.
 │   ├── s5_execution.py       #   (s2+ are future; only core+s1 exist today)
 │   └── ...
+├── modeling/                 # experimentation: harness + expNN_*.py (train/eval/promote)
+├── models/                   # registry: metadata + wrapper committed, artifacts gitignored
 ├── tests/                    # tests may be separate files (test_core, test_s1_data, ...)
 ├── examples/                 # per stage: a runnable script that runs the
 │                             #   stage on REAL market data and SAVES the
@@ -433,6 +435,32 @@ Never in git: credentials, account identifiers, market data, trade history,
 model binaries (see `.gitignore`).
 
 ---
+
+## 4b. Modeling & the model registry
+
+Experimentation and the live pipeline are separated:
+
+```
+modeling/   EXPERIMENTATION — train different models with proper purged
+            train/val/test, measure honestly (return-IC + price-vs-naive),
+            iterate. harness.py (shared spine) + expNN_*.py (one per experiment).
+            You are allowed to fail here.
+   │  promote() ONLY if harness.meets_bar() clears: real held-out IC, beats
+   │  the null, beats the naive persistence baseline.
+   ▼
+models/     REGISTRY — promoted winners only. Per model: metadata.json
+            (committed: type, features, horizon, split, test_metrics,
+            source experiment) + artifact.pkl (gitignored, rebuildable).
+            registry.json indexes them.
+   │  Predictor.load(model_id)  (models/wrapper.py — the one load API)
+   ▼
+S3 Predictors — loads a promoted model through the wrapper; never trains
+                inline. Swap the model, pipeline code doesn't change.
+```
+
+**Rule: no model reaches the pipeline except by being promoted through the
+registry.** A model that doesn't clear the bar is not promoted — that is a
+valid, honest outcome. The registry holds measured winners, not attempts.
 
 ## 5. Validation protocol (the gate to live capital)
 
