@@ -1,0 +1,36 @@
+# ── Secrets & credentials — never committed, no exceptions ──
+.env
+*.env
+.stock_predictor_env
+*_token*
+*apikey*
+*api_key*
+credentials*
+
+# ── Market data & account artifacts (private: contains real account/trade history) ──
+data/
+results/
+trades/
+logs/
+*.log
+
+# ── Trained model binaries (rebuild from source; large + not reviewable) ──
+models/
+*.pkl
+*.joblib
+catboost_info/
+
+# ── Python ──
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# ── OS / editor ──
+.DS_Store
+.idea/
+.vscode/
