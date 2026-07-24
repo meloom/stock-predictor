@@ -8,7 +8,7 @@ import pytest
 import core as core_mod
 from core import FeatureStore, MARKET_SCOPE
 from s2_signals import (rsi14, momentum, hvol20, volume_ratio20, pct_ranks,
-                        run_signal_generation)
+                        fundamental_ratios, run_signal_generation)
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +70,83 @@ def test_pct_ranks_with_ties():
     assert r["A"] == 0.0 and r["D"] == 1.0
     assert r["B"] == r["C"] == pytest.approx(0.5)
     assert pct_ranks({"only": 5.0}) == {"only": 0.5}
+
+
+# ── fundamentals ────────────────────────────────────────────────────────────
+
+def test_fundamental_ratios_exact():
+    # price 100, shares 10 -> mcap 1000; equity 500 -> bvps 50 -> B/P 0.5
+    r = fundamental_ratios(
+        price=100.0, shares=10.0,
+        statements={"total_equity": 500.0, "net_income": 50.0, "revenue": 200.0,
+                    "gross_profit": 120.0, "total_assets": 800.0,
+                    "free_cash_flow": 40.0},
+        analyst={"trailing_eps": 5.0})
+    assert r["fund.market_cap"] == 1000.0
+    assert r["fund.book_to_price"] == pytest.approx(0.5)      # (500/10)/100
+    assert r["fund.earnings_yield"] == pytest.approx(0.05)    # 5/100
+    assert r["fund.fcf_yield"] == pytest.approx(0.04)         # 40/1000
+    assert r["fund.roe"] == pytest.approx(0.10)               # 50/500
+    assert r["fund.gross_profitability"] == pytest.approx(0.15)  # 120/800
+    assert r["fund.net_margin"] == pytest.approx(0.25)        # 50/200
+
+
+def test_fundamental_ratios_missing_inputs_are_none_not_zero():
+    r = fundamental_ratios(price=100.0, shares=None, statements=None, analyst=None)
+    assert r["fund.market_cap"] is None      # no shares -> no mcap, not 0
+    assert r["fund.roe"] is None
+    assert r["fund.earnings_yield"] is None
+    # zero denominator also -> None, never a divide error or inf
+    r2 = fundamental_ratios(price=100.0, shares=10.0,
+                            statements={"total_equity": 0.0, "net_income": 5.0}, analyst={})
+    assert r2["fund.roe"] is None
+
+
+def test_fundamentals_in_pipeline_are_publication_date_aware(store):
+    """A statement filed AFTER event_date must be invisible to S2 — no
+    fundamentals lookahead."""
+    store.register("fundamental.shares_outstanding", "float", "ticker", "S1", "daily", "pit")
+    store.register("fundamental.statements", "json", "ticker", "S1", "event", "pit")
+    store.register("fundamental.analyst_snapshot", "json", "ticker", "S1", "daily", "pit")
+
+    last = _seed(store, "AAPL", [100 + i for i in range(25)])   # ends 2026-06-25
+    store.write("fundamental.shares_outstanding", "AAPL", "2026-06-01", 10.0, trigger_id="s")
+    store.write("fundamental.analyst_snapshot", "AAPL", "2026-06-01",
+                {"trailing_eps": 5.0}, trigger_id="s")
+    # statement PUBLISHED 2026-06-20 (before the 06-25 event date) -> visible
+    store.write("fundamental.statements", "AAPL", "2026-06-20",
+                {"total_equity": 500.0, "net_income": 50.0, "revenue": 200.0,
+                 "gross_profit": 120.0, "total_assets": 800.0, "free_cash_flow": 40.0},
+                trigger_id="s")
+
+    run_signal_generation(["AAPL"], last, store=store)
+    assert store.read_asof("fund.roe", "AAPL", last)["value"] == pytest.approx(0.10)
+    assert store.read_asof("fund.market_cap", "AAPL", last)["value"] == pytest.approx(124 * 10)
+
+    # now a NEWER statement filed AFTER the event date must NOT change the past
+    store.write("fundamental.statements", "AAPL", "2026-07-15",
+                {"total_equity": 999.0, "net_income": 999.0}, trigger_id="future")
+    run_signal_generation(["AAPL"], last, store=store)   # recompute same past day
+    assert store.read_asof("fund.roe", "AAPL", last)["value"] == pytest.approx(0.10)  # unchanged
+
+
+def test_fundamental_xsec_ranks(store):
+    store.register("fundamental.shares_outstanding", "float", "ticker", "S1", "daily", "pit")
+    store.register("fundamental.statements", "json", "ticker", "S1", "event", "pit")
+    store.register("fundamental.analyst_snapshot", "json", "ticker", "S1", "daily", "pit")
+
+    # HIGHQ: ROE 0.20; LOWQ: ROE 0.05 -> HIGHQ ranks top
+    for tk, ni in [("HIGHQ", 100.0), ("LOWQ", 25.0)]:
+        last = _seed(store, tk, [100 + i for i in range(25)])
+        store.write("fundamental.shares_outstanding", tk, "2026-06-01", 10.0, trigger_id="s")
+        store.write("fundamental.statements", tk, "2026-06-20",
+                    {"total_equity": 500.0, "net_income": ni}, trigger_id="s")
+        store.write("fundamental.analyst_snapshot", tk, "2026-06-01",
+                    {"trailing_eps": 5.0}, trigger_id="s")
+
+    run_signal_generation(["HIGHQ", "LOWQ"], last, store=store)
+    assert store.read_asof("xsec.rank_roe", "HIGHQ", last)["value"] == 1.0
+    assert store.read_asof("xsec.rank_roe", "LOWQ", last)["value"] == 0.0
 
 
 # ── the point-in-time guarantee ────────────────────────────────────────────

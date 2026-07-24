@@ -3,7 +3,8 @@
   "run_metrics": {
     "event_date": "2026-07-24",
     "universe_size": 3,
-    "features_written": 22,
+    "features_written": 55,
+    "fundamental_features": 33,
     "skipped": {}
   },
   "per_ticker": {
@@ -13,8 +14,19 @@
       "tech.mom20": -0.305185,
       "tech.hvol20": 0.050404,
       "tech.vr20": 1.624721,
+      "fund.market_cap": 464000318466.1865,
+      "fund.book_to_price": 0.188668,
+      "fund.earnings_yield": -0.006499,
+      "fund.fcf_yield": 0.009591,
+      "fund.roe": -0.126031,
+      "fund.gross_profitability": 0.032153,
+      "fund.net_margin": -0.68409,
       "xsec.rank_rsi14": 0.5,
-      "xsec.rank_mom5": 0.5
+      "xsec.rank_mom5": 0.5,
+      "xsec.rank_earnings_yield": 0.0,
+      "xsec.rank_fcf_yield": 1.0,
+      "xsec.rank_roe": 0.0,
+      "xsec.rank_gross_profitability": 0.5
     },
     "MRVL": {
       "tech.rsi14": 29.684587,
@@ -22,8 +34,19 @@
       "tech.mom20": -0.309259,
       "tech.hvol20": 0.056592,
       "tech.vr20": 0.723097,
+      "fund.market_cap": 170100108597.61218,
+      "fund.book_to_price": 0.107089,
+      "fund.earnings_yield": 0.014982,
+      "fund.fcf_yield": 0.002837,
+      "fund.roe": 0.001894,
+      "fund.gross_profitability": 0.046792,
+      "fund.net_margin": 0.014269,
       "xsec.rank_rsi14": 1.0,
-      "xsec.rank_mom5": 1.0
+      "xsec.rank_mom5": 1.0,
+      "xsec.rank_earnings_yield": 1.0,
+      "xsec.rank_fcf_yield": 0.5,
+      "xsec.rank_roe": 0.5,
+      "xsec.rank_gross_profitability": 1.0
     },
     "TSLA": {
       "tech.rsi14": 15.722536,
@@ -31,8 +54,19 @@
       "tech.mom20": -0.16552,
       "tech.hvol20": 0.048596,
       "tech.vr20": 1.397443,
+      "fund.market_cap": 1236326815922.5952,
+      "fund.book_to_price": 0.070255,
+      "fund.earnings_yield": 0.002971,
+      "fund.fcf_yield": -0.000889,
+      "fund.roe": 0.012826,
+      "fund.gross_profitability": 0.031988,
+      "fund.net_margin": 0.039453,
       "xsec.rank_rsi14": 0.0,
-      "xsec.rank_mom5": 0.0
+      "xsec.rank_mom5": 0.0,
+      "xsec.rank_earnings_yield": 0.5,
+      "xsec.rank_fcf_yield": 0.0,
+      "xsec.rank_roe": 1.0,
+      "xsec.rank_gross_profitability": 0.0
     }
   },
   "regime.breadth5": 0.3333

@@ -34,10 +34,37 @@ S2_FEATURES = [
      "Stdev of the trailing 20 daily returns."),
     ("tech.vr20", "float", "ticker", "daily",
      "volume[t] / mean(volume over trailing 20 days)."),
+    # -- fundamentals (from S1's statements/shares/analyst; the enrichment that
+    #    covers value/quality/size — categories the technicals above miss) --
+    ("fund.market_cap", "float", "ticker", "daily",
+     "price.close * shares_outstanding (size factor)."),
+    ("fund.book_to_price", "float", "ticker", "daily",
+     "(total_equity / shares) / price.close — VALUE (inverse P/B, ranks well "
+     "even when negative)."),
+    ("fund.earnings_yield", "float", "ticker", "daily",
+     "trailing_eps / price.close — VALUE (inverse P/E)."),
+    ("fund.fcf_yield", "float", "ticker", "daily",
+     "free_cash_flow / market_cap — VALUE (quarterly-basis, cross-sectionally "
+     "comparable)."),
+    ("fund.roe", "float", "ticker", "daily",
+     "net_income / total_equity — QUALITY (quarterly basis)."),
+    ("fund.gross_profitability", "float", "ticker", "daily",
+     "gross_profit / total_assets — QUALITY (Novy-Marx); strongest single "
+     "quality signal in the literature."),
+    ("fund.net_margin", "float", "ticker", "daily",
+     "net_income / revenue — QUALITY."),
     ("xsec.rank_rsi14", "float", "ticker", "daily",
      "Percentile rank of tech.rsi14 across the universe on the day (0..1)."),
     ("xsec.rank_mom5", "float", "ticker", "daily",
      "Percentile rank of tech.mom5 across the universe on the day (0..1)."),
+    ("xsec.rank_earnings_yield", "float", "ticker", "daily",
+     "Cross-sectional percentile rank of fund.earnings_yield (0..1)."),
+    ("xsec.rank_fcf_yield", "float", "ticker", "daily",
+     "Cross-sectional percentile rank of fund.fcf_yield (0..1)."),
+    ("xsec.rank_roe", "float", "ticker", "daily",
+     "Cross-sectional percentile rank of fund.roe (0..1)."),
+    ("xsec.rank_gross_profitability", "float", "ticker", "daily",
+     "Cross-sectional percentile rank of fund.gross_profitability (0..1)."),
     ("regime.breadth5", "float", "market", "daily",
      "Fraction of universe tickers with positive tech.mom5 on the day."),
 ]
@@ -78,6 +105,36 @@ def hvol20(closes: list[float]) -> float | None:
     rets = [closes[i] / closes[i - 1] - 1.0 for i in range(len(closes) - 20, len(closes))]
     mean = sum(rets) / len(rets)
     return math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
+
+
+def _div(a, b) -> float | None:
+    """Safe divide: None if either side missing or denominator is 0 — no
+    sentinels, a missing ratio is genuinely missing."""
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+
+
+def fundamental_ratios(price: float | None, shares: float | None,
+                       statements: dict | None, analyst: dict | None) -> dict:
+    """Value/quality/size ratios from S1's raw fundamentals. Any input missing
+    -> that ratio is None (skipped downstream, never faked). Quarterly-basis
+    ratios (roe, margins, fcf_yield) are consistent across tickers, so they
+    rank correctly cross-sectionally even though they aren't annualized."""
+    s = statements or {}
+    a = analyst or {}
+    equity = s.get("total_equity")
+    market_cap = price * shares if (price and shares) else None
+    bvps = _div(equity, shares)
+    return {
+        "fund.market_cap": market_cap,
+        "fund.book_to_price": _div(bvps, price),
+        "fund.earnings_yield": _div(a.get("trailing_eps"), price),
+        "fund.fcf_yield": _div(s.get("free_cash_flow"), market_cap),
+        "fund.roe": _div(s.get("net_income"), equity),
+        "fund.gross_profitability": _div(s.get("gross_profit"), s.get("total_assets")),
+        "fund.net_margin": _div(s.get("net_income"), s.get("revenue")),
+    }
 
 
 def volume_ratio20(volumes: list[float]) -> float | None:
@@ -130,6 +187,8 @@ def run_signal_generation(universe: list[str], event_date: str,
         skipped: dict[str, int] = {}
         rsi_by_ticker: dict[str, float] = {}
         mom5_by_ticker: dict[str, float] = {}
+        # collect fundamental ratios to rank cross-sectionally afterward
+        fund_by_ticker: dict[str, dict] = {}
 
         for t in universe:
             closes_series = store.read_series("price.close", t, event_date,
@@ -143,6 +202,7 @@ def run_signal_generation(universe: list[str], event_date: str,
                 continue
             closes = [v for _, v in closes_series]
             vols = [v for _, v in vols_series]
+            price = closes[-1]
 
             computed = {
                 "tech.rsi14": rsi14(closes),
@@ -151,6 +211,17 @@ def run_signal_generation(universe: list[str], event_date: str,
                 "tech.hvol20": hvol20(closes),
                 "tech.vr20": volume_ratio20(vols),
             }
+
+            # fundamentals — read S1's raw data as-of event_date (read_asof is
+            # publication-date aware, so a statement filed after event_date is
+            # invisible here: no lookahead)
+            def _val(feature):
+                rec = store.read_asof(feature, t, event_date, as_known_at)
+                return rec["value"] if rec else None
+            computed.update(fundamental_ratios(
+                price, _val("fundamental.shares_outstanding"),
+                _val("fundamental.statements"), _val("fundamental.analyst_snapshot")))
+
             for feat, val in computed.items():
                 if val is None:
                     skipped[feat] = skipped.get(feat, 0) + 1
@@ -160,21 +231,34 @@ def run_signal_generation(universe: list[str], event_date: str,
                 rsi_by_ticker[t] = computed["tech.rsi14"]
             if computed["tech.mom5"] is not None:
                 mom5_by_ticker[t] = computed["tech.mom5"]
+            fund_by_ticker[t] = computed
 
         # cross-sectional + regime (need the full universe pass first)
         for t, r in pct_ranks(rsi_by_ticker).items():
             rows.append(("xsec.rank_rsi14", t, event_date, round(r, 4)))
         for t, r in pct_ranks(mom5_by_ticker).items():
             rows.append(("xsec.rank_mom5", t, event_date, round(r, 4)))
+        # cross-sectional ranks of the fundamental factors (the selection-
+        # relevant form: "cheaper/higher-quality than peers today")
+        for feat, rank_name in [("fund.earnings_yield", "xsec.rank_earnings_yield"),
+                                ("fund.fcf_yield", "xsec.rank_fcf_yield"),
+                                ("fund.roe", "xsec.rank_roe"),
+                                ("fund.gross_profitability", "xsec.rank_gross_profitability")]:
+            vals = {t: c[feat] for t, c in fund_by_ticker.items() if c.get(feat) is not None}
+            for t, r in pct_ranks(vals).items():
+                rows.append((rank_name, t, event_date, round(r, 4)))
         if mom5_by_ticker:
             breadth = sum(1 for v in mom5_by_ticker.values() if v > 0) / len(mom5_by_ticker)
             rows.append(("regime.breadth5", MARKET_SCOPE, event_date, round(breadth, 4)))
 
         store.write_many(rows, trigger_id=trig.trigger_id)
+        n_fund = sum(1 for f, *_ in rows if f.startswith("fund.") or "rank_earnings" in f
+                     or "rank_fcf" in f or "rank_roe" in f or "rank_gross" in f)
         trig.add_metrics(
             event_date=event_date,
             universe_size=len(universe),
             features_written=len(rows),
+            fundamental_features=n_fund,
             skipped=skipped,
         )
         return {"trigger_id": trig.trigger_id, **trig.metrics}

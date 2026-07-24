@@ -230,9 +230,17 @@ done, regardless of whether its happy path works:
 | **Hard rules** | Raw next-day return targets conflate market drift with stock selection — in a trending window every decile of a useless ranker shows positive "returns." All cross-sectional evaluation uses **market-excess** (and where relevant sector-excess) returns. |
 
 **Implementation notes (landed 2026-07-24)**
-- `src/s2_signals.py`: registry (`tech.rsi14/mom5/mom20/hvol20/vr20`,
-  `xsec.rank_rsi14/rank_mom5`, `regime.breadth5`) · pure computation functions
-  · orchestrator. All input reads go through `core.py`'s `read_series(...,
+- `src/s2_signals.py`: registry · pure computation functions · orchestrator.
+  Technical block: `tech.rsi14/mom5/mom20/hvol20/vr20`. **Fundamental block
+  (added 2026-07-24, the enrichment that was the whole point of S1's
+  fundamentals): value** (`fund.book_to_price`, `fund.earnings_yield`,
+  `fund.fcf_yield`), **quality** (`fund.roe`, `fund.gross_profitability`,
+  `fund.net_margin`), **size** (`fund.market_cap`), each derived from S1's
+  statements/shares/analyst read publication-date-aware (a statement filed
+  after event_date is invisible — tested). Cross-sectional ranks of the
+  factors (`xsec.rank_earnings_yield/fcf_yield/roe/gross_profitability`) are
+  the selection-relevant form. Real run: 22 technical-only features → 55
+  total, 33 fundamental; INTC ROE -12.6% (its GAAP CHIPS-writedown loss). All input reads go through `core.py`'s `read_series(...,
   end_event_time=event_date)`, so lookahead is impossible by construction —
   and the property is TESTED: appending future bars must not change a past
   day's computed signals (`test_future_data_cannot_change_past_computation`).
@@ -411,7 +419,7 @@ model binaries (see `.gitignore`).
 |---|---|
 | Feature store + trigger/cost logging | **Migrated 2026-07-24** — `src/core.py`; 11 passing contract tests; smoke-tested on live data |
 | Alpha (S3) | **Migrated 2026-07-24** — `src/s3_alpha.py`; rule-based regime gate (informational, fails toward cash), deterministic event risk, scorer explicitly DISABLED pending §5 |
-| Signal generation (S2) | **Migrated 2026-07-24** — `src/s2_signals.py`; PIT property tested; real-trigger confirmed (36 features, 5 tickers) |
+| Signal generation (S2) | **Migrated + enriched 2026-07-24** — `src/s2_signals.py`; technical + fundamental (value/quality/size) blocks; publication-date-aware; PIT tested; 55 features/3 tickers real-confirmed |
 | Data + earnings signals (S1) | **Migrated 2026-07-24** — `src/s1_data.py` (prices, macro, calendar, grounded earnings extraction with per-call cost attribution); earnings extraction is observation-only |
 | Execution/safety (S4–S6 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
 | Ops/reporting (S7) | Migrate after execution, with cost fixes retained |
