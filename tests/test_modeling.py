@@ -31,12 +31,33 @@ def _planted_panel(n=2000):
 def test_fit_any_estimator_and_evaluate():
     from sklearn.ensemble import GradientBoostingRegressor
     panel, base = _planted_panel()
-    split = H.purged_split(panel["meta"])
-    trained = H.fit(panel["X"][split["train_idx"]], panel["y"][split["train_idx"]],
+    idx = list(range(len(panel["y"])))
+    trained = H.fit(panel["X"], panel["y"],
                     GradientBoostingRegressor(n_estimators=40, max_depth=2, random_state=0))
-    metrics = H.evaluate_all(trained, panel, base, split)
+    metrics = H.evaluate_at(trained, panel, base, idx)
     assert metrics["return"]["ic"] is not None
     assert "model_beats_naive_rmse" in metrics["price"]
+
+
+def test_performance_log_records_required_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(H, "PERF_LOG", tmp_path / "performance.log")
+    ranges = {"train_range": ["2026-06-01", "2026-06-26"],
+              "dev_range": ["2026-06-29", "2026-07-10"],
+              "tickers": ["AAPL", "MSFT"], "features": ["tech.rsi14"],
+              "label_strategy": "end_of_day_forward_return(H=1d)", "horizon_days": 1}
+    metrics = {"return": {"ic": 0.04, "beats_null": True},
+               "price": {"model": {"mape_pct": 2.0},
+                         "naive_persistence": {"mape_pct": 2.1},
+                         "model_beats_naive_rmse": True}}
+    rec = H.log_performance("ridge", ranges, metrics, promoted=True)
+    import json as _j
+    logged = _j.loads((tmp_path / "performance.log").read_text().strip())
+    # every required metadata field present
+    for k in ("model", "label_strategy", "train_range", "dev_range", "tickers",
+              "features", "dev_ic", "dev_beats_naive", "promoted"):
+        assert k in logged
+    assert logged["train_range"] == ["2026-06-01", "2026-06-26"]
+    assert logged["dev_range"] == ["2026-06-29", "2026-07-10"]
 
 
 def test_promotion_gate_rejects_no_edge():
@@ -54,13 +75,14 @@ def test_promote_register_load_predict_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(W, "MODELS_DIR", tmp_path)
 
     panel, base = _planted_panel()
-    split = H.purged_split(panel["meta"])
-    trained = H.fit(panel["X"][split["train_idx"]], panel["y"][split["train_idx"]],
-                    Ridge(alpha=1.0))
-    metrics = H.evaluate_all(trained, panel, base, split)
-
-    H.promote("test_model", trained,
-              {"experiment": "unit-test", "test_metrics": metrics})
+    idx = list(range(len(panel["y"])))
+    trained = H.fit(panel["X"], panel["y"], Ridge(alpha=1.0))
+    metrics = H.evaluate_at(trained, panel, base, idx)
+    ranges = {"train_range": ["2026-06-01", "2026-06-26"],
+              "dev_range": ["2026-06-29", "2026-07-10"],
+              "tickers": ["T0"], "features": PREDICTOR_FEATURES,
+              "label_strategy": "end_of_day_forward_return(H=1d)", "horizon_days": 1}
+    H.promote("test_model", trained, ranges, metrics)
     # registered
     assert "test_model" in W.list_models()
     # loadable + predicts; feature 0 high -> higher prediction than feature 0 low

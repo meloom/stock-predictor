@@ -418,7 +418,7 @@ stock-predictor/
 │   ├── s2_signals.py         #   file per stage as each stage lands.
 │   ├── s5_execution.py       #   (s2+ are future; only core+s1 exist today)
 │   └── ...
-├── modeling/                 # experimentation: harness + expNN_*.py (train/eval/promote)
+├── modeling/                 # harness.py + model_<name>.py (one per model) + performance.log
 ├── models/                   # registry: metadata + wrapper committed, artifacts gitignored
 ├── tests/                    # tests may be separate files (test_core, test_s1_data, ...)
 ├── examples/                 # per stage: a runnable script that runs the
@@ -437,6 +437,17 @@ model binaries (see `.gitignore`).
 ---
 
 ## 4b. Modeling & the model registry
+
+**Fixed training protocol** (owner-mandated, enforced in `harness.prepare_window`;
+full rules in `.claude/skills/modeling-protocol/SKILL.md`):
+- **4 weeks train (20 trading days) / 2 weeks dev (10 trading days) after**, with
+  a purge gap = label horizon between them.
+- Always the **full tracked universe** (`src/universe.py`).
+- Label: **end-of-day forward return** (predict close H days ahead).
+- **One model per file** (`modeling/model_<name>.py`).
+- Every run appends to the shared **`modeling/performance.log`** (JSON lines):
+  model, label strategy, train range, dev range, tickers, features, dev
+  metrics (IC, beats-null, price MAPE vs naive), promotion outcome.
 
 Experimentation and the live pipeline are separated:
 

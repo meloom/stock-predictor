@@ -1,44 +1,55 @@
 """modeling/harness.py — shared training/eval/promote machinery.
 
-The modeling/ folder is the EXPERIMENTATION zone: try different models with a
-proper purged train/val/test setup, measure honestly (return-IC + price-vs-
-naive), and only when a model is good enough, PROMOTE it to the models/
-registry with metadata + artifact + a loadable wrapper.
+Protocol (fixed, non-negotiable per owner direction):
+  - TRAINING window = 4 weeks (20 trading days).
+  - DEV/EVAL window = the 2 weeks (10 trading days) AFTER training.
+  - A purge gap = the label horizon sits between them (so training labels,
+    which look `horizon` days ahead, cannot overlap the dev window).
+  - ALWAYS the full tracked universe (src/universe.py).
+  - One model per file (modeling/model_*.py); every run appends its metrics +
+    metadata to the shared modeling/performance.log.
 
-This harness is the reusable spine every experiment (modeling/expNN_*.py)
-calls, so the split/eval/promote discipline is identical across experiments.
+Metadata logged per run: model, label strategy, training-data range, dev-data
+range, tickers, features, and the held-out metrics.
 
-Reuses the pipeline's own machinery so experiments train on EXACTLY what the
-live pipeline computes (no train/serve skew): S1 ingest + S2 features +
-s3_predictors.assemble_panel / evaluate / evaluate_price.
+Reuses the pipeline's own S1/S2 code so training sees EXACTLY what the live
+pipeline computes (no train/serve skew).
 """
 from __future__ import annotations
 
 import json
 import os
 import pickle
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from core import FeatureStore                                   # noqa: E402
+from universe import UNIVERSE                                   # noqa: E402
 from s1_data import run_daily_ingestion, fetch_daily_bars, fetch_macro  # noqa: E402
 from s2_signals import run_signal_generation                    # noqa: E402
 import s3_predictors as pred                                    # noqa: E402
 
 MODELS_DIR = ROOT / "models"
-PURGE_DAYS, EMBARGO_DAYS = 15, 7
+MODELING_DIR = ROOT / "modeling"
+PERF_LOG = MODELING_DIR / "performance.log"
+
+TRAIN_DAYS = 20      # 4 weeks of trading days
+DEV_DAYS = 10        # 2 weeks of trading days
+LABEL_STRATEGY = "end_of_day_forward_return"   # predict close H trading days ahead
 
 
-# ═══════════════ Data prep (real, PIT-correct) ═══════════════
+# ═══════════════ Data prep: fixed 4wk-train / 2wk-dev window, full universe ═══════════════
 
-def prepare_panel(universe: list[str], horizon_days: int, period: str = "2y",
-                  sample_every: int = 3) -> dict:
-    """Ingest real bars + compute S2 features across history + assemble a
-    PIT-correct panel. Returns {panel, base_prices, store}."""
+def prepare_window(horizon_days: int = 1, universe: list[str] | None = None,
+                   period: str = "6mo") -> dict:
+    """Build a PIT-correct panel over the most recent 4-week-train + 2-week-dev
+    window (with a `horizon_days` purge between them). Uses the full universe.
+    Returns {panel, base_prices, split, ranges}."""
+    universe = universe or UNIVERSE
     bars = fetch_daily_bars(universe, period=period)
     store = FeatureStore(Path(os.environ.get("TMPDIR", "/tmp")) /
                          f"modeling_{datetime.now(timezone.utc).timestamp()}.db")
@@ -48,34 +59,42 @@ def prepare_panel(universe: list[str], horizon_days: int, period: str = "2y",
                         fetch_shares=lambda t: None,
                         fetch_statements=lambda t, asof=None: None,
                         fetch_analyst=lambda t: None)
-    all_dates = sorted({r["date"] for rows in bars.values() for r in rows})
-    sample = all_dates[50:-(horizon_days + 2)][::sample_every]
-    for d in sample:
+
+    dates = sorted({r["date"] for rows in bars.values() for r in rows})
+    usable = dates[:-horizon_days] if horizon_days > 0 else dates   # need forward price
+    if len(usable) < TRAIN_DAYS + horizon_days + DEV_DAYS:
+        raise ValueError("not enough trading days for a 4wk/2wk window")
+    dev_dates = usable[-DEV_DAYS:]
+    e0 = dates.index(dev_dates[0])
+    train_dates = dates[e0 - horizon_days - TRAIN_DAYS: e0 - horizon_days]
+    assert len(train_dates) == TRAIN_DAYS and len(dev_dates) == DEV_DAYS, \
+        "window guarantee violated (must be 20 train / 10 dev trading days)"
+
+    window = train_dates + dev_dates
+    for d in window:
         run_signal_generation(universe, d, store=store)
-    panel = pred.assemble_panel(store, universe, sample, horizon_days=horizon_days)
+    panel = pred.assemble_panel(store, universe, window, horizon_days=horizon_days)
+
+    tr = set(train_dates)
+    dv = set(dev_dates)
+    train_idx = [i for i, (d, _) in enumerate(panel["meta"]) if d in tr]
+    dev_idx = [i for i, (d, _) in enumerate(panel["meta"]) if d in dv]
     base = [store.read_asof("price.close", t, d)["value"] for d, t in panel["meta"]]
-    return {"panel": panel, "base_prices": base, "store": store}
+    return {"panel": panel, "base_prices": base,
+            "split": {"train_idx": train_idx, "dev_idx": dev_idx},
+            "ranges": {"train_range": [train_dates[0], train_dates[-1]],
+                       "dev_range": [dev_dates[0], dev_dates[-1]],
+                       "purge_days": horizon_days,
+                       "tickers": universe,
+                       "features": list(pred.PREDICTOR_FEATURES),
+                       "label_strategy": f"{LABEL_STRATEGY}(H={horizon_days}d)",
+                       "horizon_days": horizon_days}}
 
 
-def purged_split(meta: list, train_frac: float = 0.7) -> dict:
-    """Time-ordered purged/embargoed split by DATE (not row) — no leakage
-    across the boundary."""
-    uniq = sorted({d for d, _ in meta})
-    cut = int(len(uniq) * train_frac)
-    train_end = uniq[cut]
-    test_start = uniq[min(cut + EMBARGO_DAYS, len(uniq) - 1)]
-    tr = [i for i, (d, _) in enumerate(meta) if d <= train_end]
-    te = [i for i, (d, _) in enumerate(meta) if d >= test_start]
-    return {"train_idx": tr, "test_idx": te,
-            "train_end": train_end, "test_start": test_start}
-
-
-# ═══════════════ Generic fit (any sklearn estimator) ═══════════════
+# ═══════════════ Fit / evaluate ═══════════════
 
 def fit(X, y, estimator) -> dict:
-    """Standardize + mean-impute + fit any sklearn estimator. Returns the same
-    self-contained trained dict shape s3_predictors uses, so evaluate() /
-    predict work regardless of model type."""
+    """Standardize + mean-impute + fit any sklearn estimator."""
     import numpy as np
     mean = np.nanmean(X, axis=0)
     std = np.nanstd(X, axis=0)
@@ -89,51 +108,76 @@ def fit(X, y, estimator) -> dict:
             "feature_names": list(pred.PREDICTOR_FEATURES), "coefficients": coefs}
 
 
-def evaluate_all(trained, panel, base_prices, split) -> dict:
-    """Both views: cross-sectional return (IC/MSE-vs-null) + price-vs-naive."""
-    import numpy as np
-    te = split["test_idx"]
-    X, y = panel["X"][te], panel["y"][te]
+def evaluate_at(trained, panel, base_prices, idx) -> dict:
+    """Return view (IC/MSE-vs-null) + price view (vs naive) on the dev rows."""
+    X, y = panel["X"][idx], panel["y"][idx]
     ret = pred.evaluate(trained, X, y)
-    pred_ret = pred._predict_vec(trained, X).tolist()
-    price = pred.evaluate_price(pred_ret, y.tolist(), [base_prices[i] for i in te])
+    pr = pred._predict_vec(trained, X).tolist()
+    price = pred.evaluate_price(pr, y.tolist(), [base_prices[i] for i in idx])
     return {"return": ret, "price": price}
 
 
-# ═══════════════ Promotion to the models/ registry ═══════════════
+# ═══════════════ Performance log (shared, append-only) ═══════════════
 
-def promote(model_id: str, trained: dict, metadata: dict) -> Path:
-    """Write the artifact + metadata into models/<model_id>/ and register it.
-    Artifact (.pkl) is gitignored (rebuild via the experiment); metadata is
-    committed. Registration is what makes a model loadable by the wrapper."""
-    mdir = MODELS_DIR / model_id
-    mdir.mkdir(parents=True, exist_ok=True)
-    with open(mdir / "artifact.pkl", "wb") as f:
-        pickle.dump(trained, f)
-    meta = {**metadata, "model_id": model_id,
-            "feature_names": trained["feature_names"],
-            "promoted_at": datetime.now(timezone.utc).isoformat()}
-    with open(mdir / "metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
-    # update registry index
-    reg_path = MODELS_DIR / "registry.json"
-    reg = json.loads(reg_path.read_text()) if reg_path.exists() else {"models": {}}
-    reg["models"][model_id] = {"promoted_at": meta["promoted_at"],
-                               "metrics": metadata.get("test_metrics")}
-    reg_path.write_text(json.dumps(reg, indent=2))
-    return mdir
+def log_performance(model_name: str, ranges: dict, metrics: dict,
+                    promoted: bool, extra: dict | None = None) -> dict:
+    """Append one record to modeling/performance.log — the common log of every
+    training run: model, label strategy, train/dev ranges, tickers, features,
+    metrics, promotion outcome."""
+    record = {
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+        "model": model_name,
+        "label_strategy": ranges["label_strategy"],
+        "train_range": ranges["train_range"],
+        "dev_range": ranges["dev_range"],
+        "n_tickers": len(ranges["tickers"]),
+        "tickers": ranges["tickers"],
+        "features": ranges["features"],
+        "dev_ic": metrics["return"]["ic"],
+        "dev_beats_null": metrics["return"]["beats_null"],
+        "dev_price_mape_pct": metrics["price"]["model"]["mape_pct"],
+        "dev_naive_mape_pct": metrics["price"]["naive_persistence"]["mape_pct"],
+        "dev_beats_naive": metrics["price"]["model_beats_naive_rmse"],
+        "promoted": promoted,
+        **(extra or {}),
+    }
+    PERF_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(PERF_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    return record
 
+
+# ═══════════════ Promotion ═══════════════
 
 def meets_bar(metrics: dict, min_ic: float = 0.03,
               require_beats_naive: bool = True) -> bool:
-    """The promotion gate. A model is 'good enough' only if it clears real
-    thresholds — a model that doesn't beat the null/naive is NOT promoted,
-    and that is a valid, honest outcome."""
     ret, price = metrics["return"], metrics["price"]
-    if ret["ic"] is None or ret["ic"] < min_ic:
-        return False
-    if not ret["beats_null"]:
+    if ret["ic"] is None or ret["ic"] < min_ic or not ret["beats_null"]:
         return False
     if require_beats_naive and not price["model_beats_naive_rmse"]:
         return False
     return True
+
+
+def promote(model_id: str, trained: dict, ranges: dict, metrics: dict) -> Path:
+    """Write artifact + metadata into models/<model_id>/ and register it.
+    Metadata carries: train/dev ranges, tickers, features, label strategy,
+    test metrics."""
+    mdir = MODELS_DIR / model_id
+    mdir.mkdir(parents=True, exist_ok=True)
+    with open(mdir / "artifact.pkl", "wb") as f:
+        pickle.dump(trained, f)
+    meta = {"model_id": model_id, "label_strategy": ranges["label_strategy"],
+            "train_range": ranges["train_range"], "dev_range": ranges["dev_range"],
+            "tickers": ranges["tickers"], "features": ranges["features"],
+            "horizon_days": ranges["horizon_days"], "test_metrics": metrics,
+            "promoted_at": datetime.now(timezone.utc).isoformat()}
+    (mdir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    reg_path = MODELS_DIR / "registry.json"
+    reg = json.loads(reg_path.read_text()) if reg_path.exists() else {"models": {}}
+    reg["models"][model_id] = {"promoted_at": meta["promoted_at"],
+                               "train_range": meta["train_range"],
+                               "dev_range": meta["dev_range"],
+                               "dev_ic": metrics["return"]["ic"]}
+    reg_path.write_text(json.dumps(reg, indent=2))
+    return mdir

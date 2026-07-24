@@ -38,3 +38,6 @@ __pycache__/
 .idea/
 .vscode/
 /runtime/
+
+# the modeling performance log IS committed (the shared training record)
+!modeling/performance.log
