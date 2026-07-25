@@ -279,7 +279,9 @@ class Collector:
                           "total": total, "collected": collected or 0, "due_now": due or 0,
                           "errors": errs or 0, "pct": round(100 * (collected or 0) / total) if total else 0,
                           "last_run_h": hours_since(last)})
-        kinds.sort(key=lambda k: -k["pct"])
+        # STABLE order (by collection priority, then name) — never reorder by progress,
+        # so rows don't jump around as the live page refreshes.
+        kinds.sort(key=lambda k: (self.kinds.get(k["kind"], {}).get("priority", 999), k["kind"]))
 
         # per-signal store coverage
         signals = []
@@ -305,7 +307,7 @@ class Collector:
         queue = []
         for kind, source, scope, status, last_ok, next_due, attempts, err in self.c.execute(
                 "SELECT kind, source, scope, status, last_ok, next_due, attempts, last_error "
-                "FROM collection_tasks ORDER BY next_due ASC"):
+                "FROM collection_tasks ORDER BY scope, kind"):   # STABLE grid — no reshuffle
             try:
                 due_in = round((datetime.fromisoformat(next_due) - now).total_seconds() / 60)
             except Exception:
