@@ -97,6 +97,46 @@ is nearly useless for direction.
    has some), and **transcripts** (NLP). This is exactly why the champion is blind: none
    of these are in our price/volume/fundamental feature set.
 
+## Results — signals integrated + tested on our data (2026-07-25)
+
+Built two PIT-safe blocks in `augment_features.py` (the yfinance-fetchable ones;
+short interest & implied-move are current-snapshot only, not historically PIT):
+- `analyst` — net upgrades−downgrades trailing 30d/90d + recent-downgrade flag
+  (109/109 tickers, 3.8k upgrades / 3.5k downgrades, dated → PIT-safe).
+- `preearn` — pre-earnings 5d/10d drift gated to names reporting within 10 sessions.
+
+**Tested across ALL models over ALL rolling windows** (`eval_signals.py`), per-day
+precision@1, baseline vs +signals:
+
+| model | up@1 base→+sig | down@1 base→+sig |
+|---|---|---|
+| logistic | 24.2 → 22.1 (−2.1) | 16.8 → 15.8 (−1.1) |
+| random_forest | 20.5 → 17.4 (−3.2) | 13.2 → 13.2 (0.0) |
+| histgbm | 21.6 → 20.0 (−1.6) | 23.2 → 21.6 (−1.6) |
+| gradient_boosting | 18.9 → 20.0 (+1.1) | 24.2 → 21.6 (−2.6) |
+| **DUAL champion** | **24.2 → 22.1 (−2.1)** | **23.2 → 21.6 (−1.6)** |
+
+**On the daily directional model the signals HURT (−1.5 to −3pp).** Reason (as the
+research predicted): they matter only in the ~4% of rows near a report, so as
+always-on features they are noise on the other 96% and dilute the momentum/
+extension signal. **NOT promoted to `PREDICTOR_FEATURES`.**
+
+**In their proper domain (near-earnings rows only, `days_to_earn ≤ 10`, n=2954) the
+signals ARE real but weak:**
+- analyst **upgrades → P(big-up) 13.3% vs 11.3% base (+2pp)**, P(big-down) 8.9% vs
+  10.3% — a correct, modest bullish tilt.
+- recent-downgrade flag → noisy/contrarian (downgraded names had *lower* P(big-down),
+  likely already priced/oversold) — not a clean short signal.
+- positive pre-earnings drift → weak upward continuation (+0.15% mean fwd); negative
+  drift is two-way (no edge).
+
+**Conclusion:** these belong in a **dedicated near-earnings module** (or Model 1 of
+the magnitude×direction split), NOT the daily predictor. The blocks + fetch + eval
+are kept in the codebase for that future module. This is the third confirmation
+(after `earnings` and `insider`) that event signals don't help the daily directional
+metric — the direction of an earnings move is genuinely close to unpredictable
+ex-ante, exactly as the 20-instance study concluded.
+
 ## Proposed next steps (data-gated, priority order)
 1. **Analyst-revision momentum** — cheapest ex-ante *directional* signal; yfinance
    `recommendations` / `upgrades_downgrades`, cached. (Backlog item #2.)

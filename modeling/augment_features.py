@@ -39,6 +39,7 @@ BARS_CACHE = ROOT / "runtime" / "bars_1y.pkl"
 MACRO_CACHE = ROOT / "runtime" / "macro_1y.pkl"
 INSIDER_CACHE = ROOT / "runtime" / "insider.pkl"
 EARNINGS_CACHE = ROOT / "runtime" / "earnings.pkl"
+ANALYST_CACHE = ROOT / "runtime" / "analyst_revisions.pkl"
 
 # coarse sector map for the tracked universe (only groups we actually hold need
 # entries; anything unlisted falls in "other" and gets a neutral sector signal).
@@ -127,6 +128,101 @@ def get_earnings(tickers=None) -> dict:
     EARNINGS_CACHE.parent.mkdir(parents=True, exist_ok=True)
     pickle.dump(out, open(EARNINGS_CACHE, "wb"))
     return out
+
+
+def get_analyst_revisions(tickers=None) -> dict:
+    """Fetch each ticker's dated analyst grade changes (upgrades/downgrades) once
+    and cache. Value = list of {date, action} where action in up/down/main/init.
+    This is the top ex-ante DIRECTIONAL earnings signal (EARNINGS_RESEARCH.md):
+    net revision momentum predicts the surprise direction better than the surprise.
+    Dated -> PIT-safe. Missing/failed ticker -> [] (feature NaN)."""
+    if ANALYST_CACHE.exists():
+        return pickle.load(open(ANALYST_CACHE, "rb"))
+    import yfinance as yf
+    tickers = tickers or UNIVERSE
+    out = {}
+    for t in tickers:
+        rows = []
+        try:
+            df = yf.Ticker(t).upgrades_downgrades
+            if df is not None and len(df):
+                for idx, r in df.iterrows():
+                    d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
+                    act = str(r.get("Action", "")).lower()
+                    rows.append({"date": d, "action": act})
+        except Exception:
+            pass
+        out[t] = rows
+    ANALYST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    pickle.dump(out, open(ANALYST_CACHE, "wb"))
+    return out
+
+
+def analyst_block(meta, bars):
+    """ANALYST-REVISION momentum — net upgrades-minus-downgrades trailing 30d/90d
+    plus a recent-downgrade flag. PIT-safe: only grade changes dated <= d. The
+    strongest ex-ante directional earnings signal in the research."""
+    from datetime import date
+    rev = get_analyst_revisions()
+    ords = {}
+    for t, rows in rev.items():
+        acc = []
+        for r in rows:
+            try:
+                acc.append((date(*map(int, r["date"].split("-"))).toordinal(), r["action"]))
+            except Exception:
+                pass
+        ords[t] = sorted(acc)
+    names = ["an.net_rev_30d", "an.net_rev_90d", "an.recent_downgrade_30d"]
+    F = np.full((len(meta), len(names)), np.nan)
+    for r, (d, t) in enumerate(meta):
+        acc = ords.get(t)
+        if acc is None:
+            continue
+        do = date(*map(int, d.split("-"))).toordinal()
+        n30u = n30d = n90u = n90d = 0
+        for eo, act in acc:
+            if eo > do:
+                break
+            age = do - eo
+            up = act == "up"; dn = act == "down"
+            if age <= 90:
+                n90u += up; n90d += dn
+            if age <= 30:
+                n30u += up; n30d += dn
+        F[r, 0] = n30u - n30d
+        F[r, 1] = n90u - n90d
+        F[r, 2] = 1.0 if n30d > 0 else 0.0
+    return names, F
+
+
+def preearn_block(meta, bars, win: int = 10):
+    """PRE-EARNINGS DRIFT — the price move INTO the report (professionals position
+    ahead), gated to names reporting within `win` sessions. Trailing 5-day and
+    10-day return, zero when no earnings are near (so the feature only speaks when
+    a catalyst is imminent). PIT-safe (trailing closes + scheduled calendar)."""
+    from datetime import date
+    S = _series(bars)
+    cal = get_earnings()
+    ords = {t: sorted(date(*map(int, d.split("-"))).toordinal() for d in ds)
+            for t, ds in cal.items()}
+    names = ["pe.drift5_near", "pe.drift10_near", "pe.near_earn_flag"]
+    F = np.full((len(meta), len(names)), np.nan)
+    for r, (d, t) in enumerate(meta):
+        s = S.get(t); es = ords.get(t)
+        if not s or d not in s["idx"]:
+            continue
+        do = date(*map(int, d.split("-"))).toordinal()
+        nxt = [e - do for e in es] if es else []
+        nxt = [x for x in nxt if x >= 0]
+        near = 1.0 if (nxt and min(nxt) <= win) else 0.0
+        i = s["idx"][d]; c = s["c"]
+        d5 = (c[i] / c[i - 5] - 1.0) if i >= 5 else 0.0
+        d10 = (c[i] / c[i - 10] - 1.0) if i >= 10 else 0.0
+        F[r, 0] = d5 * near
+        F[r, 1] = d10 * near
+        F[r, 2] = near
+    return names, F
 
 
 def earnings_block(meta, bars, cap: int = 90):
@@ -419,7 +515,7 @@ def regime_block(meta, bars, win: int = 20):
 
 BLOCKS = {"ext": ext_block, "sector": sector_block, "regime": regime_block,
           "xhorizon": xhorizon_block, "macro": macro_block, "insider": insider_block,
-          "earnings": earnings_block}
+          "earnings": earnings_block, "analyst": analyst_block, "preearn": preearn_block}
 
 
 def build_augmented(block_keys: list[str], horizon: int = 1):
