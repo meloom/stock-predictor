@@ -70,8 +70,10 @@ def main():
         sweep.append({"th": th, "up_prec": pu, "up_calls": nu,
                       "dn_prec": pdn, "dn_calls": ndn, "both_prec": both, "both_calls": int(both_n)})
 
-    # operating point: highest threshold with >=5 down-calls (high-precision use)
-    op = next((s for s in reversed(sweep) if s["dn_calls"] and s["dn_calls"] >= 5), sweep[len(sweep)//2])
+    # operating point: best down-precision among thresholds with an adequate
+    # sample (>= 8 down-calls) — avoids flattering thin high-threshold points.
+    eligible = [s for s in sweep if s["dn_calls"] and s["dn_calls"] >= 8 and s["dn_prec"] is not None]
+    op = max(eligible, key=lambda s: s["dn_prec"]) if eligible else sweep[len(sweep)//2]
     H.log_performance("updown_clf", ranges,
                       {"return": {"ic": None, "rmse": None, "direction_hit_rate": None, "beats_null": None},
                        "price": {"model": {"rmse": None, "mape_pct": None},
