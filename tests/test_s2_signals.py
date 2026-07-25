@@ -8,7 +8,7 @@ import pytest
 import core as core_mod
 from core import FeatureStore, MARKET_SCOPE
 from s2_signals import (rsi14, momentum, hvol20, volume_ratio20, pct_ranks,
-                        fundamental_ratios, run_signal_generation)
+                        fundamental_ratios, xhorizon_features, run_signal_generation)
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +41,32 @@ def test_momentum_exact():
     closes = [100, 100, 100, 100, 100, 100, 110]
     assert momentum(closes, 5) == pytest.approx(0.10)
     assert momentum(closes, 20) is None  # insufficient history -> None, no sentinel
+
+
+def test_xhorizon_at_high_vs_off_high():
+    # a steady climb: last close IS the trailing high -> flagged extended
+    up = [100 + i for i in range(120)]
+    f = xhorizon_features(up)
+    assert f["xh.dist_hi252"] == pytest.approx(0.0)
+    assert f["xh.new_high_flag"] == 1.0
+    assert f["xh.above_hi_streak"] == 10.0            # capped at 10
+    assert f["xh.ret_21d"] == pytest.approx(up[-1] / up[-22] - 1.0)
+    # same run, then a sharp pullback -> off the high, streak resets, flag off
+    off = up + [219 * 0.85, 219 * 0.84, 219 * 0.83]
+    g = xhorizon_features(off)
+    assert g["xh.dist_hi252"] < -0.1
+    assert g["xh.new_high_flag"] == 0.0
+    assert g["xh.above_hi_streak"] == 0.0
+
+
+def test_xhorizon_short_history_is_none_not_sentinel():
+    # under the 41-close minimum every extension feature is genuinely missing
+    assert all(v is None for v in xhorizon_features([100, 101, 102, 103]).values())
+    # the 6-month return stays None until 127 closes exist, even when others fill in
+    mid = [100 + i for i in range(80)]
+    f = xhorizon_features(mid)
+    assert f["xh.ret_21d"] is not None and f["xh.ret_63d"] is not None
+    assert f["xh.ret_126d"] is None
 
 
 def test_rsi_extremes_and_known_value():

@@ -58,6 +58,11 @@ PREDICTOR_FEATURES = [
     # S2 cross-sectional ranks (the selection-relevant form)
     "xsec.rank_rsi14", "xsec.rank_mom5", "xsec.rank_earnings_yield",
     "xsec.rank_fcf_yield", "xsec.rank_roe", "xsec.rank_gross_profitability",
+    # S2 long-horizon extension — champion block from grounded error analysis
+    # (best measured lift: down-side per-day precision@1 2.5x->2.9x base rate).
+    # See modeling/ERROR_ANALYSIS.md.
+    "xh.ret_21d", "xh.ret_63d", "xh.ret_126d",
+    "xh.dist_hi252", "xh.new_high_flag", "xh.above_hi_streak",
 ]
 
 EOD_HORIZON_DAYS = 1   # "end of day": next session's close. Configurable.

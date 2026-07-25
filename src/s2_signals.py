@@ -75,6 +75,20 @@ S2_FEATURES = [
      "Cross-sectional percentile rank of fund.roe (0..1)."),
     ("xsec.rank_gross_profitability", "float", "ticker", "daily",
      "Cross-sectional percentile rank of fund.gross_profitability (0..1)."),
+    # -- LONG-HORIZON extension (the champion block from grounded error analysis:
+    #    see modeling/ERROR_ANALYSIS.md). The top confident-wrong LONG calls
+    #    (MRVL/AMAT/MU 2026-06-30..07-01) were all names at a 52-week high after a
+    #    multi-month parabolic run, then a 'sell-the-news' reversal. These measure
+    #    that stretch; they lifted down-side per-day precision@1 from 2.5x to 2.9x
+    #    the base rate. PIT-safe (trailing closes only). --
+    ("xh.ret_21d", "float", "ticker", "daily", "close[t]/close[t-21] - 1 (1-month return)."),
+    ("xh.ret_63d", "float", "ticker", "daily", "close[t]/close[t-63] - 1 (3-month return)."),
+    ("xh.ret_126d", "float", "ticker", "daily", "close[t]/close[t-126] - 1 (6-month return)."),
+    ("xh.dist_hi252", "float", "ticker", "daily",
+     "(close - trailing 252d high)/high; <=0, 0 = at the 52-week high."),
+    ("xh.new_high_flag", "float", "ticker", "daily", "1 if close within 2% of the trailing 252d high, else 0."),
+    ("xh.above_hi_streak", "float", "ticker", "daily",
+     "consecutive recent days (<=10) closing within 3% of the trailing high."),
     ("regime.breadth5", "float", "market", "daily",
      "Fraction of universe tickers with positive tech.mom5 on the day."),
 ]
@@ -160,6 +174,42 @@ def lagged_returns(closes: list[float], n: int = 7) -> list[float | None]:
     return out
 
 
+def xhorizon_features(closes: list[float]) -> dict[str, float | None]:
+    """Long-horizon extension — the champion block from error analysis. Multi-
+    month returns + distance from the trailing 252-day high + a new-high flag,
+    capturing the 'stretched at a 52-week high after a parabolic run -> reversal-
+    down risk' pattern behind the top confident-wrong LONG calls. PIT-safe: uses
+    only trailing closes. Each feature is None where history is too short (no
+    padding/sentinels — a missing value is genuinely missing)."""
+    n = len(closes)
+    out = {"xh.ret_21d": None, "xh.ret_63d": None, "xh.ret_126d": None,
+           "xh.dist_hi252": None, "xh.new_high_flag": None, "xh.above_hi_streak": None}
+    if n < 41:                       # need a few months before extension is meaningful
+        return out
+    c0 = closes[-1]
+    lb = min(252, n)
+    hi = max(closes[-lb:])
+    if n >= 22:
+        out["xh.ret_21d"] = c0 / closes[-22] - 1.0
+    if n >= 64:
+        out["xh.ret_63d"] = c0 / closes[-64] - 1.0
+    if n >= 127:
+        out["xh.ret_126d"] = c0 / closes[-127] - 1.0
+    out["xh.dist_hi252"] = (c0 - hi) / hi if hi else None
+    out["xh.new_high_flag"] = 1.0 if c0 >= 0.98 * hi else 0.0
+    # consecutive recent days (<=10) that closed within 3% of the trailing high
+    streak = 0
+    for k in range(n - 1, max(n - 11, 0), -1):
+        lo = max(0, k - lb + 1)
+        hk = max(closes[lo:k + 1])
+        if hk and closes[k] >= 0.97 * hk:
+            streak += 1
+        else:
+            break
+    out["xh.above_hi_streak"] = float(streak)
+    return out
+
+
 def volume_ratio20(volumes: list[float]) -> float | None:
     if len(volumes) < 20:
         return None
@@ -192,7 +242,10 @@ def pct_ranks(values: dict[str, float]) -> dict[str, float]:
 
 # ═══════════════ Orchestrator ═══════════════
 
-HISTORY_N = 30  # trading days of closes fetched per ticker (covers rsi14/mom20/hvol20)
+HISTORY_N = 260  # trading days of closes per ticker: covers rsi14/mom20/hvol20
+                 # AND the xh.* long-horizon extension block (trailing 252d high).
+                 # The short features only read the tail, so the longer read is
+                 # a superset — identical results, plus a year of history for xh.*
 
 
 def run_signal_generation(universe: list[str], event_date: str,
@@ -236,6 +289,8 @@ def run_signal_generation(universe: list[str], event_date: str,
             }
             for k, r in enumerate(lagged_returns(closes, 7), start=1):
                 computed[f"tech.ret_lag{k}"] = r
+            # long-horizon extension (champion block: modeling/ERROR_ANALYSIS.md)
+            computed.update(xhorizon_features(closes))
 
             # fundamentals — read S1's raw data as-of event_date (read_asof is
             # publication-date aware, so a statement filed after event_date is

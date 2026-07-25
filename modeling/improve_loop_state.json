@@ -1,0 +1,18 @@
+{
+  "status": "iteration_complete",
+  "metric": "per_day_precision_at_k (k=1,2,5,10)",
+  "base_rate": {"up": 0.094, "down": 0.081},
+  "champion_feature_set": "live S3 = 20 usable features incl. xh.* long-horizon block (fundamentals data-blocked/filtered)",
+  "champion_result_down_at_1": {"histgbm": "23% (2.9x)", "gradient_boosting": "25% (3.1x)"},
+  "promoted_to_live_pipeline": {"s2_signals.py": "xhorizon_features()", "s3_predictors.py": "6 xh.* in PREDICTOR_FEATURES", "tests": "48 pass (2 new)"},
+  "blocks_tested": {
+    "xhorizon": "PROMOTED (+1.3pp, down-side)",
+    "ext": "marginal, not promoted",
+    "macro": "dropped (day-level, no x-sec lift)",
+    "sector": "dropped (hurt)",
+    "insider": "built+tested, dropped (real driver but REDUNDANT with xhorizon)"
+  },
+  "readme_table": "regenerated: per-day precision@k, all 5 models + baseline_random, RMSE/peak-precision retired",
+  "backlog_remaining": ["analyst_downgrade(recommendations)", "sp500_inclusion(calendar)", "fcf_trend(hist_fundamentals)"],
+  "grounded_failures_analyzed": ["MRVL 2026-06-30", "AMAT 2026-06-30", "MU 2026-07-01"]
+}
