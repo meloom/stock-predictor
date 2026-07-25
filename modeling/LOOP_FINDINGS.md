@@ -85,3 +85,34 @@ horizon. The two directions with a real chance (per earlier measurement):
 
 The loop worked exactly as intended: it didn't manufacture a winner. It
 measured 30 methods honestly and kept the baseline because nothing beat it.
+
+---
+
+## Breakthrough: reframe as high-precision big-move classification (2026-07-25)
+
+Owner's reframe: don't predict the return — predict only BIG moves (label +1 if
+>+3%, −1 if <−3%, else neutral) and only when confident. Metric = PRECISION
+(a neutral flagged up/down is the costly error). This is the FIRST framing that
+surfaced real signal.
+
+Dev window base rates: up>+3% 8.6%, down<−3% 11.5%.
+
+| threshold | UP prec | DOWN prec | (base: up 8.6%, down 11.5%) |
+|---|---|---|---|
+| 0.35 | 11.4% | 31.9% | down 2.8× base |
+| 0.50 | 8.6%  | 44.0% | down 3.8× base |
+| 0.58 | 4.2%  | 50.0% | down 4.4× base |
+| 0.65 | 0.0%  | 58.3% | down 5.1× base |
+
+- **DOWN (big-drop) prediction has real, sizeable precision** — up to ~50–58%
+  vs an 11.5% base rate (4–5× lift). It's selecting *which* names drop, not
+  just riding the falling market (a "predict everything down" model would sit
+  at the 11.5% base rate, not 50%).
+- **UP prediction is noise** here — precision ≈ base rate, then 0 at high
+  confidence (the dev fortnight was a down market; big up-moves were rare).
+- Plot: `modeling/precision_curves.png`.
+
+**Caveat (honest):** one 10-day window, ~12–25 down-calls — promising but
+small-sample, and partly a down-market regime. Confirm across rolling windows
+before trusting it. But this is the first genuinely measurable edge in the
+whole effort, and it came from the right problem framing, not a better model.
