@@ -172,17 +172,27 @@ def fetch_current_quote(ticker: str) -> dict | None:
     state = (info.get("marketState") or "").upper()
     pre, post = info.get("preMarketPrice"), info.get("postMarketPrice")
     reg = info.get("regularMarketPrice") or info.get("currentPrice")
+
+    def _mt(key):   # the quote's GENERATION time (market timestamp), ISO UTC
+        ts = info.get(key)
+        try:
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat() if ts else None
+        except Exception:
+            return None
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     if state.startswith("PRE") and pre:
-        return {"price": float(pre), "session": "pre"}
+        return {"price": float(pre), "session": "pre", "as_of": _mt("preMarketTime") or now_iso}
     if state.startswith("POST") and post:
-        return {"price": float(post), "session": "post"}
+        return {"price": float(post), "session": "post", "as_of": _mt("postMarketTime") or now_iso}
     if reg:
-        return {"price": float(reg), "session": "regular" if state == "REGULAR" else "closed"}
+        return {"price": float(reg), "session": "regular" if state == "REGULAR" else "closed",
+                "as_of": _mt("regularMarketTime") or now_iso}
     # last resort: any extended-hours quote beats nothing (still never a stale bar)
     if post:
-        return {"price": float(post), "session": "post"}
+        return {"price": float(post), "session": "post", "as_of": _mt("postMarketTime") or now_iso}
     if pre:
-        return {"price": float(pre), "session": "pre"}
+        return {"price": float(pre), "session": "pre", "as_of": _mt("preMarketTime") or now_iso}
     return None
 
 # ═══════════════ Fundamentals: raw statement data for S2 ═══════════════

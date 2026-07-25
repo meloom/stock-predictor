@@ -436,7 +436,11 @@ def _h_quote(scope, store, tid):
     q = s1_data.fetch_current_quote(scope)
     if q is None:
         return 0, 1
-    store.write("price.current", scope, _today(), q, trigger_id=tid)
+    # event_time = when the quote was GENERATED (market timestamp), not today's
+    # date — so intraday snapshots are distinct and PIT-correct for training.
+    # (ingested_at, set by the store, records when we COLLECTED it.)
+    event_time = q.get("as_of") or datetime.now(timezone.utc).isoformat()
+    store.write("price.current", scope, event_time, q, trigger_id=tid)
     return 1, 1
 
 
@@ -476,6 +480,53 @@ def _h_statements(scope, store, tid):
     if st is not None:
         store.write("fundamental.statements", scope, st["event_time"], st, trigger_id=tid); n += 1
     return n, 1
+
+
+def _h_insider(scope, store, tid):
+    """RAW insider (SEC Form 4) transactions — the external data the S2 insider
+    block needs. Snapshot of the dated transaction list; S2 derives net-sell ratios."""
+    store.register("insider.transactions_raw", "json", "ticker", "S1", "daily",
+                   "RAW insider Form-4 transactions (dated list snapshot from yfinance). "
+                   "event_time = snapshot day; S2 derives trailing net-sell metrics.")
+    import yfinance as yf
+    try:
+        df = yf.Ticker(scope).insider_transactions
+    except Exception:
+        return 0, 1
+    if df is None or len(df) == 0:
+        return 0, 1
+    recs = []
+    for _, r in df.iterrows():
+        d = r.get("Start Date")
+        d = d.date().isoformat() if hasattr(d, "date") else (str(d)[:10] if d is not None else None)
+        txt = str(r.get("Text", "")); val = _num(r.get("Value")) or 0.0
+        recs.append({"date": d, "value": val, "position": str(r.get("Position", "")),
+                     "is_sale": ("sale" in txt.lower()) and val > 0})
+    store.write("insider.transactions_raw", scope, _today(), recs, trigger_id=tid)
+    return 1, 1
+
+
+def _h_analyst_revisions(scope, store, tid):
+    """RAW analyst upgrades/downgrades — dated grade changes (the external data the
+    S2 revision-momentum block needs). Distinct from analyst_snapshot (consensus)."""
+    store.register("analyst.revisions_raw", "json", "ticker", "S1", "daily",
+                   "RAW dated analyst grade changes (upgrades/downgrades from yfinance). "
+                   "event_time = snapshot day; S2 derives net-revision momentum.")
+    import yfinance as yf
+    try:
+        df = yf.Ticker(scope).upgrades_downgrades
+    except Exception:
+        return 0, 1
+    if df is None or len(df) == 0:
+        return 0, 1
+    recs = []
+    for idx, r in df.iterrows():
+        d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
+        recs.append({"date": d, "action": str(r.get("Action", "")).lower(),
+                     "firm": str(r.get("Firm", "")), "to": str(r.get("ToGrade", "")),
+                     "from": str(r.get("FromGrade", ""))})
+    store.write("analyst.revisions_raw", scope, _today(), recs, trigger_id=tid)
+    return 1, 1
 
 
 def _h_dte(scope, store, tid):
@@ -724,7 +775,9 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_kind("implied_move", "polygon", DAY, 25, _h_implied_move, est_calls=4)
     col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1)
     col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1)
+    col.register_kind("analyst_revisions", "yfinance", DAY, 41, _h_analyst_revisions, est_calls=1)
     col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1)
+    col.register_kind("insider", "yfinance", 3 * DAY, 44, _h_insider, est_calls=1)
     col.register_kind("earn_date", "yfinance", DAY, 45, _h_earn_date, est_calls=1)   # RAW next-earnings date/time
     col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1)
     col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1)

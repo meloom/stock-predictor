@@ -28,6 +28,8 @@ DRILL_FEATURES = [
     ["fundamental.analyst_snapshot", "Analyst"], ["fundamental.statements", "Fundamentals"],
     ["earnings.next_date", "Next earnings date"],       # S1 raw; days_to_earnings is S2
     ["earnings.report_raw", "Earnings report (raw)"],   # S1 raw; earnings.analysis is S2
+    ["insider.transactions_raw", "Insider transactions"],
+    ["analyst.revisions_raw", "Analyst revisions"],
 ]
 
 
