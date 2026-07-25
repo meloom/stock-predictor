@@ -13,8 +13,15 @@ python -m collector add-ticker NVDA      # prioritized backfill for a new ticker
 python -m collector drain --seconds 55   # one bounded pass (for a per-minute cron)
 python -m collector run                  # long-running daemon
 python -m collector status               # queue + quota snapshot
-python -m collector_dashboard out.html   # render the coverage/backfill dashboard
+python -m collector_dashboard out.html   # write a one-off dashboard snapshot
+python -m collector_dashboard serve 8787 # LIVE local dashboard — refresh to see updates
 ```
+
+The **live dashboard** (`serve`) regenerates on every request and auto-refreshes, so
+just refresh the browser to see the latest state. It shows overall backfill %, per-
+source quota, per-kind progress, a ticker×signal freshness heatmap, and the full
+**queue schedule at per-ticker × per-signal × next-run granularity** (state, last
+collected, next run, retries — with a live filter box).
 
 **Cron (self-healing, respects limits):** run a bounded drain every minute — each
 run consumes only that minute's quota, then exits:

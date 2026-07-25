@@ -285,15 +285,30 @@ class Collector:
             signals.append({"feature": feature, "rows": nrows, "scopes": nscopes,
                             "latest_event": latest_evt, "fresh_h": hours_since(latest_ing)})
 
-        # ticker × signal freshness matrix
+        # ticker × signal matrix, with the TIME detail per cell (count + event span)
         cols = matrix_features or ["price.close", "price.current", "short.pct_float",
                                    "opt.implied_move", "fundamental.analyst_snapshot",
                                    "fundamental.statements", "calendar.days_to_earnings"]
         matrix = {}
-        for feature, scope, ing, evt in self.c.execute(
-                "SELECT feature, scope, MAX(ingested_at), MAX(event_time) FROM feature_values "
-                "WHERE feature IN (%s) GROUP BY feature, scope" % ",".join("?" * len(cols)), cols):
-            matrix.setdefault(scope, {})[feature] = {"fresh_h": hours_since(ing), "event": evt}
+        for feature, scope, ing, cnt, first_e, last_e in self.c.execute(
+                "SELECT feature, scope, MAX(ingested_at), COUNT(*), MIN(event_time), MAX(event_time) "
+                "FROM feature_values WHERE feature IN (%s) GROUP BY feature, scope"
+                % ",".join("?" * len(cols)), cols):
+            matrix.setdefault(scope, {})[feature] = {
+                "fresh_h": hours_since(ing), "count": cnt, "first": first_e, "last": last_e}
+
+        # full queue schedule (per source/kind/scope task, sorted by what's next)
+        queue = []
+        for kind, source, scope, status, last_ok, next_due, attempts, err in self.c.execute(
+                "SELECT kind, source, scope, status, last_ok, next_due, attempts, last_error "
+                "FROM collection_tasks ORDER BY next_due ASC"):
+            try:
+                due_in = round((datetime.fromisoformat(next_due) - now).total_seconds() / 60)
+            except Exception:
+                due_in = None
+            queue.append({"kind": kind, "source": source, "scope": scope, "status": status,
+                          "collected_h": hours_since(last_ok), "due_in_min": due_in,
+                          "attempts": attempts, "error": err})
 
         total_rows = self.c.execute("SELECT COUNT(*) FROM feature_values").fetchone()[0]
         all_total = sum(k["total"] for k in kinds)
@@ -302,7 +317,8 @@ class Collector:
                 "overall": {"tasks": all_total, "collected": all_done,
                             "pct": round(100 * all_done / all_total) if all_total else 0,
                             "data_points": total_rows, "due_now": self.status()["due_now"]},
-                "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix}
+                "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix,
+                "queue": queue}
 
 
 # ═══════════════ handlers — one unit of work each -> (n_rows, n_calls) ═════════
