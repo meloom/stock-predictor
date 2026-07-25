@@ -498,6 +498,108 @@ def _h_implied_move(scope, store, tid):
     return 3, calls
 
 
+# ── EARNINGS: raw download -> processed analysis (a two-stage pipeline) ──
+# earn_report DOWNLOADS the raw report data and stores it; earn_analysis (a
+# dependent PROCESSING task) reads that raw record, computes the analysis, and
+# stores the processed outcome. Report generation reads earnings.analysis.
+_EARN_FEATURES = [
+    ("earnings.report_raw", "json", "ticker", "event",
+     "DOWNLOADED raw earnings report: EPS estimate/reported/surprise + latest "
+     "quarterly revenue & net income. event_time = the earnings announcement date."),
+    ("earnings.analysis", "json", "ticker", "event",
+     "PROCESSED earnings analysis derived from earnings.report_raw: EPS surprise, "
+     "revenue YoY, net margin, beat/miss, signal score. event_time = the report date."),
+]
+
+
+def _num(v):
+    try:
+        v = float(v)
+        return v if v == v else None      # drop NaN
+    except Exception:
+        return None
+
+
+def fetch_earnings_report(ticker: str) -> dict | None:
+    """Download the raw earnings report for the most recent REPORTED quarter:
+    EPS estimate/reported/surprise (from the earnings calendar) + latest quarterly
+    revenue & net income. event_time = the announcement date (PIT-correct)."""
+    import yfinance as yf
+    from datetime import date
+    try:
+        tk = yf.Ticker(ticker)
+        ed = tk.get_earnings_dates(limit=12)
+    except Exception:
+        return None
+    if ed is None or len(ed) == 0:
+        return None
+    today = date.today()
+    rep = None
+    for idx, row in ed.iterrows():                    # sorted newest-first
+        d = idx.date() if hasattr(idx, "date") else idx
+        if d <= today and _num(row.get("Reported EPS")) is not None:
+            rep = (d, row); break
+    if rep is None:
+        return None
+    d, row = rep
+    raw = {"event_time": d.isoformat(),
+           "eps_estimate": _num(row.get("EPS Estimate")),
+           "eps_reported": _num(row.get("Reported EPS")),
+           "surprise_pct": _num(row.get("Surprise(%)"))}
+    try:
+        q = tk.quarterly_income_stmt
+        if q is not None and q.shape[1] >= 1:
+            def line(labels, col):
+                for lab in labels:
+                    if lab in q.index:
+                        return _num(q.loc[lab].iloc[col])
+                return None
+            raw["revenue"] = line(["Total Revenue", "Revenue"], 0)
+            raw["net_income"] = line(["Net Income", "Net Income Common Stockholders"], 0)
+            if q.shape[1] >= 5:
+                raw["revenue_year_ago"] = line(["Total Revenue", "Revenue"], 4)
+    except Exception:
+        pass
+    return raw
+
+
+def analyze_earnings(raw: dict) -> dict:
+    """PROCESS a raw earnings report into the analysis outcome."""
+    s = raw.get("surprise_pct")
+    rev, prev, ni = raw.get("revenue"), raw.get("revenue_year_ago"), raw.get("net_income")
+    yoy = ((rev - prev) / prev * 100) if (rev and prev and prev > 0) else None
+    margin = (ni / rev * 100) if (ni is not None and rev) else None
+    beat = None if s is None else ("beat" if s > 0.5 else ("miss" if s < -0.5 else "inline"))
+    score = None if s is None else round(max(-1.0, min(1.0, s / 10.0)), 3)   # ±10% surprise → ±1
+    return {"report_event_time": raw.get("event_time"), "eps_surprise_pct": s,
+            "revenue_yoy_pct": round(yoy, 2) if yoy is not None else None,
+            "net_margin_pct": round(margin, 2) if margin is not None else None,
+            "beat_miss": beat, "signal_score": score, "processed": True}
+
+
+def _h_earn_report(scope, store, tid):
+    for n, dt, sk, cd, r in _EARN_FEATURES:
+        store.register(n, dt, sk, "S1", cd, r)
+    raw = fetch_earnings_report(scope)
+    if not raw or not raw.get("event_time"):
+        return 0, 1
+    store.write("earnings.report_raw", scope, raw["event_time"], raw, trigger_id=tid)
+    return 1, 1
+
+
+def _h_earn_analysis(scope, store, tid):
+    """PROCESSING task: read the downloaded raw report, analyze, store the outcome.
+    Depends on earn_report — if the raw isn't collected yet, no-op and retry."""
+    for n, dt, sk, cd, r in _EARN_FEATURES:
+        store.register(n, dt, sk, "S1", cd, r)
+    rec = store.read_asof("earnings.report_raw", scope, _today())
+    if not rec:
+        return 0, 0                                   # raw not downloaded yet
+    raw = rec["value"]
+    store.write("earnings.analysis", scope, raw["event_time"], analyze_earnings(raw), trigger_id=tid)
+    return 1, 0                                       # local processing, no external call
+
+
 def _today():
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -507,6 +609,7 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col = Collector(db_path, store, now_fn)
     col.register_source("yfinance", limit=120, window_sec=60)   # polite self-limit
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
+    col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
     # kind, source, interval, priority, handler, scope, est_calls
     col.register_kind("macro", "yfinance", DAY, 10, _h_macro, scope="market", est_calls=3)
     col.register_kind("bars", "yfinance", DAY, 20, _h_bars, est_calls=1)
@@ -515,7 +618,10 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1)
     col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1)
     col.register_kind("dte", "yfinance", DAY, 45, _h_dte, est_calls=1)
+    col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1)
     col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1)
+    # PROCESSED (derived) — runs AFTER earn_report; reads the raw, writes the analysis
+    col.register_kind("earn_analysis", "process", DAY, 55, _h_earn_analysis, est_calls=1)
     return col
 
 

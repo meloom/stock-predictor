@@ -110,6 +110,25 @@ def test_saturated_source_does_not_starve_others(col):
     assert ("b", "Z") in ran
 
 
+def test_earnings_processing_depends_on_raw(col):
+    """The processed earnings analysis must READ the downloaded raw record and
+    write the derived outcome — and no-op (retry) when the raw isn't there yet."""
+    import collector as C
+    # analysis before any raw is downloaded -> no-op (0 rows, 0 calls)
+    assert C._h_earn_analysis("AAPL", col.store, "t") == (0, 0)
+    # simulate the raw download having run
+    raw = {"event_time": "2026-04-30", "eps_estimate": 1.94, "eps_reported": 2.01,
+           "surprise_pct": 3.46, "revenue": 111.0, "net_income": 29.0, "revenue_year_ago": 95.0}
+    for n, dt, sk, cd, r in C._EARN_FEATURES:
+        col.store.register(n, dt, sk, "S1", cd, r)
+    col.store.write("earnings.report_raw", "AAPL", "2026-04-30", raw, trigger_id="t")
+    # now the processing task derives + stores the analysis at the report date
+    assert C._h_earn_analysis("AAPL", col.store, "t") == (1, 0)
+    ana = col.store.read_asof("earnings.analysis", "AAPL", "2026-04-30")["value"]
+    assert ana["beat_miss"] == "beat" and ana["processed"] is True
+    assert round(ana["revenue_yoy_pct"], 1) == 16.8
+
+
 def test_status_reports_quota_and_counts(col):
     col.seed(["AAPL", "MSFT"])
     col.tick()

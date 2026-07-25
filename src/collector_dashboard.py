@@ -27,6 +27,7 @@ DRILL_FEATURES = [
     ["short.pct_float", "Short interest"], ["opt.implied_move", "Implied move"],
     ["fundamental.analyst_snapshot", "Analyst"], ["fundamental.statements", "Fundamentals"],
     ["calendar.days_to_earnings", "Days-to-earnings"],
+    ["earnings.report_raw", "Earnings report (raw)"], ["earnings.analysis", "Earnings analysis (processed)"],
 ]
 
 
