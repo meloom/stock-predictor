@@ -99,12 +99,13 @@ class Collector:
         self.limits[source] = (limit, window_sec)
 
     def register_kind(self, kind, source, interval_sec, priority, handler,
-                      scope="ticker", est_calls=1):
+                      scope="ticker", est_calls=1, stage="S1"):
         """Declare a data kind: its source, refresh cadence, priority, handler
-        fn(scope, store, trigger_id)->(n_rows, n_calls), scope type, and how many
-        API calls one unit costs (for strict rate limiting)."""
-        self.kinds[kind] = {"source": source, "interval": interval_sec,
-                            "priority": priority, "scope": scope, "est_calls": est_calls}
+        fn(scope, store, trigger_id)->(n_rows, n_calls), scope type, API cost, and
+        the PIPELINE STAGE (S1 = raw collection, S2 = derived/processing, ...). The
+        data-collection dashboard shows S1; derived kinds belong to their stage."""
+        self.kinds[kind] = {"source": source, "interval": interval_sec, "priority": priority,
+                            "scope": scope, "est_calls": est_calls, "stage": stage}
         self.handlers[(source, kind)] = handler
 
     # ── rate limiter (persistent, rolling window) ─────────────────────────────
@@ -300,12 +301,16 @@ class Collector:
             except Exception:
                 return None
 
-        # per-kind queue progress (backfill = collected at least once)
+        # per-kind queue progress. "collected" = succeeded (has last_ok AND no
+        # standing error) — an errored/disabled task does NOT count as collected,
+        # so the % reflects real coverage. Only S1 kinds show on this dashboard.
         kinds = []
         for kind, total, collected, due, errs, last in self.c.execute(
-                "SELECT kind, COUNT(*), SUM(last_ok IS NOT NULL), "
+                "SELECT kind, COUNT(*), SUM(last_ok IS NOT NULL AND last_error IS NULL), "
                 "SUM(status='pending' AND next_due<=?), SUM(last_error IS NOT NULL), MAX(last_ok) "
                 "FROM collection_tasks GROUP BY kind", (nowi,)):
+            if self.kinds.get(kind, {}).get("stage", "S1") != "S1":
+                continue                                  # derived (S2+) — not data collection
             kinds.append({"kind": kind, "source": self.kinds.get(kind, {}).get("source", "?"),
                           "total": total, "collected": collected or 0, "due_now": due or 0,
                           "errors": errs or 0, "pct": round(100 * (collected or 0) / total) if total else 0,
@@ -314,18 +319,23 @@ class Collector:
         # so rows don't jump around as the live page refreshes.
         kinds.sort(key=lambda k: (self.kinds.get(k["kind"], {}).get("priority", 999), k["kind"]))
 
-        # per-signal store coverage
+        # per-signal store coverage — only S1 RAW-collected features (derived S2+
+        # signals belong to their own stage's dashboard).
+        non_s1 = ("tech.", "xsec.", "regime.", "alpha.", "earnings.analysis",
+                  "calendar.days_to_earnings", "fundamental.earnings_signal")
         signals = []
         for feature, nrows, nscopes, latest_evt, latest_ing in self.c.execute(
                 "SELECT feature, COUNT(*), COUNT(DISTINCT scope), MAX(event_time), MAX(ingested_at) "
                 "FROM feature_values GROUP BY feature ORDER BY feature"):
+            if any(feature.startswith(p) for p in non_s1):
+                continue
             signals.append({"feature": feature, "rows": nrows, "scopes": nscopes,
                             "latest_event": latest_evt, "fresh_h": hours_since(latest_ing)})
 
         # ticker × signal matrix, with the TIME detail per cell (count + event span)
         cols = matrix_features or ["price.close", "price.current", "short.pct_float",
                                    "opt.implied_move", "fundamental.analyst_snapshot",
-                                   "fundamental.statements", "calendar.days_to_earnings"]
+                                   "fundamental.statements", "earnings.next_date"]
         matrix = {}
         for feature, scope, ing, cnt, first_e, last_e in self.c.execute(
                 "SELECT feature, scope, MAX(ingested_at), COUNT(*), MIN(event_time), MAX(event_time) "
@@ -642,6 +652,62 @@ def _h_earn_analysis(scope, store, tid):
     return 1, 0                                       # local processing, no external call
 
 
+# ── EARNINGS DATE: raw next-report date/time (S1) -> days_to_earnings (S2) ──
+_CAL_FEATURES = [
+    ("earnings.next_date", "json", "ticker", "daily",
+     "RAW: exact scheduled date & time of the NEXT earnings report (from the "
+     "earnings calendar). event_time = snapshot day; issuer-revisable."),
+]
+
+
+def fetch_next_earnings_date(ticker: str) -> dict | None:
+    import yfinance as yf
+    from datetime import date
+    try:
+        ed = yf.Ticker(ticker).get_earnings_dates(limit=8)
+    except Exception:
+        return None
+    if ed is None or len(ed) == 0:
+        return None
+    today = date.today()
+    fut = [idx for idx in ed.index if (idx.date() if hasattr(idx, "date") else idx) >= today]
+    if not fut:
+        return None
+    nxt = min(fut)
+    try:
+        iso = nxt.isoformat()
+    except Exception:
+        iso = str(nxt)
+    return {"next_earnings": iso}
+
+
+def _h_earn_date(scope, store, tid):
+    for n, dt, sk, cd, r in _CAL_FEATURES:
+        store.register(n, dt, sk, "S1", cd, r)
+    v = fetch_next_earnings_date(scope)
+    if not v:
+        return 0, 1
+    store.write("earnings.next_date", scope, _today(), v, trigger_id=tid)
+    return 1, 1
+
+
+def _h_days_to_earn(scope, store, tid):
+    """S2 PROCESSING: derive days_to_earnings from the raw earnings.next_date."""
+    import s1_data
+    s1_data.register_all(store)                      # registers calendar.days_to_earnings
+    rec = store.read_asof("earnings.next_date", scope, _today())
+    if not rec:
+        return 0, 0
+    from datetime import date
+    try:
+        y, m, d = map(int, rec["value"]["next_earnings"][:10].split("-"))
+        days = (date(y, m, d) - date.today()).days
+    except Exception:
+        return 0, 0
+    store.write("calendar.days_to_earnings", scope, _today(), days, trigger_id=tid)
+    return 1, 0
+
+
 def _today():
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -659,11 +725,13 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1)
     col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1)
     col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1)
-    col.register_kind("dte", "yfinance", DAY, 45, _h_dte, est_calls=1)
+    col.register_kind("earn_date", "yfinance", DAY, 45, _h_earn_date, est_calls=1)   # RAW next-earnings date/time
     col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1)
     col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1)
-    # PROCESSED (derived) — runs AFTER earn_report; reads the raw, writes the analysis
-    col.register_kind("earn_analysis", "process", DAY, 55, _h_earn_analysis, est_calls=1)
+    # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
+    # they don't show on the data-collection dashboard. Each reads raw S1 data.
+    col.register_kind("earn_analysis", "process", DAY, 55, _h_earn_analysis, est_calls=1, stage="S2")
+    col.register_kind("days_to_earn", "process", DAY, 56, _h_days_to_earn, est_calls=1, stage="S2")
     return col
 
 

@@ -19,15 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 SIGNAL_LABELS = {
     "price.close": "Bars", "price.current": "Quote", "short.pct_float": "Short%",
     "opt.implied_move": "ImplMove", "fundamental.analyst_snapshot": "Analyst",
-    "fundamental.statements": "Fundmls", "calendar.days_to_earnings": "Earn",
+    "fundamental.statements": "Fundmls", "earnings.next_date": "NextEarn",
 }
 # signals shown in the per-ticker drill-down (feature, label)
 DRILL_FEATURES = [
     ["price.close", "Bars"], ["price.volume", "Volume"], ["price.current", "Quote"],
     ["short.pct_float", "Short interest"], ["opt.implied_move", "Implied move"],
     ["fundamental.analyst_snapshot", "Analyst"], ["fundamental.statements", "Fundamentals"],
-    ["calendar.days_to_earnings", "Days-to-earnings"],
-    ["earnings.report_raw", "Earnings report (raw)"], ["earnings.analysis", "Earnings analysis (processed)"],
+    ["earnings.next_date", "Next earnings date"],       # S1 raw; days_to_earnings is S2
+    ["earnings.report_raw", "Earnings report (raw)"],   # S1 raw; earnings.analysis is S2
 ]
 
 
