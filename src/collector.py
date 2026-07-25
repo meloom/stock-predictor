@@ -499,6 +499,21 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     return col
 
 
+def _single_instance_lock():
+    """Hold an exclusive lock so a cron drain and a running daemon never double-run
+    and race the shared rate limiter. Returns the open file (keep the reference) or
+    None if another worker already holds it."""
+    import fcntl
+    lock_path = Path(DEFAULT_DB).parent / "collector.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        return None
+
+
 def _cli():
     import argparse
     ap = argparse.ArgumentParser(description="S1 queue-driven collector")
@@ -516,8 +531,14 @@ def _cli():
     elif args.cmd == "add-ticker":
         col.add_ticker(args.ticker.upper()); print(f"enqueued backfill for {args.ticker.upper()}")
     elif args.cmd == "drain":
+        lock = _single_instance_lock()
+        if lock is None:
+            print("another collector worker is running — skipping"); return
         print(json.dumps(col.drain(seconds=args.seconds), default=str))
     elif args.cmd == "run":
+        lock = _single_instance_lock()
+        if lock is None:
+            print("another collector worker is already running — exiting"); return
         print("collector daemon starting (Ctrl-C to stop)"); col.run_forever()
     elif args.cmd == "status":
         print(json.dumps(col.status(), indent=2, default=str))
