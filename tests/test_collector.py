@@ -88,6 +88,28 @@ def test_handler_failure_backs_off(col):
     assert datetime.fromisoformat(row[1]) > col.clock()
 
 
+def test_saturated_source_does_not_starve_others(col):
+    """Regression: a rate-limited source with MANY high-priority due tasks (more
+    than any query LIMIT) must not starve a lower-priority task on a source that
+    still has quota — the worker falls through to the source with capacity."""
+    ran = []
+    col.register_source("lim", limit=1, window_sec=60)
+    col.register_kind("a", "lim", interval_sec=3600, priority=5,
+                      handler=lambda s, st, t: (ran.append(("a", s)), (1, 1))[1])
+    col.register_source("free", limit=50, window_sec=60)
+    col.register_kind("b", "free", interval_sec=3600, priority=50,
+                      handler=lambda s, st, t: (ran.append(("b", s)), (1, 1))[1])
+    now = col.clock().isoformat()
+    for i in range(150):                       # 150 high-priority rate-limited tasks
+        col._upsert("lim", "a", f"T{i}", 5, 3600, now)
+    col._upsert("free", "b", "Z", 50, 3600, now)   # one low-priority task with quota
+    col._record_calls("lim", 1)                # exhaust the 'lim' source (limit 1)
+    assert col.available("lim") == 0
+    r = col.tick()                             # must run the 'free' task, not stall
+    assert r is not None and r["task"] == "free:b:Z"
+    assert ("b", "Z") in ran
+
+
 def test_status_reports_quota_and_counts(col):
     col.seed(["AAPL", "MSFT"])
     col.tick()

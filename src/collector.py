@@ -169,9 +169,13 @@ class Collector:
         """Run at most one due task whose source has quota. Returns a summary
         dict, or None if nothing is runnable right now."""
         now = self._now()
+        # ALL due tasks are candidates (no LIMIT): a rate-limited source at the top
+        # of the priority order (e.g. 109 polygon tasks) must not starve the fast
+        # sources below it — when its quota is spent we fall through to the next
+        # source that still has quota.
         rows = self.c.execute(
             "SELECT task_id, source, kind, scope, interval_sec, attempts FROM collection_tasks "
-            "WHERE status='pending' AND next_due<=? ORDER BY priority ASC, next_due ASC LIMIT 100",
+            "WHERE status='pending' AND next_due<=? ORDER BY priority ASC, next_due ASC",
             (now.isoformat(),)).fetchall()
         for task_id, source, kind, scope, interval, attempts in rows:
             est = self.kinds.get(kind, {}).get("est_calls", 1)
