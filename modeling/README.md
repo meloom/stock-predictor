@@ -1,19 +1,39 @@
 # modeling/ — the experimentation zone
 
-Train different models with a proper purged train/val/test setup, measure
-honestly, iterate until one is good enough — THEN promote it to `models/`.
+Train models with a standardized PIT-correct setup, measure honestly on ONE
+decided metric, promote only measured winners into the live pipeline (`src/`).
 
-- `harness.py`  — shared spine: `prepare_panel` (real PIT-correct panel via the
-  live S1/S2 code — no train/serve skew), `purged_split` (15d purge / 7d
-  embargo by date), `fit` (any sklearn estimator), `evaluate_all` (return-IC +
-  price-vs-naive), `promote` (write artifact+metadata to models/), `meets_bar`
-  (the promotion gate).
-- `expNN_*.py`  — one experiment per file; each tries model(s), prints honest
-  metrics, and promotes the best only with `--promote` AND only if it clears
-  the bar.
+**Metric (decided):** per-day **precision@k** on big moves — each day, take the
+top-k highest-conviction longs and shorts; precision@k = the fraction that
+actually moved > ±3%. The random baseline is the base rate (up 9.4% / down 8.1%).
+RMSE and the old peak-precision columns are retired.
 
-Rule: no model reaches the pipeline except by being promoted through the
-registry. Experiments are where you're allowed to fail; the registry is where
+**Live model:** the 3-class big-move classifier (`src/s3_predictors.py`
+`train_classifier` / `predict_proba_eod`) — reconciled from a prior train/serve
+mismatch (production once ran a Ridge regression while all diagnostics ran this
+HistGBM). Champion feature set = the 25 S1/S2 features **+ the `xh.*` long-horizon
+extension block** (down-side precision@1 ≈ 2.9–3.1× the base rate).
+
+### Files
+- `harness.py` — standardized spine: `build_full_dataset` / `load_full_dataset`
+  (one fetch → S2 across the year → panel, cached), `make_labels` (+1/0/−1 at
+  ±3%), `rolling_windows` (4wk-train / 2wk-dev, purged), `prepare_window`, `fit`,
+  `log_performance`, `promote`, `meets_bar`.
+- `augment_features.py` — error-analysis feature blocks (BLOCKS dict): `xhorizon`
+  (**promoted**), `earnings` (validated for the magnitude head), and the tested-
+  and-dropped `ext` / `sector` / `macro` / `insider`. Bars/macro/insider/earnings
+  fetched once and cached under `runtime/`.
+- `eval_augmented.py` — does a block lift per-day precision@k vs baseline?
+- `eval_magnitude.py` — the RIGHT test for earnings: does it lift recall of big
+  (esp. earnings-reaction) moves in a `P(|R|>3%)` magnitude model?
+- `extract_errors.py` — mines the champion's top precision failures (confident-
+  wrong) and recall failures (biggest missed moves) → `error_examples2.json`.
+- `rebuild_readme.py` — regenerates the models table below (the auto block).
+- `model_*.py` — one model per file (baselines + variants).
+- **`ERROR_ANALYSIS.md`** — grounded root-cause write-up driving every feature.
+
+Rule: no model reaches the pipeline except by beating the baseline on the decided
+metric. Experiments are where you're allowed to fail; the live pipeline is where
 only measured winners live.
 
 ## Models tried (auto-logged)
