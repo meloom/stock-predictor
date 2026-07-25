@@ -1,0 +1,9 @@
+{
+  "model": "baseline_naive",
+  "feature_transform": "-",
+  "estimator": "persistence",
+  "price_rmse": 10.334769329220233,
+  "beats_naive": false,
+  "direction_hit_rate": null,
+  "iter": -1
+}

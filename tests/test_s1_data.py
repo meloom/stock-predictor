@@ -57,6 +57,8 @@ def test_all_costs_attribute_to_one_trigger(isolated_runtime):
 
 
 def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
     store = FeatureStore(tmp_path / "features.db")
 
     def fake_bars(tickers):
@@ -97,10 +99,10 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
     # LIVE current price stored, session-aware, DISTINCT from the close
     assert metrics["current_prices_ok"] == 1
     assert metrics["current_price_sessions"] == {"post": 1}
-    cur = store.read_asof("price.current", "AAPL", "2026-07-24")["value"]
+    cur = store.read_asof("price.current", "AAPL", today)["value"]
     assert cur == {"price": 103.0, "session": "post"}     # the real current price
     assert store.read_asof("price.close", "AAPL", "2026-07-24")["value"] == 100.0  # NOT this
-    assert store.read_asof("price.current", "MSFT", "2026-07-24") is None  # no fake fallback
+    assert store.read_asof("price.current", "MSFT", today) is None  # no fake fallback
 
     # store contents + lineage
     rec = store.read_asof("price.close", "AAPL", "2026-07-24")
@@ -121,6 +123,8 @@ def test_fundamentals_publication_date_prevents_lookahead(isolated_runtime, tmp_
     PUBLICATION date, not the fiscal period end — so a backtest cannot see it
     before it was filed."""
     from core import FeatureStore
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
     store = FeatureStore(tmp_path / "f.db")
 
     def fake_bars(tickers):
@@ -155,5 +159,5 @@ def test_fundamentals_publication_date_prevents_lookahead(isolated_runtime, tmp_
     # but on 2026-05-02 (after filing) it IS visible
     assert store.read_asof("fundamental.statements", "AAPL", "2026-05-02") is not None
 
-    assert store.read_asof("fundamental.shares_outstanding", "AAPL", "2026-07-24")["value"] == 1.5e9
-    assert store.read_asof("fundamental.analyst_snapshot", "AAPL", "2026-07-24")["value"]["n_analysts"] == 30
+    assert store.read_asof("fundamental.shares_outstanding", "AAPL", today)["value"] == 1.5e9
+    assert store.read_asof("fundamental.analyst_snapshot", "AAPL", today)["value"]["n_analysts"] == 30

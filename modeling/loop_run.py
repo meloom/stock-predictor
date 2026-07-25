@@ -175,13 +175,19 @@ def main():
                                  "error_note": ea["note"]})
         results.append((name, feat, est, m, trained))
 
-    # champion selection: lowest dev price RMSE across new + incumbent
+    # champion selection: lowest dev price RMSE across new models + incumbent.
+    # naive persistence IS a model and the INITIAL champion — so a new model
+    # only wins by beating naive too ("better than all other models").
     def rmse(m): return m["price"]["model"]["rmse"]
     naive_rmse = results[0][3]["price"]["naive_persistence"]["rmse"]
+    if champ is None:
+        champ = {"model": "baseline_naive", "feature_transform": "-",
+                 "estimator": "persistence", "price_rmse": naive_rmse,
+                 "beats_naive": False, "direction_hit_rate": None, "iter": -1}
+        CHAMPION.write_text(json.dumps(champ, indent=2))
     best = min(results, key=lambda r: rmse(r[3]))
     best_rmse = rmse(best[3])
-    champ_rmse = champ["price_rmse"] if champ else float("inf")
-    new_champ = best_rmse < champ_rmse
+    new_champ = best_rmse < champ["price_rmse"]
     if new_champ:
         CHAMPION.write_text(json.dumps({
             "model": best[0], "feature_transform": best[1], "estimator": best[2],
@@ -189,6 +195,7 @@ def main():
             "beats_naive": bool(best_rmse < naive_rmse),
             "direction_hit_rate": best[3]["return"]["direction_hit_rate"],
             "iter": it}, indent=2))
+    champ = load_json(CHAMPION, champ)
 
     STATE.write_text(json.dumps({"iter": it, "next_iter": it + 1,
                                  "champion_price_rmse": min(best_rmse, champ_rmse)}, indent=2))
@@ -199,8 +206,8 @@ def main():
         print(f"  {name:34s} price_RMSE {rmse(m):8.3f}  vs_naive "
               f"{(naive_rmse-rmse(m))/naive_rmse*100:+.2f}%  dir_hit "
               f"{(m['return']['direction_hit_rate'] or 0)*100:.1f}%")
-    print(f"champion now: {best[0] if new_champ else (champ['model'] if champ else 'naive')} "
-          f"(RMSE {min(best_rmse, champ_rmse):.3f}, {'NEW' if new_champ else 'unchanged'})")
+    print(f"champion now: {champ['model']} (RMSE {champ['price_rmse']:.3f}, "
+          f"beats_naive={champ['beats_naive']}, {'NEW' if new_champ else 'unchanged'})")
 
 
 def pd_range(rng, meta):

@@ -1,1 +1,1 @@
-{"iter": -1, "next_iter": 0, "total": 10, "status": "awaiting_cache"}
+{"iter": 9, "next_iter": 10, "total": 10, "status": "complete", "champion": "baseline_naive"}
