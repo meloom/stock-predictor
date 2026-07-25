@@ -36,12 +36,10 @@ def test_recovers_planted_signal():
     positive held-out IC + beats the null + the loaded feature dominates."""
     rng = [(i * 2654435761 % 1000) / 1000.0 for i in range(4000)]
     n = len(rng)
-    X = np.zeros((n, len(PREDICTOR_FEATURES)))
-    X[:, 0] = np.array(rng)
-    for j in range(1, len(PREDICTOR_FEATURES)):
-        X[:, j] = np.array([rng[(i + j * 7) % n] for i in range(n)])
-    noise = np.array([((i * 40503 % 1000) / 1000.0 - 0.5) * 0.1 for i in range(n)])
-    y = 0.05 * (X[:, 0] - 0.5) + noise
+    g = np.random.default_rng(0)
+    X = g.standard_normal((n, len(PREDICTOR_FEATURES)))
+    noise = g.standard_normal(n) * 0.02
+    y = 0.05 * X[:, 0] + noise                       # target driven by feature 0
     cut = int(n * 0.7)
     m = train(X[:cut], y[:cut])
     ev = evaluate(m, X[cut:], y[cut:])
@@ -53,9 +51,9 @@ def test_recovers_planted_signal():
 def test_no_edge_on_noise():
     """Pure noise -> no claimed edge (IC ~ 0). No overfitting-to-noise."""
     N = 3000
-    X = np.array([[(i * (j + 3) * 2654435761 % 1000) / 1000.0
-                   for j in range(len(PREDICTOR_FEATURES))] for i in range(N)], dtype=float)
-    y = np.array([((i * 40503 % 1000) / 1000.0 - 0.5) for i in range(N)])
+    g = np.random.default_rng(1)
+    X = g.standard_normal((N, len(PREDICTOR_FEATURES)))
+    y = g.standard_normal(N)                          # target unrelated to X
     cut = int(N * 0.7)
     ev = evaluate(train(X[:cut], y[:cut]), X[cut:], y[cut:])
     assert abs(ev["ic"]) < 0.15, ev

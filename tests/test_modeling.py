@@ -16,13 +16,9 @@ from s3_predictors import PREDICTOR_FEATURES
 
 
 def _planted_panel(n=2000):
-    rng = [(i * 2654435761 % 1000) / 1000.0 for i in range(n)]
-    X = np.zeros((n, len(PREDICTOR_FEATURES)))
-    X[:, 0] = np.array(rng)
-    for j in range(1, len(PREDICTOR_FEATURES)):
-        X[:, j] = np.array([rng[(i + j * 7) % n] for i in range(n)])
-    y = 0.05 * (X[:, 0] - 0.5) + np.array([((i * 40503 % 1000) / 1000.0 - 0.5) * 0.05
-                                           for i in range(n)])
+    g = np.random.default_rng(0)
+    X = g.standard_normal((n, len(PREDICTOR_FEATURES)))
+    y = 0.05 * X[:, 0] + g.standard_normal(n) * 0.02
     meta = [(f"2026-{1 + i % 12:02d}-{1 + i % 28:02d}", f"T{i%10}") for i in range(n)]
     base = [100.0] * n
     return {"X": X, "y": y, "meta": meta, "feature_names": list(PREDICTOR_FEATURES)}, base
@@ -45,7 +41,7 @@ def test_performance_log_records_required_metadata(tmp_path, monkeypatch):
               "dev_range": ["2026-06-29", "2026-07-10"],
               "tickers": ["AAPL", "MSFT"], "features": ["tech.rsi14"],
               "label_strategy": "end_of_day_forward_return(H=1d)", "horizon_days": 1}
-    metrics = {"return": {"ic": 0.04, "rmse": 0.03, "beats_null": True},
+    metrics = {"return": {"direction_hit_rate": 0.55, "ic": 0.04, "rmse": 0.03, "beats_null": True},
                "price": {"model": {"mape_pct": 2.0, "rmse": 5.0},
                          "naive_persistence": {"mape_pct": 2.1, "rmse": 5.1},
                          "model_beats_naive_rmse": True}}
@@ -54,7 +50,7 @@ def test_performance_log_records_required_metadata(tmp_path, monkeypatch):
     logged = _j.loads((tmp_path / "performance.log").read_text().strip())
     # every required metadata field present, incl. RMSE per model
     for k in ("model", "label_strategy", "train_range", "dev_range", "tickers",
-              "features", "dev_ic", "dev_return_rmse", "dev_price_rmse",
+              "features", "dev_direction_hit_rate", "dev_return_rmse", "dev_price_rmse",
               "dev_naive_price_rmse", "dev_beats_naive", "promoted"):
         assert k in logged
     assert logged["train_range"] == ["2026-06-01", "2026-06-26"]

@@ -37,10 +37,11 @@ def main():
                             extra={"horizon_days": HORIZON})
     print(f"[{MODEL_NAME}] train {ranges['train_range']} dev {ranges['dev_range']} "
           f"tickers {rec['n_tickers']}")
-    print(f"  dev IC {metrics['return']['ic']:+.4f}  beats_null {metrics['return']['beats_null']}"
-          f"  | price MAPE {metrics['price']['model']['mape_pct']:.2f}% vs naive "
-          f"{metrics['price']['naive_persistence']['mape_pct']:.2f}%  "
-          f"beats_naive {metrics['price']['model_beats_naive_rmse']}")
+    hit = metrics['return']['direction_hit_rate']
+    print(f"  dev price RMSE {metrics['price']['model']['rmse']:.3f} vs naive "
+          f"{metrics['price']['naive_persistence']['rmse']:.3f}  "
+          f"(beats_naive {metrics['price']['model_beats_naive_rmse']})  | "
+          f"direction hit-rate {hit*100:.1f}%" if hit is not None else "  (no direction)")
     print(f"  meets bar: {H.meets_bar(metrics)}  promoted: {promoted}  -> logged to performance.log")
 
 

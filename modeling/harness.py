@@ -47,7 +47,7 @@ LABEL_STRATEGY = "end_of_day_forward_return"   # predict close H trading days ah
 # ═══════════════ Data prep: fixed 4wk-train / 2wk-dev window, full universe ═══════════════
 
 def prepare_window(horizon_days: int = 1, universe: list[str] | None = None,
-                   period: str = "6mo", with_fundamentals: bool = True) -> dict:
+                   period: str = "1y", with_fundamentals: bool = True) -> dict:
     """Build a PIT-correct panel over the most recent 4-week-train + 2-week-dev
     window (with a `horizon_days` purge between them). Uses the full universe.
     with_fundamentals=True populates the fund.* features (slower — fetches
@@ -75,9 +75,14 @@ def prepare_window(horizon_days: int = 1, universe: list[str] | None = None,
                         fetch_analyst=fetch_analyst)
 
     dates = sorted({r["date"] for rows in bars.values() for r in rows})
+    n_ok = sum(1 for rows in bars.values() if rows)
     usable = dates[:-horizon_days] if horizon_days > 0 else dates   # need forward price
-    if len(usable) < TRAIN_DAYS + horizon_days + DEV_DAYS:
-        raise ValueError("not enough trading days for a 4wk/2wk window")
+    need = TRAIN_DAYS + horizon_days + DEV_DAYS
+    if len(usable) < need:
+        raise ValueError(
+            f"not enough trading days for a 4wk/2wk window: got {len(dates)} "
+            f"dates ({n_ok}/{len(universe)} tickers returned bars) — need >= "
+            f"{need}. Likely a yfinance rate-limit/sparse fetch; retry later.")
     dev_dates = usable[-DEV_DAYS:]
     e0 = dates.index(dev_dates[0])
     train_dates = dates[e0 - horizon_days - TRAIN_DAYS: e0 - horizon_days]
@@ -147,13 +152,14 @@ def log_performance(model_name: str, ranges: dict, metrics: dict,
         "n_tickers": len(ranges["tickers"]),
         "tickers": ranges["tickers"],
         "features": ranges["features"],
-        "dev_ic": metrics["return"]["ic"],
-        "dev_return_rmse": metrics["return"]["rmse"],
-        "dev_beats_null": metrics["return"]["beats_null"],
+        # plain metrics only (no "IC"): price error + direction hit-rate
         "dev_price_rmse": metrics["price"]["model"]["rmse"],
         "dev_naive_price_rmse": metrics["price"]["naive_persistence"]["rmse"],
         "dev_price_mape_pct": metrics["price"]["model"]["mape_pct"],
         "dev_naive_mape_pct": metrics["price"]["naive_persistence"]["mape_pct"],
+        "dev_direction_hit_rate": metrics["return"]["direction_hit_rate"],
+        "dev_return_rmse": metrics["return"]["rmse"],
+        "dev_beats_null": metrics["return"]["beats_null"],
         "dev_beats_naive": metrics["price"]["model_beats_naive_rmse"],
         "promoted": promoted,
         **(extra or {}),

@@ -49,6 +49,9 @@ S3_FEATURES = [
 PREDICTOR_FEATURES = [
     # S2 technical
     "tech.rsi14", "tech.mom5", "tech.mom20", "tech.hvol20", "tech.vr20",
+    # last 7 daily returns (NOT price levels — returns are stationary)
+    "tech.ret_lag1", "tech.ret_lag2", "tech.ret_lag3", "tech.ret_lag4",
+    "tech.ret_lag5", "tech.ret_lag6", "tech.ret_lag7",
     # S2 fundamental (value / quality / size) — from S1 statements/shares/analyst
     "fund.book_to_price", "fund.earnings_yield", "fund.fcf_yield",
     "fund.roe", "fund.gross_profitability", "fund.net_margin", "fund.market_cap",
@@ -143,7 +146,17 @@ def evaluate(trained, X, y) -> dict:
     pred = _predict_vec(trained, X)
     mse = float(np.mean((pred - y) ** 2))
     null_mse = float(np.mean((y - np.mean(y)) ** 2))
-    return {"n": int(len(y)), "ic": spearman_ic(pred.tolist(), y.tolist()),
+    # direction hit-rate: % where predicted up/down matched actual up/down —
+    # the plain-English "did it call it right". n/a for a constant predictor
+    # (a baseline that predicts a flat number has no direction).
+    if float(np.std(pred)) < 1e-12:
+        hit = None
+    else:
+        mask = y != 0
+        hit = float(np.mean((pred[mask] > 0) == (y[mask] > 0))) if mask.any() else None
+    return {"n": int(len(y)),
+            "direction_hit_rate": hit,          # % up/down called correctly
+            "ic": spearman_ic(pred.tolist(), y.tolist()),  # kept internal, not displayed
             "mse": mse, "rmse": float(mse ** 0.5),
             "null_mse": null_mse, "null_rmse": float(null_mse ** 0.5),
             "r2_vs_null": (1 - mse / null_mse) if null_mse else None,

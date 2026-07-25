@@ -34,6 +34,16 @@ S2_FEATURES = [
      "Stdev of the trailing 20 daily returns."),
     ("tech.vr20", "float", "ticker", "daily",
      "volume[t] / mean(volume over trailing 20 days)."),
+    # -- lagged daily RETURNS (not price levels): the last 7 daily % moves.
+    #    ret_lagK = close[t-K+1]/close[t-K] - 1. PIT-safe (each uses only closes
+    #    <= t). Captures short-term momentum/reversal the aggregates miss. --
+    ("tech.ret_lag1", "float", "ticker", "daily", "daily return realized on day t (most recent)."),
+    ("tech.ret_lag2", "float", "ticker", "daily", "daily return on day t-1."),
+    ("tech.ret_lag3", "float", "ticker", "daily", "daily return on day t-2."),
+    ("tech.ret_lag4", "float", "ticker", "daily", "daily return on day t-3."),
+    ("tech.ret_lag5", "float", "ticker", "daily", "daily return on day t-4."),
+    ("tech.ret_lag6", "float", "ticker", "daily", "daily return on day t-5."),
+    ("tech.ret_lag7", "float", "ticker", "daily", "daily return on day t-6."),
     # -- fundamentals (from S1's statements/shares/analyst; the enrichment that
     #    covers value/quality/size — categories the technicals above miss) --
     ("fund.market_cap", "float", "ticker", "daily",
@@ -137,6 +147,19 @@ def fundamental_ratios(price: float | None, shares: float | None,
     }
 
 
+def lagged_returns(closes: list[float], n: int = 7) -> list[float | None]:
+    """The n most recent daily returns, newest first. ret[0] = today's realized
+    daily return (close[-1]/close[-2]-1). PIT-safe — uses only trailing closes.
+    Returns None per lag where history is insufficient."""
+    out = []
+    for k in range(1, n + 1):
+        if len(closes) >= k + 1:
+            out.append(closes[-k] / closes[-k - 1] - 1.0)
+        else:
+            out.append(None)
+    return out
+
+
 def volume_ratio20(volumes: list[float]) -> float | None:
     if len(volumes) < 20:
         return None
@@ -211,6 +234,8 @@ def run_signal_generation(universe: list[str], event_date: str,
                 "tech.hvol20": hvol20(closes),
                 "tech.vr20": volume_ratio20(vols),
             }
+            for k, r in enumerate(lagged_returns(closes, 7), start=1):
+                computed[f"tech.ret_lag{k}"] = r
 
             # fundamentals — read S1's raw data as-of event_date (read_asof is
             # publication-date aware, so a statement filed after event_date is
