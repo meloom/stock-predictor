@@ -5,9 +5,10 @@ import numpy as np
 import pytest
 
 import core as core_mod
-from core import FeatureStore
-from s3_predictors import (assemble_panel, train, evaluate, evaluate_price,
-                           run_predictors, predict_eod, PREDICTOR_FEATURES)
+from core import FeatureStore, MARKET_SCOPE
+from s3_predictors import (assemble_panel, train, train_classifier, evaluate,
+                           evaluate_price, run_predictors, predict_eod,
+                           predict_proba_eod, PREDICTOR_FEATURES)
 
 
 def test_price_eval_vs_naive_baseline():
@@ -106,3 +107,44 @@ def test_run_predictors_writes_predictions(store):
     px = store.read_asof("predict.eod_price", "AAPL", "2026-06-05")["value"]
     assert px is not None  # implied close = price * (1 + predicted return)
     assert store.outputs_of(m["trigger_id"])["total_values"] >= 4
+
+
+def test_classifier_recovers_direction():
+    """The live big-move classifier must learn direction: plant a feature that
+    drives big up-moves, confirm predict_proba assigns high p_up to up cases."""
+    g = np.random.default_rng(3)
+    n = 3000
+    X = g.standard_normal((n, len(PREDICTOR_FEATURES)))
+    # feature 0 large -> big positive return; feature 0 very negative -> big drop
+    y = 0.06 * X[:, 0] + g.standard_normal(n) * 0.01
+    cut = int(n * 0.7)
+    trained = train_classifier(X[:cut], y[:cut], move=0.03)
+    assert trained["kind"] == "classifier" and set(trained["classes"]) <= {-1, 0, 1}
+    # standardize + score the held-out set directly through the model
+    Xz = np.nan_to_num((X[cut:] - trained["mean"]) / trained["std"])
+    proba = trained["model"].predict_proba(Xz)
+    iu = trained["classes"].index(1)
+    p_up = proba[:, iu]
+    yb = y[cut:]
+    # p_up must be higher on the actual big-up rows than on the big-down rows
+    assert p_up[yb > 0.03].mean() > p_up[yb < -0.03].mean() + 0.2
+
+
+def test_run_predictors_classifier_writes_probabilities(store):
+    days = [f"2026-06-{i:02d}" for i in range(1, 11)]
+    for i, d in enumerate(days):
+        for tk, base in [("AAPL", 100.0), ("MSFT", 200.0)]:
+            store.write("price.close", tk, d, base + i, trigger_id="s")
+            store.write("tech.rsi14", tk, d, 50.0, trigger_id="s")
+    panel = assemble_panel(store, ["AAPL", "MSFT"], days[:8], horizon_days=1)
+    clf = train_classifier(panel["X"], panel["y"], move=0.001)  # tiny move -> non-degenerate labels
+
+    m = run_predictors(["AAPL", "MSFT"], "2026-06-05", store=store, trained=clf)
+    assert m["status"] == "PREDICTED"
+    for feat in ("predict.p_up", "predict.p_down", "predict.confidence", "predict.direction"):
+        rec = store.read_asof(feat, "AAPL", "2026-06-05")
+        assert rec is not None and isinstance(rec["value"], float)
+    # S4 back-compat: predict.eod_return is still emitted
+    assert store.read_asof("predict.eod_return", "AAPL", "2026-06-05") is not None
+    meta = store.read_asof("predict.eod_meta", MARKET_SCOPE, "2026-06-05")
+    assert meta["value"]["model"] == "big_move_classifier/histgbm"

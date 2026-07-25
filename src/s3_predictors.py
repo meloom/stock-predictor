@@ -18,6 +18,14 @@ whether its predictions size REAL CAPITAL downstream — not whether the model
 runs. "Don't deploy unvalidated" is not "don't build": a predictor earns the
 gate by predicting and being measured every day.
 
+LIVE MODEL = the 3-class big-move classifier (`train_classifier` +
+`predict_proba_eod`), reconciling a prior train/serve mismatch where production
+ran a Ridge regression while all offline precision diagnostics ran this HistGBM
+classifier (see modeling/ERROR_ANALYSIS.md). `run_predictors` writes the
+classifier's p_up/p_down/confidence/direction, and still emits predict.eod_return
+(a probability-weighted proxy) so S4's existing gate is unchanged. `train`
+(Ridge) is retained as an interpretable regression baseline.
+
 Depends on: S1 (prices) + S2 (features). Provides to: S4 Alpha.
 Project style: one file per stage; simple, working. Tests: tests/test_s3_predictors.py.
 """
@@ -35,6 +43,18 @@ S3_FEATURES = [
     ("predict.eod_price", "float", "ticker", "daily",
      "end_of_day_price predictor: implied forward close = price.close * "
      "(1 + predicted return)."),
+    # -- big-move CLASSIFIER outputs (the model the offline precision analysis
+    #    actually uses; now the live predictor too — see modeling/ERROR_ANALYSIS.md.
+    #    Reconciles a prior train/serve mismatch where live ran Ridge regression
+    #    while diagnostics ran this 3-class HistGBM). --
+    ("predict.p_up", "float", "ticker", "daily",
+     "P(next-day return > +move) from the 3-class big-move classifier."),
+    ("predict.p_down", "float", "ticker", "daily",
+     "P(next-day return < -move) from the 3-class big-move classifier."),
+    ("predict.confidence", "float", "ticker", "daily",
+     "max(p_up, p_down) — the model's conviction in its directional call."),
+    ("predict.direction", "float", "ticker", "daily",
+     "+1 if p_up>=0.5 and leads, -1 if p_down>=0.5 and leads, else 0 (abstain)."),
     ("predict.eod_meta", "json", "market", "daily",
      "Per-run predictor metadata: {model, horizon_days, trained_on, "
      "test_metrics, inputs_max_ingested_at}."),
@@ -143,6 +163,53 @@ def _predict_vec(trained, X):
     return trained["model"].predict(Xz)
 
 
+# ── big-move CLASSIFIER (the LIVE model; see reconcile note in the registry) ──
+
+def train_classifier(X, y, move: float = 0.03):
+    """3-class big-move classifier (HistGradientBoosting), the model the offline
+    precision analysis uses — now the live predictor. Label: +1 if forward return
+    > +move, -1 if < -move, else 0 (neutral). predict_proba gives the confidence
+    the whole precision@k analysis is built on. Standardizes + NaN-safe."""
+    import numpy as np
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    mean = np.nan_to_num(np.nanmean(X, axis=0), nan=0.0)
+    std = np.nanstd(X, axis=0); std[(std == 0) | np.isnan(std)] = 1.0
+    Xz = np.nan_to_num(np.where(np.isnan(X), 0.0, (X - mean) / std),
+                       nan=0.0, posinf=0.0, neginf=0.0)
+    lab = np.where(y > move, 1, np.where(y < -move, -1, 0))
+    model = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05,
+                                           max_iter=250, random_state=0).fit(Xz, lab)
+    return {"model": model, "mean": mean, "std": std, "kind": "classifier",
+            "move": move, "classes": [int(c) for c in model.classes_],
+            "feature_names": list(PREDICTOR_FEATURES)}
+
+
+def predict_proba_eod(store, universe, event_date, trained, as_known_at=None):
+    """Per-ticker big-move probabilities from the live classifier. Emits p_up,
+    p_down, confidence, the discrete direction call, and a probability-weighted
+    eod_return proxy (p_up*move - p_down*move) that keeps S4's predict.eod_return
+    gate working unchanged."""
+    import numpy as np
+    classes = trained["classes"]; move = trained["move"]
+    iu = classes.index(1) if 1 in classes else None
+    idn = classes.index(-1) if -1 in classes else None
+    out = {}
+    for t in universe:
+        feats = [(store.read_asof(f, t, event_date, as_known_at) or {}).get("value", np.nan)
+                 for f in PREDICTOR_FEATURES]
+        A = np.array([feats], dtype=float)
+        Xz = np.nan_to_num(np.where(np.isnan(A), 0.0, (A - trained["mean"]) / trained["std"]),
+                           nan=0.0, posinf=0.0, neginf=0.0)
+        proba = trained["model"].predict_proba(Xz)[0]
+        p_up = float(proba[iu]) if iu is not None else 0.0
+        p_dn = float(proba[idn]) if idn is not None else 0.0
+        direction = 1.0 if (p_up >= p_dn and p_up >= 0.5) else (-1.0 if (p_dn > p_up and p_dn >= 0.5) else 0.0)
+        out[t] = {"p_up": round(p_up, 4), "p_down": round(p_dn, 4),
+                  "confidence": round(max(p_up, p_dn), 4), "direction": direction,
+                  "eod_return": round(p_up * move - p_dn * move, 6)}
+    return out
+
+
 def evaluate(trained, X, y) -> dict:
     """Held-out RETURN metrics — the cross-sectional view. IC (rank corr) +
     MSE vs. the predict-the-mean null. A model that doesn't beat the null
@@ -231,17 +298,33 @@ def run_predictors(universe: list[str], event_date: str,
                              status="NO_MODEL")
             return {"trigger_id": trig.trigger_id, **trig.metrics}
 
-        preds = predict_eod(store, universe, event_date, trained, horizon_days, as_known_at)
+        is_clf = trained.get("kind") == "classifier"
         written = 0
-        for t, p in preds.items():
-            store.write("predict.eod_return", t, event_date, p["eod_return"],
-                        trigger_id=trig.trigger_id)
-            if p["eod_price"] is not None:
-                store.write("predict.eod_price", t, event_date, p["eod_price"],
+        if is_clf:
+            preds = predict_proba_eod(store, universe, event_date, trained, as_known_at)
+            for t, p in preds.items():
+                for feat in ("p_up", "p_down", "confidence", "direction", "eod_return"):
+                    store.write(f"predict.{feat}", t, event_date, p[feat],
+                                trigger_id=trig.trigger_id)
+                px = store.read_asof("price.close", t, event_date, as_known_at)
+                if px:
+                    store.write("predict.eod_price", t, event_date,
+                                round(px["value"] * (1 + p["eod_return"]), 4),
+                                trigger_id=trig.trigger_id)
+                written += 1
+            model_tag = "big_move_classifier/histgbm"
+        else:
+            preds = predict_eod(store, universe, event_date, trained, horizon_days, as_known_at)
+            for t, p in preds.items():
+                store.write("predict.eod_return", t, event_date, p["eod_return"],
                             trigger_id=trig.trigger_id)
-            written += 1
+                if p["eod_price"] is not None:
+                    store.write("predict.eod_price", t, event_date, p["eod_price"],
+                                trigger_id=trig.trigger_id)
+                written += 1
+            model_tag = "end_of_day_price/ridge"
         store.write("predict.eod_meta", MARKET_SCOPE, event_date,
-                    {"model": "end_of_day_price/ridge", "horizon_days": horizon_days,
+                    {"model": model_tag, "horizon_days": horizon_days,
                      "test_metrics": trained.get("test_metrics")},
                     trigger_id=trig.trigger_id)
         trig.add_metrics(event_date=event_date, universe_size=len(universe),
