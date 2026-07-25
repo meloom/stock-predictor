@@ -52,6 +52,22 @@ S1_FEATURES = [
      "recommendation_mean, target_mean_price}. Snapshotted daily so a REVISION "
      "time series accrues going forward — analyst revisions cannot be "
      "backfilled from yfinance, they must be collected from now on."),
+    # -- SHORT INTEREST (crowding / squeeze-fuel; feeds the future near-earnings
+    #    module, NOT the daily directional model which it was shown to hurt). The
+    #    FINRA bi-monthly print. event_time = the SETTLEMENT date the print refers
+    #    to; FINRA disseminates it ~8 business days LATER, so a strict as-of
+    #    backtest must lag by that gap — a full dissemination-dated history needs
+    #    FINRA's archive files (see docs/DATA_SOURCES.md). yfinance gives only the
+    #    current + prior print, so daily ingestion accrues real history going
+    #    forward (same pattern as analyst_snapshot). --
+    ("short.shares", "float", "ticker", "biweekly",
+     "Shares sold short (latest FINRA bi-monthly print)."),
+    ("short.pct_float", "float", "ticker", "biweekly",
+     "Short interest as a fraction of float — the crowding signal."),
+    ("short.days_to_cover", "float", "ticker", "biweekly",
+     "Short interest / avg daily volume — squeeze fuel (short ratio)."),
+    ("short.change_pct", "float", "ticker", "biweekly",
+     "(shares_short - prior print) / prior — short buildup (+) vs covering (-)."),
 ]
 
 # Conservative reporting lag: a quarterly statement is treated as knowable this
@@ -271,6 +287,41 @@ def fetch_analyst_snapshot(ticker: str) -> dict | None:
     }
     return snap if any(v is not None for v in snap.values()) else None
 
+
+def fetch_short_interest(ticker: str) -> dict | None:
+    """Short-interest snapshot from the latest FINRA bi-monthly print (via yfinance
+    .info). Returns event_time = the SETTLEMENT date the print refers to
+    (dateShortInterest), so it lands PIT-correctly in the store, plus the level and
+    the change vs the prior print (buildup/covering). Returns None if the field is
+    absent. NOTE: FINRA disseminates ~8 business days after settlement — see
+    docs/DATA_SOURCES.md for the dissemination-lag caveat and the archive path to a
+    full historical series."""
+    import yfinance as yf
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception:
+        return None
+    shares = info.get("sharesShort")
+    if shares is None:
+        return None
+    prior = info.get("sharesShortPriorMonth")
+    ts = info.get("dateShortInterest")
+    event_time = None
+    if ts:
+        try:
+            event_time = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+        except Exception:
+            event_time = None
+    change_pct = ((float(shares) - float(prior)) / float(prior)
+                  if prior not in (None, 0) else None)
+    return {
+        "event_time": event_time,
+        "shares_short": float(shares),
+        "pct_float": info.get("shortPercentOfFloat"),
+        "days_to_cover": info.get("shortRatio"),
+        "change_pct": change_pct,
+    }
+
 # ═══════════════ Grounded LLM earnings extraction ═══════════════
 
 SIGNAL_MODEL = "claude-sonnet-4-5"
@@ -368,6 +419,7 @@ def run_daily_ingestion(universe: list[str],
                         fetch_shares=fetch_shares_outstanding,
                         fetch_statements=fetch_latest_statements,
                         fetch_analyst=fetch_analyst_snapshot,
+                        fetch_short=fetch_short_interest,
                         earnings_signal_fn=None,
                         earnings_check_tickers: list[str] | None = None) -> dict:
     """One full S1 pass. Returns the metrics dict (also logged to runs.jsonl).
@@ -428,7 +480,7 @@ def run_daily_ingestion(universe: list[str],
         # Publication-date discipline lives in fetch_latest_statements: a
         # statement's event_time is the real announcement date (or a
         # conservative lag), so backtests never see it before it was filed.
-        shares_ok, stmts_ok, analyst_ok = 0, 0, 0
+        shares_ok, stmts_ok, analyst_ok, short_ok = 0, 0, 0, 0
         for t in universe:
             sh = fetch_shares(t) if fetch_shares else None
             if sh is not None:
@@ -446,6 +498,18 @@ def run_daily_ingestion(universe: list[str],
                 store.write("fundamental.analyst_snapshot", t, today, an,
                             trigger_id=trig.trigger_id)
                 analyst_ok += 1
+            # short interest — event_time = the print's settlement date (PIT), so
+            # it's placed on the day the position was measured, not ingestion day.
+            si = fetch_short(t) if fetch_short else None
+            if si is not None:
+                et = si["event_time"] or today
+                for feat, key in (("short.shares", "shares_short"),
+                                  ("short.pct_float", "pct_float"),
+                                  ("short.days_to_cover", "days_to_cover"),
+                                  ("short.change_pct", "change_pct")):
+                    if si[key] is not None:
+                        store.write(feat, t, et, si[key], trigger_id=trig.trigger_id)
+                short_ok += 1
 
         # -- earnings signals (LLM, cost-attributed to this trigger) --------
         signals_written = 0
@@ -469,6 +533,7 @@ def run_daily_ingestion(universe: list[str],
             shares_ok=shares_ok,
             statements_ok=stmts_ok,
             analyst_snapshots_ok=analyst_ok,
+            short_interest_ok=short_ok,
             macro_series=sorted(k for k, s in macro.items() if s),
             calendar_ok=cal_ok,
             calendar_unknown=cal_unknown,

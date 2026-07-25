@@ -88,7 +88,7 @@ def test_ingestion_offline_end_to_end(isolated_runtime, tmp_path):
     metrics = run_daily_ingestion(
         universe=["AAPL", "MSFT", "DEAD"], store=store,
         fetch_bars=fake_bars, fetch_macro=fake_macro, fetch_dte=fake_dte,
-        fetch_quote=fake_quote,
+        fetch_quote=fake_quote, fetch_short=lambda t: None,
         earnings_signal_fn=fake_signal, earnings_check_tickers=["AAPL"])
 
     # coverage metrics are honest about the dead ticker
@@ -142,7 +142,8 @@ def test_fundamentals_publication_date_prevents_lookahead(isolated_runtime, tmp_
         fetch_dte=lambda t, asof=None: None, fetch_quote=lambda t: None,
         fetch_shares=lambda t: 1.5e9,
         fetch_statements=fake_statements,
-        fetch_analyst=lambda t: {"forward_eps": 6.5, "n_analysts": 30})
+        fetch_analyst=lambda t: {"forward_eps": 6.5, "n_analysts": 30},
+        fetch_short=lambda t: None)
 
     assert metrics["shares_ok"] == 1
     assert metrics["statements_ok"] == 1
@@ -161,3 +162,32 @@ def test_fundamentals_publication_date_prevents_lookahead(isolated_runtime, tmp_
 
     assert store.read_asof("fundamental.shares_outstanding", "AAPL", today)["value"] == 1.5e9
     assert store.read_asof("fundamental.analyst_snapshot", "AAPL", today)["value"]["n_analysts"] == 30
+
+
+def test_short_interest_stored_at_settlement_date(isolated_runtime, tmp_path):
+    """Short interest lands at the print's SETTLEMENT date (event_time), not the
+    ingestion day, and the level/%float/days-to-cover/change are all written."""
+    from core import FeatureStore
+    store = FeatureStore(tmp_path / "si.db")
+
+    def fake_bars(tickers):
+        return {t: [{"date": "2026-07-24", "close": 100.0, "volume": 1e6}] for t in tickers}
+
+    def fake_short(ticker):
+        # print measured 2026-06-30; disseminated later, but event_time = settlement
+        return {"event_time": "2026-06-30", "shares_short": 1.2e7,
+                "pct_float": 0.18, "days_to_cover": 4.5, "change_pct": 0.25}
+
+    metrics = run_daily_ingestion(
+        universe=["GME"], store=store, fetch_bars=fake_bars, fetch_macro=lambda: {},
+        fetch_dte=lambda t, asof=None: None, fetch_quote=lambda t: None,
+        fetch_shares=lambda t: None, fetch_statements=lambda t, asof=None: None,
+        fetch_analyst=lambda t: None, fetch_short=fake_short)
+
+    assert metrics["short_interest_ok"] == 1
+    # stored at the settlement date
+    assert store.read_asof("short.pct_float", "GME", "2026-06-30")["value"] == 0.18
+    assert store.read_asof("short.days_to_cover", "GME", "2026-06-30")["value"] == 4.5
+    assert store.read_asof("short.change_pct", "GME", "2026-06-30")["value"] == 0.25
+    # PIT: a backtest standing BEFORE the settlement date must not see it
+    assert store.read_asof("short.pct_float", "GME", "2026-06-15") is None
