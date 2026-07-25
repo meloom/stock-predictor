@@ -16,6 +16,23 @@ These are owner-mandated; do not deviate without explicit direction.
 - `harness.prepare_window()` enforces this with an assertion — never hand-roll
   a different split.
 
+## No evaluation leakage — walk-forward + a FINAL untouched holdout
+- **Always test on dates strictly AFTER the training window.** Every metric,
+  backtest, or P&L number must come from a model trained only on data that
+  precedes the evaluated date (`harness.rolling_windows` does this: dev is the
+  2 weeks after train, with a purge gap). Never score a model on any date it
+  (or a later-in-time window) trained on.
+- **Selection bias is leakage too.** Choosing features / models / thresholds
+  (e.g. the `xhorizon` champion) by their performance across the *whole*
+  backtest period makes the reported number in-sample AT THE SELECTION LEVEL —
+  optimistic, even when each window is walk-forward. The only honest headline
+  number comes from a **final holdout period never looked at during
+  development** (reserve the most recent ~6–8 weeks; do all feature/model
+  selection strictly before it; touch the holdout once, at the end).
+- **P&L must be net of costs.** A precision/IC number is signal quality, not
+  profit. Report backtest returns net of a realistic round-trip cost (bps) and
+  state where the edge dies — the thin edge here flips negative by ~10–20 bps.
+
 ## Universe — always all of it
 - Train on the **full tracked universe** (`src/universe.py::UNIVERSE`), never a
   hand-picked subset. Changing coverage means editing `universe.py`, one place.
