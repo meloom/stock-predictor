@@ -77,6 +77,21 @@ rose) — so the value of an earnings feature is not perfect direction but:
 earnings calendar), ahead of analyst-downgrade/index-inclusion. It is the umbrella
 the other event features (analyst revisions, guidance) sit under.
 
+### Built + tested (2026-07-25): `earnings` block — validated, but for the MAGNITUDE head
+
+`modeling/augment_features.py::earnings_block` (days_to/since earnings + imminent/
+post flags, from a cached yfinance earnings calendar, 109/109 tickers). Two tests:
+- **Directional precision@k (`eval_augmented.py --blocks earnings`): +0.1pp → DROP.**
+  Expected — earnings proximity cannot predict the *direction* of a surprise (ZS
+  beat and crashed), so it can't lift a directional metric.
+- **Magnitude model `P(|R|>3%)` (`eval_magnitude.py`): recall on earnings-reaction
+  moves 18.8% → 23.9% (+5.1pp)**, general recall flat. It helps exactly its target
+  slice and nothing else.
+
+**Conclusion:** `days_to_earnings` is real but belongs in **Model 1 (magnitude)** of
+the two-model split, NOT the live directional predictor. Not promoted to
+`PREDICTOR_FEATURES` (would fail the precision gate); reserved for the split.
+
 ---
 
 ## Top confident-wrong UP calls (predicted up, actually dropped >3%)

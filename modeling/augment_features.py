@@ -38,6 +38,7 @@ from universe import UNIVERSE                          # noqa: E402
 BARS_CACHE = ROOT / "runtime" / "bars_1y.pkl"
 MACRO_CACHE = ROOT / "runtime" / "macro_1y.pkl"
 INSIDER_CACHE = ROOT / "runtime" / "insider.pkl"
+EARNINGS_CACHE = ROOT / "runtime" / "earnings.pkl"
 
 # coarse sector map for the tracked universe (only groups we actually hold need
 # entries; anything unlisted falls in "other" and gets a neutral sector signal).
@@ -103,6 +104,60 @@ def get_insider(tickers=None) -> dict:
     INSIDER_CACHE.parent.mkdir(parents=True, exist_ok=True)
     pickle.dump(out, open(INSIDER_CACHE, "wb"))
     return out
+
+
+def get_earnings(tickers=None) -> dict:
+    """Fetch each ticker's earnings-announcement dates once (past + scheduled
+    future) and cache. yfinance get_earnings_dates gives ~6y of quarterly dates.
+    Missing/failed -> empty list (feature NaN downstream)."""
+    if EARNINGS_CACHE.exists():
+        return pickle.load(open(EARNINGS_CACHE, "rb"))
+    import yfinance as yf
+    tickers = tickers or UNIVERSE
+    out = {}
+    for t in tickers:
+        dates = []
+        try:
+            df = yf.Ticker(t).get_earnings_dates(limit=24)
+            if df is not None and len(df):
+                dates = sorted({str(i)[:10] for i in df.index})
+        except Exception:
+            pass
+        out[t] = dates
+    EARNINGS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    pickle.dump(out, open(EARNINGS_CACHE, "wb"))
+    return out
+
+
+def earnings_block(meta, bars, cap: int = 90):
+    """EARNINGS-PROXIMITY — the dominant RECALL gap (modeling/ERROR_ANALYSIS.md):
+    every top-10 missed move was a 20-31% one-day earnings reaction the model gave
+    ~0 probability, because it had no earnings channel. Features (all knowable in
+    advance from the scheduled calendar, PIT-safe): calendar days to the next
+    earnings, days since the last, and flags for 'reaction imminent' (report is
+    today/tomorrow -> next session is the gap) and 'just reported'. Direction of
+    the surprise is NOT predictable — the value is letting the model ABSTAIN into a
+    known catalyst (kills precision failures) and flag big-move risk (recall)."""
+    from datetime import date
+    cal = get_earnings()
+    ords = {t: sorted(date(*map(int, d.split("-"))).toordinal() for d in ds)
+            for t, ds in cal.items()}
+    names = ["eve.days_to_earn", "eve.days_since_earn", "eve.earn_imminent", "eve.post_earn"]
+    F = np.full((len(meta), len(names)), np.nan)
+    for r, (d, t) in enumerate(meta):
+        es = ords.get(t)
+        if not es:
+            continue
+        d_ord = date(*map(int, d.split("-"))).toordinal()
+        nxt = [e - d_ord for e in es if e >= d_ord]
+        prev = [d_ord - e for e in es if e <= d_ord]
+        dto = min(nxt) if nxt else cap
+        dsi = min(prev) if prev else cap
+        F[r, 0] = min(dto, cap)
+        F[r, 1] = min(dsi, cap)
+        F[r, 2] = 1.0 if dto <= 1 else 0.0     # report today/tomorrow -> reaction next session
+        F[r, 3] = 1.0 if dsi <= 1 else 0.0     # just reported (post-earnings drift)
+    return names, F
 
 
 def insider_block(meta, bars, win: int = 90):
@@ -363,7 +418,8 @@ def regime_block(meta, bars, win: int = 20):
 
 
 BLOCKS = {"ext": ext_block, "sector": sector_block, "regime": regime_block,
-          "xhorizon": xhorizon_block, "macro": macro_block, "insider": insider_block}
+          "xhorizon": xhorizon_block, "macro": macro_block, "insider": insider_block,
+          "earnings": earnings_block}
 
 
 def build_augmented(block_keys: list[str], horizon: int = 1):
