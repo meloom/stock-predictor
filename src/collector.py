@@ -253,6 +253,24 @@ class Collector:
                               "WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 5").fetchall()
         return {"by_status": by_status, "due_now": due, "quota": quota, "recent_errors": errs}
 
+    def signal_detail(self, scope: str, feature: str, day_limit: int = 90, ts_limit: int = 300) -> dict:
+        """Drill-down for one ticker × signal: daily density (points per event
+        date) + the exact collection timestamps (event_time & ingested_at)."""
+        daily = [{"date": d, "count": n} for d, n in self.c.execute(
+            "SELECT substr(event_time,1,10) d, COUNT(*) FROM feature_values "
+            "WHERE feature=? AND scope=? GROUP BY d ORDER BY d DESC LIMIT ?",
+            (feature, scope, day_limit)).fetchall()]
+        stamps = [{"event_time": et, "ingested_at": ing} for et, ing in self.c.execute(
+            "SELECT event_time, ingested_at FROM feature_values WHERE feature=? AND scope=? "
+            "ORDER BY ingested_at DESC LIMIT ?", (feature, scope, ts_limit)).fetchall()]
+        total = self.c.execute("SELECT COUNT(*) FROM feature_values WHERE feature=? AND scope=?",
+                               (feature, scope)).fetchone()[0]
+        span = self.c.execute("SELECT MIN(event_time), MAX(event_time) FROM feature_values "
+                              "WHERE feature=? AND scope=?", (feature, scope)).fetchone()
+        return {"scope": scope, "feature": feature, "total": total,
+                "first_event": span[0], "last_event": span[1],
+                "daily": list(reversed(daily)), "stamps": stamps}
+
     # ── coverage / progress report ────────────────────────────────────────────
     def coverage_report(self, matrix_features: list[str] | None = None) -> dict:
         """A snapshot of collection progress: per-kind backfill %, per-signal

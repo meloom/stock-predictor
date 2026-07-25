@@ -10,6 +10,7 @@ Shows: overall backfill %, per-source quota, per-kind progress, a ticker×signal
 freshness heatmap (with per-cell time detail), and the full QUEUE schedule at
 per-signal × per-ticker × per-time granularity (state, last collected, next due).
 """
+import json as _json
 import sys
 from pathlib import Path
 
@@ -20,6 +21,13 @@ SIGNAL_LABELS = {
     "opt.implied_move": "ImplMove", "fundamental.analyst_snapshot": "Analyst",
     "fundamental.statements": "Fundmls", "calendar.days_to_earnings": "Earn",
 }
+# signals shown in the per-ticker drill-down (feature, label)
+DRILL_FEATURES = [
+    ["price.close", "Bars"], ["price.volume", "Volume"], ["price.current", "Quote"],
+    ["short.pct_float", "Short interest"], ["opt.implied_move", "Implied move"],
+    ["fundamental.analyst_snapshot", "Analyst"], ["fundamental.statements", "Fundamentals"],
+    ["calendar.days_to_earnings", "Days-to-earnings"],
+]
 
 
 def _fresh_class(h):
@@ -109,6 +117,9 @@ def render(report: dict, tickers: list[str]) -> str:
                   f'<td><span class="dot {_fresh_class(s["fresh_h"])}"></span>'
                   f'<span class="mono">{fresh}</span></td></tr>')
 
+    drill_opts = "".join(f"<option>{t}</option>" for t in shown)
+    drill_json = _json.dumps(DRILL_FEATURES)
+
     return f"""{_CSS}
 <main>
   <header>
@@ -137,6 +148,11 @@ def render(report: dict, tickers: list[str]) -> str:
     <tbody id="qbody">{grows}</tbody></table></div>
   </section>
 
+  <section class="panel"><h2>Collection detail <span class="muted">— pick a ticker, expand a signal for daily density &amp; the exact collection timestamps</span></h2>
+    <select id="tk" class="filter" onchange="loadTicker()">{drill_opts}</select>
+    <div id="detail" class="detail"></div>
+  </section>
+
   <section class="panel"><h2>Signals in the store</h2>
     <table class="signals"><thead><tr><th>Feature</th><th>Rows</th><th>Tickers</th>
     <th>Latest event</th><th>Freshness</th></tr></thead><tbody>{srows}</tbody></table>
@@ -146,6 +162,34 @@ def render(report: dict, tickers: list[str]) -> str:
 function filterQ(){{var v=document.getElementById('qf').value.toLowerCase();
   document.querySelectorAll('#qbody tr').forEach(function(r){{
     r.style.display=r.textContent.toLowerCase().indexOf(v)>-1?'':'none';}});}}
+const DRILL={drill_json};
+function loadTicker(){{
+  var wrap=document.getElementById('detail'); wrap.innerHTML='';
+  DRILL.forEach(function(f){{
+    var row=document.createElement('div'); row.className='sigrow';
+    var btn=document.createElement('button'); btn.className='sigbtn'; btn.textContent='\\u25B8 '+f[1];
+    var body=document.createElement('div'); body.className='sigbody';
+    btn.onclick=function(){{toggleSig(btn,body,f[0],f[1]);}};
+    row.appendChild(btn); row.appendChild(body); wrap.appendChild(row);
+  }});
+}}
+async function toggleSig(btn,body,feat,label){{
+  if(body.dataset.open==='1'){{body.dataset.open='0';body.innerHTML='';btn.textContent='\\u25B8 '+label;return;}}
+  var tk=document.getElementById('tk').value;
+  btn.textContent='\\u25BE '+label; body.innerHTML='<div class="dmeta muted">loading…</div>';
+  var r=await fetch('/api/detail?scope='+encodeURIComponent(tk)+'&feature='+encodeURIComponent(feat));
+  var d=await r.json(); body.dataset.open='1';
+  var mx=Math.max.apply(null,[1].concat(d.daily.map(function(x){{return x.count;}})));
+  var bars=d.daily.map(function(x){{var h=Math.round(4+18*x.count/mx);
+    return '<span class="dbar" style="height:'+h+'px" title="'+x.date+': '+x.count+' point(s)"></span>';}}).join('');
+  var ts=d.stamps.slice(0,80).map(function(s){{
+    return '<tr><td class="mono">'+s.event_time+'</td><td class="mono muted">'+String(s.ingested_at).replace('T',' ').slice(0,19)+'</td></tr>';}}).join('');
+  body.innerHTML='<div class="dmeta mono">'+d.total+' points \\u00b7 '+(d.first_event||'\\u2014')+' \\u2192 '+(d.last_event||'\\u2014')+'</div>'+
+    '<div class="density" title="daily density (one bar per event date)">'+(bars||'<span class="muted">no data collected yet</span>')+'</div>'+
+    (d.stamps.length?'<details><summary>exact collection timestamps ('+d.stamps.length+')</summary>'+
+    '<div class="tswrap"><table class="ts"><thead><tr><th>event date</th><th>collected at (ingested_at)</th></tr></thead><tbody>'+ts+'</tbody></table></div></details>':'');
+}}
+document.addEventListener('DOMContentLoaded',loadTicker);
 </script>"""
 
 
@@ -217,6 +261,20 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .due.duenow{color:var(--accent);font-weight:600}.due.done{color:var(--fresh)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--miss)}
 .dot.fresh{background:var(--fresh)}.dot.aging{background:var(--aging)}.dot.stale{background:var(--stale)}
+.detail{margin-top:6px}
+.sigrow{border-bottom:1px solid var(--line)}.sigrow:last-child{border-bottom:none}
+.sigbtn{width:100%;text-align:left;background:none;border:none;color:var(--ink);font:inherit;
+  font-size:13px;font-weight:600;padding:11px 4px;cursor:pointer;font-family:ui-monospace,monospace}
+.sigbtn:hover{color:var(--accent)}.sigbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sigbody{padding:0 4px}.sigbody:empty{padding:0}
+.dmeta{font-size:12px;padding:2px 0 10px}
+.density{display:flex;align-items:flex-end;gap:2px;min-height:24px;padding:6px 0 12px;flex-wrap:wrap}
+.dbar{width:5px;background:var(--fresh);border-radius:1px;display:inline-block}
+details{margin:0 0 12px}summary{cursor:pointer;font-size:12px;color:var(--accent);padding:4px 0}
+.tswrap{max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:8px}
+.ts{font-size:12px}.ts th{position:sticky;top:0;background:var(--panel);text-align:left;padding:8px 10px;
+  font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);border-bottom:1px solid var(--line)}
+.ts td{padding:5px 10px;border-bottom:1px solid var(--line)}
 </style>"""
 
 
@@ -230,22 +288,31 @@ def _page(report, tickers, auto_refresh=0):
 
 def serve(port=8787):
     from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import urlparse, parse_qs
     from collector import default_collector
     from universe import UNIVERSE
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            report = default_collector().coverage_report()      # regenerated live per request
-            html = _page(report, UNIVERSE, auto_refresh=20).encode()
+            col = default_collector()
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/detail":          # drill-down: one ticker × signal
+                q = parse_qs(parsed.query)
+                payload = _json.dumps(col.signal_detail(
+                    q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
+                ctype = "application/json"
+            else:                                     # the dashboard, regenerated live
+                payload = _page(col.coverage_report(), UNIVERSE, auto_refresh=0).encode()
+                ctype = "text/html; charset=utf-8"
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers(); self.wfile.write(html)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers(); self.wfile.write(payload)
 
         def log_message(self, *a):
             pass
 
-    print(f"S1 collector dashboard → http://localhost:{port}  (live; auto-refresh 20s, Ctrl-C to stop)")
+    print(f"S1 collector dashboard → http://localhost:{port}  (live; refresh to update, Ctrl-C to stop)")
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
