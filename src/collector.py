@@ -285,6 +285,23 @@ class Collector:
                 "first_event": span[0], "last_event": span[1],
                 "daily": list(reversed(daily)), "by_5min": by_5min, "stamps": stamps}
 
+    def raw_values(self, scope: str, feature: str, limit: int = 60) -> dict:
+        """The EXACT stored values for one scope × feature (most recent first),
+        with event_time (when generated) and ingested_at (when collected). JSON
+        values are decoded so the inspector shows real content."""
+        import json as J
+        rows = []
+        for et, ing, val in self.c.execute(
+                "SELECT event_time, ingested_at, value FROM feature_values "
+                "WHERE feature=? AND scope=? ORDER BY event_time DESC, ingested_at DESC LIMIT ?",
+                (feature, scope, limit)).fetchall():
+            try:
+                v = J.loads(val)
+            except Exception:
+                v = val
+            rows.append({"event_time": et, "ingested_at": ing, "value": v})
+        return {"scope": scope, "feature": feature, "count": len(rows), "rows": rows}
+
     # ── coverage / progress report ────────────────────────────────────────────
     def coverage_report(self, matrix_features: list[str] | None = None) -> dict:
         """A snapshot of collection progress: per-kind backfill %, per-signal

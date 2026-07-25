@@ -15,6 +15,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from core import MARKET_SCOPE
+except Exception:
+    MARKET_SCOPE = "_market"
 
 SIGNAL_LABELS = {
     "price.close": "Bars", "price.current": "Quote", "short.pct_float": "Short%",
@@ -126,6 +130,8 @@ def render(report: dict, tickers: list[str]) -> str:
 
     drill_opts = "".join(f"<option>{t}</option>" for t in shown)
     drill_json = _json.dumps(DRILL_FEATURES)
+    rsig_opts = "".join(f"<option>{s['feature']}</option>" for s in report["signals"])
+    mkt_json = _json.dumps(MARKET_SCOPE)
 
     return f"""{_CSS}
 <main>
@@ -153,6 +159,15 @@ def render(report: dict, tickers: list[str]) -> str:
     <div class="qwrap"><table class="qsched"><thead><tr><th>Ticker</th><th>Signal</th><th>Src</th>
     <th>State</th><th>Last collected (UTC)</th><th>Next run (UTC)</th><th>Retries</th></tr></thead>
     <tbody id="qbody">{grows}</tbody></table></div>
+  </section>
+
+  <section class="panel"><h2>Raw data inspector <span class="muted">— view the exact stored value for any ticker × signal (use __MARKET__ for macro)</span></h2>
+    <div class="rawctrl">
+      <select id="rsig" onchange="rscopeHint()">{rsig_opts}</select>
+      <input id="rscope" value="AAPL" placeholder="ticker (macro auto-uses market)" spellcheck="false">
+      <button id="rgo" onclick="showRaw()">Show raw values</button>
+    </div>
+    <div id="rawout"></div>
   </section>
 
   <section class="panel"><h2>Collection detail <span class="muted">— pick a ticker, expand a signal for daily density &amp; the exact collection timestamps</span></h2>
@@ -200,7 +215,29 @@ async function toggleSig(btn,body,feat,label){{
     (d.stamps.length?'<details><summary>exact timestamps to the second ('+d.stamps.length+')</summary>'+
     '<div class="tswrap"><table class="ts"><thead><tr><th>event time</th><th>collected at (ingested_at)</th></tr></thead><tbody>'+ts+'</tbody></table></div></details>':'');
 }}
-document.addEventListener('DOMContentLoaded',loadTicker);
+const MARKET={mkt_json};
+function rscopeHint(){{
+  var f=document.getElementById('rsig').value, s=document.getElementById('rscope');
+  if(f.indexOf('macro.')===0||f.indexOf('regime.')===0){{s.value=MARKET;}}
+  else if(s.value===MARKET){{s.value='AAPL';}}
+}}
+async function showRaw(){{
+  var feat=document.getElementById('rsig').value;
+  var scope=document.getElementById('rscope').value.trim();
+  if(feat.indexOf('macro.')===0||feat.indexOf('regime.')===0){{scope=MARKET;}} else {{scope=scope.toUpperCase();}}
+  var out=document.getElementById('rawout'); out.innerHTML='<div class="dmeta muted">loading…</div>';
+  var r=await fetch('/api/raw?scope='+encodeURIComponent(scope)+'&feature='+encodeURIComponent(feat));
+  var d=await r.json();
+  if(!d.rows.length){{out.innerHTML='<div class="dmeta muted">no data for '+scope+' · '+feat+'</div>';return;}}
+  function esc(x){{return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}}
+  var rows=d.rows.map(function(x){{
+    var v=(x.value!==null&&typeof x.value==='object')?JSON.stringify(x.value):String(x.value);
+    return '<tr><td class="mono">'+esc(x.event_time)+'</td><td class="mono muted">'+esc(String(x.ingested_at).replace('T',' ').slice(0,19))+'</td><td class="mono rawval">'+esc(v)+'</td></tr>';
+  }}).join('');
+  out.innerHTML='<div class="dmeta mono">'+esc(scope)+' \\u00b7 '+esc(feat)+' \\u2014 '+d.count+' most-recent values (newest first)</div>'+
+    '<div class="tswrap"><table class="ts"><thead><tr><th>event time (generated)</th><th>collected at</th><th>raw value</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+}}
+document.addEventListener('DOMContentLoaded',function(){{loadTicker();rscopeHint();}});
 </script>"""
 
 
@@ -259,6 +296,13 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .cell.miss{background:var(--miss);border:1px solid var(--line)}
 .filter{width:100%;max-width:340px;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
 .filter:focus{outline:2px solid var(--accent);outline-offset:1px}
+.rawctrl{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.rawctrl select,.rawctrl input{padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
+.rawctrl select{min-width:230px}.rawctrl input{width:180px}
+.rawctrl select:focus,.rawctrl input:focus{outline:2px solid var(--accent);outline-offset:1px}
+.rawctrl button{padding:8px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+.rawctrl button:hover{filter:brightness(1.08)}
+.rawval{max-width:640px;white-space:pre-wrap;word-break:break-word;color:var(--ink)}
 .qwrap{max-height:460px;overflow:auto;border:1px solid var(--line);border-radius:10px}
 .qsched{font-size:12.5px}
 .qsched thead th{position:sticky;top:0;background:var(--panel);z-index:1;padding:10px}
@@ -352,6 +396,11 @@ def serve(port=8787):
             if path == "/api/detail":                 # drill-down: one ticker × signal
                 q = parse_qs(parsed.query)
                 payload = _json.dumps(col.signal_detail(
+                    q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
+                ctype = "application/json"
+            elif path == "/api/raw":                   # exact stored values
+                q = parse_qs(parsed.query)
+                payload = _json.dumps(col.raw_values(
                     q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
                 ctype = "application/json"
             elif path == "/data-collection":          # THIS pipeline step's dashboard
