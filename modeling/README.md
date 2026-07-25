@@ -19,17 +19,17 @@ only measured winners live.
 ## Models tried (auto-logged)
 
 <!-- MODELS:START -->
-Auto-generated from `performance.log`. Train **2026-06-09 → 2026-07-08** · dev **2026-07-10 → 2026-07-23** · 109 tickers · 25 features · label `end_of_day_forward_return(H=1d)`.
+**Metric: PRECISION on big moves** (label up if next-day return > +3%, down if < -3%, else neutral). We only judge up/down calls the model is confident about; a neutral flagged up/down is the costly error. (RMSE was dropped — it measured market timing, not stock selection.)
 
-| model | type | key dev metric | vs baseline |
+Train **2026-06-09 → 2026-07-08** · dev **2026-07-10 → 2026-07-23** · 109 tickers · 25 features. Random-guess precision (base rate): **up 8.6%**, **down 11.5%** — beat these to have signal.
+
+| model | up precision (calls) | down precision (calls) | down lift vs base |
 |---|---|---|---|
-| `baseline_naive` | regression | price RMSE 10.335 | +0.00% vs naive |
-| `baseline_mean` | regression | price RMSE 10.436 | -0.98% vs naive |
-| `ridge` | regression | price RMSE 10.647 | -3.02% vs naive |
-| `lasso` | regression | price RMSE 10.566 | -2.24% vs naive |
-| `elasticnet` | regression | price RMSE 10.598 | -2.55% vs naive |
-| `random_forest` | regression | price RMSE 10.356 | -0.20% vs naive |
-| `extra_trees` | regression | price RMSE 10.395 | -0.58% vs naive |
-| `histgbm` | regression | price RMSE 10.451 | -1.12% vs naive |
-| `updown_clf` | classification | down precision 58% @ conf 0.65 | 5.1× base rate |
+| `logistic` | 14% (124 @conf 0.43) | 50% (12 @conf 0.75) | **4.4×** |
+| `random_forest` | 12% (17 @conf 0.5) | 53% (15 @conf 0.48) | **4.7×** |
+| `extra_trees` | 14% (14 @conf 0.45) | 56% (16 @conf 0.43) | **4.9×** |
+| `histgbm` | 11% (79 @conf 0.35) | 58% (12 @conf 0.65) | **5.1×** |
+| `gradient_boosting` | 13% (130 @conf 0.25) | 73% (11 @conf 0.63) | **6.3×** |
+| `knn` | 17% (35 @conf 0.23) | 0% (12 @conf 0.2) | — |
+| `mlp` | 14% (65 @conf 0.55) | 35% (31 @conf 0.8) | **3.1×** |
 <!-- MODELS:END -->
