@@ -180,15 +180,19 @@ async function toggleSig(btn,body,feat,label){{
   btn.textContent='\\u25BE '+label; body.innerHTML='<div class="dmeta muted">loading…</div>';
   var r=await fetch('/api/detail?scope='+encodeURIComponent(tk)+'&feature='+encodeURIComponent(feat));
   var d=await r.json(); body.dataset.open='1';
-  var mx=Math.max.apply(null,[1].concat(d.daily.map(function(x){{return x.count;}})));
-  var bars=d.daily.map(function(x){{var h=Math.round(4+18*x.count/mx);
-    return '<span class="dbar" style="height:'+h+'px" title="'+x.date+': '+x.count+' point(s)"></span>';}}).join('');
-  var ts=d.stamps.slice(0,80).map(function(s){{
+  function strip(arr,keyf,lab){{
+    var mx=Math.max.apply(null,[1].concat(arr.map(function(x){{return x.count;}})));
+    var bars=arr.map(function(x){{var h=Math.round(4+18*x.count/mx);
+      return '<span class="dbar" style="height:'+h+'px" title="'+keyf(x)+': '+x.count+' point(s)"></span>';}}).join('');
+    return '<div class="striplab mono">'+lab+'</div><div class="density">'+(bars||'<span class="muted">none</span>')+'</div>';
+  }}
+  var ts=d.stamps.slice(0,120).map(function(s){{
     return '<tr><td class="mono">'+s.event_time+'</td><td class="mono muted">'+String(s.ingested_at).replace('T',' ').slice(0,19)+'</td></tr>';}}).join('');
-  body.innerHTML='<div class="dmeta mono">'+d.total+' points \\u00b7 '+(d.first_event||'\\u2014')+' \\u2192 '+(d.last_event||'\\u2014')+'</div>'+
-    '<div class="density" title="daily density (one bar per event date)">'+(bars||'<span class="muted">no data collected yet</span>')+'</div>'+
-    (d.stamps.length?'<details><summary>exact collection timestamps ('+d.stamps.length+')</summary>'+
-    '<div class="tswrap"><table class="ts"><thead><tr><th>event date</th><th>collected at (ingested_at)</th></tr></thead><tbody>'+ts+'</tbody></table></div></details>':'');
+  body.innerHTML='<div class="dmeta mono">'+d.total+' points \\u00b7 events '+(d.first_event||'\\u2014')+' \\u2192 '+(d.last_event||'\\u2014')+'</div>'+
+    strip(d.daily,function(x){{return x.date;}},'coverage by event date (1 bar / day)')+
+    strip(d.by_5min,function(x){{return x.t;}},'collection cadence (1 bar / 5 min, ingested_at)')+
+    (d.stamps.length?'<details><summary>exact timestamps to the second ('+d.stamps.length+')</summary>'+
+    '<div class="tswrap"><table class="ts"><thead><tr><th>event time</th><th>collected at (ingested_at)</th></tr></thead><tbody>'+ts+'</tbody></table></div></details>':'');
 }}
 document.addEventListener('DOMContentLoaded',loadTicker);
 </script>"""
@@ -269,6 +273,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .sigbtn:hover{color:var(--accent)}.sigbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .sigbody{padding:0 4px}.sigbody:empty{padding:0}
 .dmeta{font-size:12px;padding:2px 0 10px}
+.striplab{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-top:4px}
 .density{display:flex;align-items:flex-end;gap:2px;min-height:24px;padding:6px 0 12px;flex-wrap:wrap}
 .dbar{width:5px;background:var(--fresh);border-radius:1px;display:inline-block}
 details{margin:0 0 12px}summary{cursor:pointer;font-size:12px;color:var(--accent);padding:4px 0}
@@ -277,6 +282,47 @@ details{margin:0 0 12px}summary{cursor:pointer;font-size:12px;color:var(--accent
   font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);border-bottom:1px solid var(--line)}
 .ts td{padding:5px 10px;border-bottom:1px solid var(--line)}
 </style>"""
+
+
+_STEPS = [
+    ("S1", "Data Collection", "/data-collection", True,
+     "Queue-driven collector: backfill progress, freshness heatmap, per-ticker×signal drill-down."),
+    ("S2", "Signals", None, False, "Engineered features from the collected data."),
+    ("S3", "Predictors", None, False, "Model training, precision@k, champion registry."),
+    ("S4", "Alpha", None, False, "Regime gate, event risk, position signals."),
+    ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
+]
+
+
+def _index_page():
+    cards = ""
+    for stage, name, href, live, desc in _STEPS:
+        tag = '<span class="s-live">live</span>' if live else '<span class="s-soon">soon</span>'
+        open_a = f'<a class="scard" href="{href}">' if href else '<div class="scard off">'
+        close_a = "</a>" if href else "</div>"
+        cards += (f'{open_a}<div class="s-top"><span class="s-stage">{stage}</span>{tag}</div>'
+                  f'<div class="s-name">{name}</div><div class="s-desc">{desc}</div>{close_a}')
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Pipeline dashboards</title>{_CSS}<style>'
+            '.wrap{max-width:900px;margin:0 auto;padding:48px 24px}'
+            '.wrap h1{font-size:22px;font-weight:660;letter-spacing:-.02em;margin:0 0 6px}'
+            '.wrap p.lede{color:var(--mut);margin:0 0 28px}'
+            '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}'
+            '.scard{display:block;text-decoration:none;color:inherit;background:var(--card);'
+            'border:1px solid var(--line);border-radius:14px;padding:20px;transition:border-color .15s}'
+            '.scard:hover{border-color:var(--accent)}.scard.off{opacity:.55}'
+            '.s-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}'
+            '.s-stage{font-family:ui-monospace,monospace;font-size:12px;color:var(--mut);font-weight:600}'
+            '.s-live{font-family:ui-monospace,monospace;font-size:10.5px;text-transform:uppercase;'
+            'letter-spacing:.05em;color:var(--fresh);background:color-mix(in srgb,var(--fresh) 15%,transparent);padding:2px 8px;border-radius:20px}'
+            '.s-soon{font-family:ui-monospace,monospace;font-size:10.5px;text-transform:uppercase;'
+            'letter-spacing:.05em;color:var(--mut);background:var(--miss);padding:2px 8px;border-radius:20px}'
+            '.s-name{font-size:16px;font-weight:640;margin-bottom:4px}.s-desc{font-size:12.5px;color:var(--mut);line-height:1.5}'
+            '</style></head><body><div class="wrap">'
+            '<h1>stock-predictor · pipeline dashboards</h1>'
+            '<p class="lede">One dashboard per stage. Data Collection is live; the rest arrive as each stage gets its own view.</p>'
+            f'<div class="grid">{cards}</div></div></body></html>')
 
 
 def _page(report, tickers, auto_refresh=0):
@@ -296,14 +342,17 @@ def serve(port=8787):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             col = default_collector()
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/detail":          # drill-down: one ticker × signal
+            parsed = urlparse(self.path); path = parsed.path.rstrip("/") or "/"
+            if path == "/api/detail":                 # drill-down: one ticker × signal
                 q = parse_qs(parsed.query)
                 payload = _json.dumps(col.signal_detail(
                     q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
                 ctype = "application/json"
-            else:                                     # the dashboard, regenerated live
+            elif path == "/data-collection":          # THIS pipeline step's dashboard
                 payload = _page(col.coverage_report(), UNIVERSE, auto_refresh=0).encode()
+                ctype = "text/html; charset=utf-8"
+            else:                                     # "/" index of all step dashboards
+                payload = _index_page().encode()
                 ctype = "text/html; charset=utf-8"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -313,7 +362,8 @@ def serve(port=8787):
         def log_message(self, *a):
             pass
 
-    print(f"S1 collector dashboard → http://localhost:{port}  (live; refresh to update, Ctrl-C to stop)")
+    print(f"Dashboards → http://localhost:{port}/  ·  data collection → "
+          f"http://localhost:{port}/data-collection  (Ctrl-C to stop)")
     HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 

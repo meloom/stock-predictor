@@ -260,6 +260,19 @@ class Collector:
             "SELECT substr(event_time,1,10) d, COUNT(*) FROM feature_values "
             "WHERE feature=? AND scope=? GROUP BY d ORDER BY d DESC LIMIT ?",
             (feature, scope, day_limit)).fetchall()]
+        # COLLECTION density: ingested_at bucketed to 5-minute intervals (as fine
+        # as we store — shows exactly when/how often this signal was collected).
+        buckets = {}
+        for m, n in self.c.execute(
+                "SELECT substr(ingested_at,1,16) m, COUNT(*) FROM feature_values "
+                "WHERE feature=? AND scope=? GROUP BY m ORDER BY m DESC LIMIT 600",
+                (feature, scope)).fetchall():
+            try:
+                base = m[:14] + "%02d" % ((int(m[14:16]) // 5) * 5)   # floor minute to /5
+            except Exception:
+                base = m
+            buckets[base] = buckets.get(base, 0) + n
+        by_5min = [{"t": k.replace("T", " "), "count": v} for k, v in sorted(buckets.items())]
         stamps = [{"event_time": et, "ingested_at": ing} for et, ing in self.c.execute(
             "SELECT event_time, ingested_at FROM feature_values WHERE feature=? AND scope=? "
             "ORDER BY ingested_at DESC LIMIT ?", (feature, scope, ts_limit)).fetchall()]
@@ -269,7 +282,7 @@ class Collector:
                               "WHERE feature=? AND scope=?", (feature, scope)).fetchone()
         return {"scope": scope, "feature": feature, "total": total,
                 "first_event": span[0], "last_event": span[1],
-                "daily": list(reversed(daily)), "stamps": stamps}
+                "daily": list(reversed(daily)), "by_5min": by_5min, "stamps": stamps}
 
     # ── coverage / progress report ────────────────────────────────────────────
     def coverage_report(self, matrix_features: list[str] | None = None) -> dict:
