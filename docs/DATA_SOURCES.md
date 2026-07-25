@@ -1,5 +1,32 @@
 # Data sources — near-earnings signals (what's free, what costs money)
 
+## Running the always-on collector (`src/collector.py`)
+
+S1 is a queue-driven collector: a persistent task queue (`collection_tasks` in the
+store DB), a per-source rate limiter, and a worker that drains it — strictly pacing
+each source (yfinance polite, **Polygon 5/min** for the basic plan). Recurring tasks
+keep data fresh; `add-ticker` / a new source enqueue prioritized backfills.
+
+```
+python -m collector seed                 # ensure recurring tasks for the universe
+python -m collector add-ticker NVDA      # prioritized backfill for a new ticker
+python -m collector drain --seconds 55   # one bounded pass (for a per-minute cron)
+python -m collector run                  # long-running daemon
+python -m collector status               # queue + quota snapshot
+python -m collector_dashboard out.html   # render the coverage/backfill dashboard
+```
+
+**Cron (self-healing, respects limits):** run a bounded drain every minute — each
+run consumes only that minute's quota, then exits:
+```
+* * * * * cd /path/to/stock-predictor && PYTHONPATH=src venv/bin/python -m collector drain --seconds 55 >> runtime/logs/collector.log 2>&1
+```
+Secrets (e.g. `POLYGON_API_KEY`) live in `~/.credentials` (chmod 600), read via
+`collector.load_secret` — never committed.
+
+---
+
+
 The near-earnings module (see `modeling/EARNINGS_RESEARCH.md`) needs signals that
 are NOT in our current price/volume/fundamental feeds. Status and cost of each.
 
