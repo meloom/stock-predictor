@@ -345,6 +345,7 @@ class Collector:
                 due_in = None
             queue.append({"kind": kind, "source": source, "scope": scope, "status": status,
                           "collected_h": hours_since(last_ok), "due_in_min": due_in,
+                          "last_ok": last_ok, "next_due": next_due,
                           "attempts": attempts, "error": err})
 
         total_rows = self.c.execute("SELECT COUNT(*) FROM feature_values").fetchone()[0]
@@ -375,8 +376,36 @@ def _h_bars(scope, store, tid):
     for b in bars:
         rows.append(("price.close", scope, b["date"], b["close"]))
         rows.append(("price.volume", scope, b["date"], b["volume"]))
-    if rows:
-        store.write_many(rows, trigger_id=tid)
+    if not rows:
+        # empty = yfinance throttled/failed this ticker. RAISE so the task retries
+        # (with backoff) instead of falsely marking itself collected with no data.
+        raise RuntimeError("no bars returned (rate-limited?) — will retry")
+    store.write_many(rows, trigger_id=tid)
+    return len(rows), 1
+
+
+def _h_bars_polygon(scope, store, tid):
+    """Daily bars from Polygon (reliable — yfinance throttles rapid download bursts).
+    One call per ticker for ~13 months of history."""
+    key = load_secret("POLYGON_API_KEY")
+    if not key:
+        raise RuntimeError("no POLYGON_API_KEY")
+    import s1_data
+    _reg_s1(store)
+    from datetime import date, timedelta
+    to = date.today().isoformat()
+    frm = (date.today() - timedelta(days=400)).isoformat()
+    d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/day/{frm}/{to}"
+                  f"?adjusted=true&sort=asc&limit=50000", key)
+    res = d.get("results") or []
+    if not res:
+        raise RuntimeError(f"no Polygon bars for {scope} — will retry")
+    rows = []
+    for b in res:
+        dt = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date().isoformat()
+        rows.append(("price.close", scope, dt, b["c"]))
+        rows.append(("price.volume", scope, dt, b["v"]))
+    store.write_many(rows, trigger_id=tid)
     return len(rows), 1
 
 
@@ -620,12 +649,12 @@ def _today():
 # ═══════════════ default wiring ════════════════════════════════════════════════
 def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col = Collector(db_path, store, now_fn)
-    col.register_source("yfinance", limit=120, window_sec=60)   # polite self-limit
+    col.register_source("yfinance", limit=30, window_sec=60)    # gentle — yfinance throttles bursts
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
     col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
     # kind, source, interval, priority, handler, scope, est_calls
     col.register_kind("macro", "yfinance", DAY, 10, _h_macro, scope="market", est_calls=3)
-    col.register_kind("bars", "yfinance", DAY, 20, _h_bars, est_calls=1)
+    col.register_kind("bars", "polygon", DAY, 20, _h_bars_polygon, est_calls=1)  # reliable vs yfinance throttle
     col.register_kind("implied_move", "polygon", DAY, 25, _h_implied_move, est_calls=4)
     col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1)
     col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1)

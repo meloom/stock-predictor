@@ -96,18 +96,22 @@ def render(report: dict, tickers: list[str]) -> str:
         body += f'<tr><th class="tick mono">{t}</th>{cells}</tr>'
 
     # full queue schedule — per signal × ticker × time
+    def _ts(iso):   # ISO -> 'YYYY-MM-DD HH:MM' (minute level)
+        return iso[:16].replace("T", " ") if iso else "—"
     grows = ""
     for q in report["queue"]:
         lbl, dcls = _due_label(q)
         state = ("err" if q["error"] else ("done" if q["status"] == "done"
                  else ("duenow" if (q["due_in_min"] or 1) <= 0 else "sched")))
-        col_h = f'{q["collected_h"]}h ago' if q["collected_h"] is not None else "never"
+        collected = _ts(q.get("last_ok")) if q.get("last_ok") else "never"
+        nxt = _ts(q.get("next_due"))
+        rel = f'<span class="muted"> · {lbl}</span>' if q["status"] != "done" else ""
         tries = f'<span class="chip crit">×{q["attempts"]}</span>' if q["attempts"] else ""
         grows += (f'<tr><td class="mono tk">{q["scope"]}</td>'
                   f'<td class="mono kind">{q["kind"]}</td><td class="src">{q["source"]}</td>'
                   f'<td><span class="tag {state}">{state}</span></td>'
-                  f'<td class="mono muted">{col_h}</td>'
-                  f'<td class="mono due {dcls}">{lbl}</td><td>{tries}</td></tr>')
+                  f'<td class="mono muted">{collected}</td>'
+                  f'<td class="mono due {dcls}">{nxt}{rel}</td><td>{tries}</td></tr>')
 
     srows = ""
     for s in report["signals"]:
@@ -145,7 +149,7 @@ def render(report: dict, tickers: list[str]) -> str:
   <section class="panel"><h2>Queue schedule <span class="muted">— every task by ticker × signal × next-run ({len(report["queue"])} tasks)</span></h2>
     <input id="qf" class="filter" placeholder="filter by ticker, signal, or state…" oninput="filterQ()">
     <div class="qwrap"><table class="qsched"><thead><tr><th>Ticker</th><th>Signal</th><th>Src</th>
-    <th>State</th><th>Collected</th><th>Next run</th><th>Retries</th></tr></thead>
+    <th>State</th><th>Last collected (UTC)</th><th>Next run (UTC)</th><th>Retries</th></tr></thead>
     <tbody id="qbody">{grows}</tbody></table></div>
   </section>
 
