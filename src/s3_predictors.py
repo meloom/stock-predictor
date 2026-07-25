@@ -184,15 +184,46 @@ def train_classifier(X, y, move: float = 0.03):
             "feature_names": list(PREDICTOR_FEATURES)}
 
 
+def train_dual_classifier(X, y, move: float = 0.03):
+    """SIDE-SPECIFIC big-move classifier (loop-2 winner): LOGISTIC for the long/up
+    side + HISTGBM for the short/down side. Grounded in the finding that logistic
+    dominates up-precision (up@1 24% vs 22%) while histgbm dominates down-precision
+    (down@1 23% vs 17%) — the dual beats either single model on both sides. Both
+    learners share one standardization; predict_proba_eod takes p_up from logistic
+    and p_down from histgbm."""
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    mean = np.nan_to_num(np.nanmean(X, axis=0), nan=0.0)
+    std = np.nanstd(X, axis=0); std[(std == 0) | np.isnan(std)] = 1.0
+    Xz = np.nan_to_num(np.where(np.isnan(X), 0.0, (X - mean) / std),
+                       nan=0.0, posinf=0.0, neginf=0.0)
+    lab = np.where(y > move, 1, np.where(y < -move, -1, 0))
+    up_model = LogisticRegression(max_iter=500, class_weight="balanced").fit(Xz, lab)
+    dn_model = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05,
+                                              max_iter=250, random_state=0).fit(Xz, lab)
+    return {"kind": "dual_classifier", "up_model": up_model, "dn_model": dn_model,
+            "up_classes": [int(c) for c in up_model.classes_],
+            "dn_classes": [int(c) for c in dn_model.classes_],
+            "mean": mean, "std": std, "move": move,
+            "feature_names": list(PREDICTOR_FEATURES)}
+
+
 def predict_proba_eod(store, universe, event_date, trained, as_known_at=None):
     """Per-ticker big-move probabilities from the live classifier. Emits p_up,
     p_down, confidence, the discrete direction call, and a probability-weighted
     eod_return proxy (p_up*move - p_down*move) that keeps S4's predict.eod_return
-    gate working unchanged."""
+    gate working unchanged. Handles both the single 3-class classifier and the
+    side-specific DUAL classifier (p_up from its up_model, p_down from dn_model)."""
     import numpy as np
-    classes = trained["classes"]; move = trained["move"]
-    iu = classes.index(1) if 1 in classes else None
-    idn = classes.index(-1) if -1 in classes else None
+    move = trained["move"]
+    if trained.get("kind") == "dual_classifier":
+        um, dm = trained["up_model"], trained["dn_model"]
+        uc, dc = trained["up_classes"], trained["dn_classes"]
+    else:
+        um = dm = trained["model"]; uc = dc = trained["classes"]
+    iu = uc.index(1) if 1 in uc else None
+    idn = dc.index(-1) if -1 in dc else None
     out = {}
     for t in universe:
         feats = [(store.read_asof(f, t, event_date, as_known_at) or {}).get("value", np.nan)
@@ -200,9 +231,8 @@ def predict_proba_eod(store, universe, event_date, trained, as_known_at=None):
         A = np.array([feats], dtype=float)
         Xz = np.nan_to_num(np.where(np.isnan(A), 0.0, (A - trained["mean"]) / trained["std"]),
                            nan=0.0, posinf=0.0, neginf=0.0)
-        proba = trained["model"].predict_proba(Xz)[0]
-        p_up = float(proba[iu]) if iu is not None else 0.0
-        p_dn = float(proba[idn]) if idn is not None else 0.0
+        p_up = float(um.predict_proba(Xz)[0][iu]) if iu is not None else 0.0
+        p_dn = float(dm.predict_proba(Xz)[0][idn]) if idn is not None else 0.0
         direction = 1.0 if (p_up >= p_dn and p_up >= 0.5) else (-1.0 if (p_dn > p_up and p_dn >= 0.5) else 0.0)
         out[t] = {"p_up": round(p_up, 4), "p_down": round(p_dn, 4),
                   "confidence": round(max(p_up, p_dn), 4), "direction": direction,
@@ -298,7 +328,7 @@ def run_predictors(universe: list[str], event_date: str,
                              status="NO_MODEL")
             return {"trigger_id": trig.trigger_id, **trig.metrics}
 
-        is_clf = trained.get("kind") == "classifier"
+        is_clf = trained.get("kind") in ("classifier", "dual_classifier")
         written = 0
         if is_clf:
             preds = predict_proba_eod(store, universe, event_date, trained, as_known_at)
@@ -312,7 +342,9 @@ def run_predictors(universe: list[str], event_date: str,
                                 round(px["value"] * (1 + p["eod_return"]), 4),
                                 trigger_id=trig.trigger_id)
                 written += 1
-            model_tag = "big_move_classifier/histgbm"
+            model_tag = ("dual: logistic(up)+histgbm(down)"
+                         if trained.get("kind") == "dual_classifier"
+                         else "big_move_classifier/histgbm")
         else:
             preds = predict_eod(store, universe, event_date, trained, horizon_days, as_known_at)
             for t, p in preds.items():

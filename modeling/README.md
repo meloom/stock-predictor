@@ -8,11 +8,15 @@ top-k highest-conviction longs and shorts; precision@k = the fraction that
 actually moved > ±3%. The random baseline is the base rate (up 9.4% / down 8.1%).
 RMSE and the old peak-precision columns are retired.
 
-**Live model:** the 3-class big-move classifier (`src/s3_predictors.py`
-`train_classifier` / `predict_proba_eod`) — reconciled from a prior train/serve
-mismatch (production once ran a Ridge regression while all diagnostics ran this
-HistGBM). Champion feature set = the 25 S1/S2 features **+ the `xh.*` long-horizon
-extension block** (down-side precision@1 ≈ 2.9–3.1× the base rate).
+**Live model:** the **side-specific DUAL classifier** (`src/s3_predictors.py`
+`train_dual_classifier` / `predict_proba_eod`) — **logistic for the long/up side,
+HistGBM for the short/down side** (loop-2 finding: logistic reads up-moves better,
+up@1 24% vs 22%; HistGBM reads crashes better, down@1 23% vs 17% — the dual beats
+either single model on both sides). Reconciled from a prior train/serve mismatch
+(production once ran a Ridge regression while diagnostics ran the classifier).
+Champion feature set = the 25 S1/S2 features **+ the `xh.*` long-horizon extension
+block**. Per-day precision@1 ≈ 2.6× (up) / 2.9× (down) the base rate. See
+`LOOP2_FINDINGS.md` for the error-analysis loop that produced it.
 
 ### Prediction windows (horizons)
 Models are organized by **prediction window** — how many trading days ahead the

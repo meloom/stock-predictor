@@ -6,7 +6,8 @@ import pytest
 
 import core as core_mod
 from core import FeatureStore, MARKET_SCOPE
-from s3_predictors import (assemble_panel, train, train_classifier, evaluate,
+from s3_predictors import (assemble_panel, train, train_classifier,
+                           train_dual_classifier, evaluate,
                            evaluate_price, run_predictors, predict_eod,
                            predict_proba_eod, PREDICTOR_FEATURES)
 
@@ -148,3 +149,41 @@ def test_run_predictors_classifier_writes_probabilities(store):
     assert store.read_asof("predict.eod_return", "AAPL", "2026-06-05") is not None
     meta = store.read_asof("predict.eod_meta", MARKET_SCOPE, "2026-06-05")
     assert meta["value"]["model"] == "big_move_classifier/histgbm"
+
+
+def test_dual_classifier_uses_logistic_up_histgbm_down():
+    """The side-specific dual model must take p_up from the logistic head and
+    p_down from the histgbm head, and recover a planted directional signal."""
+    g = np.random.default_rng(5)
+    n = 3000
+    X = g.standard_normal((n, len(PREDICTOR_FEATURES)))
+    y = 0.06 * X[:, 0] + g.standard_normal(n) * 0.01
+    trained = train_dual_classifier(X[:2000], y[:2000], move=0.03)
+    assert trained["kind"] == "dual_classifier"
+    assert type(trained["up_model"]).__name__ == "LogisticRegression"
+    assert type(trained["dn_model"]).__name__ == "HistGradientBoostingClassifier"
+    # p_up should be higher on true up rows than true down rows (feature-0 driven)
+    Xz = np.nan_to_num((X[2000:] - trained["mean"]) / trained["std"])
+    iu = trained["up_classes"].index(1)
+    p_up = trained["up_model"].predict_proba(Xz)[:, iu]
+    yb = y[2000:]
+    assert p_up[yb > 0.03].mean() > p_up[yb < -0.03].mean() + 0.2
+
+
+def test_run_predictors_dual_writes_probabilities(store):
+    days = [f"2026-06-{i:02d}" for i in range(1, 11)]
+    # two-directional prices so labels span +1/-1/0 (logistic needs >=2 classes)
+    px = {"AAPL": [100, 103, 101, 104, 102, 105, 103, 106, 104, 107],
+          "MSFT": [200, 196, 199, 195, 198, 194, 197, 193, 196, 192]}
+    for i, d in enumerate(days):
+        for tk in ("AAPL", "MSFT"):
+            store.write("price.close", tk, d, float(px[tk][i]), trigger_id="s")
+            store.write("tech.rsi14", tk, d, 50.0, trigger_id="s")
+    panel = assemble_panel(store, ["AAPL", "MSFT"], days[:8], horizon_days=1)
+    dual = train_dual_classifier(panel["X"], panel["y"], move=0.001)
+    m = run_predictors(["AAPL", "MSFT"], "2026-06-05", store=store, trained=dual)
+    assert m["status"] == "PREDICTED"
+    assert store.read_asof("predict.p_up", "AAPL", "2026-06-05") is not None
+    assert store.read_asof("predict.eod_return", "AAPL", "2026-06-05") is not None  # S4 compat
+    meta = store.read_asof("predict.eod_meta", MARKET_SCOPE, "2026-06-05")
+    assert meta["value"]["model"] == "dual: logistic(up)+histgbm(down)"
