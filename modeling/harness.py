@@ -42,6 +42,87 @@ PERF_LOG = MODELING_DIR / "performance.log"
 TRAIN_DAYS = 20      # 4 weeks of trading days
 DEV_DAYS = 10        # 2 weeks of trading days
 LABEL_STRATEGY = "end_of_day_forward_return"   # predict close H trading days ahead
+MOVE_THRESHOLD = 0.03   # big-move label: |fwd return| > this => up/down, else neutral
+
+
+# ═══════════════ STANDARDIZED data collection (one path for train + eval) ════
+# Every model script uses build_full_dataset + make_labels + rolling_windows so
+# the split/labels/standardization are identical everywhere — no ad-hoc per-
+# script data prep.
+
+def build_full_dataset(horizon_days: int = 1, universe: list[str] | None = None,
+                       period: str = "1y", with_fundamentals: bool = True,
+                       cache: bool = True) -> dict:
+    """ONE fetch -> S2 features across the WHOLE period -> a panel spanning all
+    trading days (so any 4wk/2wk window, or many rolling windows, can be sliced
+    without re-fetching). Cached to runtime/full_dataset_h{H}.pkl."""
+    import pickle
+    universe = universe or UNIVERSE
+    cache_p = (ROOT / "runtime" / f"full_dataset_h{horizon_days}.pkl")
+    bars = fetch_daily_bars(universe, period=period)
+    store = FeatureStore(Path(os.environ.get("TMPDIR", "/tmp")) /
+                         f"fullds_{datetime.now(timezone.utc).timestamp()}.db")
+    if with_fundamentals:
+        sh = {t: fetch_shares_outstanding(t) for t in universe}
+        st = {t: fetch_latest_statements(t) for t in universe}
+        an = {t: fetch_analyst_snapshot(t) for t in universe}
+        fs, fst, fan = (lambda t: sh.get(t)), (lambda t, asof=None: st.get(t)), (lambda t: an.get(t))
+    else:
+        fs = fst = fan = (lambda t, asof=None: None)
+    run_daily_ingestion(universe, store=store, fetch_bars=lambda t: bars,
+                        fetch_macro=lambda: fetch_macro(period),
+                        fetch_dte=lambda t, asof=None: None, fetch_quote=lambda t: None,
+                        fetch_shares=fs, fetch_statements=fst, fetch_analyst=fan)
+    all_dates = sorted({r["date"] for rows in bars.values() for r in rows})
+    usable = all_dates[35:-(horizon_days + 1)]   # warmup for S2 history + fwd room
+    for d in usable:
+        run_signal_generation(universe, d, store=store)
+    panel = pred.assemble_panel(store, universe, usable, horizon_days=horizon_days)
+    base = [store.read_asof("price.close", t, d)["value"] for d, t in panel["meta"]]
+    out = {"panel": panel, "base_prices": base, "feature_names": panel["feature_names"],
+           "universe": universe, "horizon_days": horizon_days,
+           "label_strategy": f"{LABEL_STRATEGY}(H={horizon_days}d)"}
+    if cache:
+        cache_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_p, "wb") as f:
+            pickle.dump(out, f)
+    return out
+
+
+def load_full_dataset(horizon_days: int = 1):
+    import pickle
+    p = ROOT / "runtime" / f"full_dataset_h{horizon_days}.pkl"
+    return pickle.load(open(p, "rb")) if p.exists() else None
+
+
+def make_labels(y, move: float = MOVE_THRESHOLD):
+    """Big-move 3-class labels: +1 up (>+move), -1 down (<-move), 0 neutral."""
+    import numpy as np
+    y = np.asarray(y, float)
+    return np.where(y > move, 1, np.where(y < -move, -1, 0))
+
+
+def rolling_windows(meta, horizon_days: int = 1, step_days: int = 10):
+    """Yield successive standardized 4wk-train / 2wk-dev windows across history
+    (purge = horizon between them). Each: {train_idx, dev_idx, train_range,
+    dev_range}. This is how up/down precision is measured across MANY regimes,
+    not one lucky/unlucky fortnight."""
+    dates = sorted({d for d, _ in meta})
+    span = TRAIN_DAYS + horizon_days + DEV_DAYS
+    out = []
+    start = 0
+    while start + span <= len(dates):
+        tr_dates = dates[start:start + TRAIN_DAYS]
+        dv_dates = dates[start + TRAIN_DAYS + horizon_days:
+                         start + TRAIN_DAYS + horizon_days + DEV_DAYS]
+        tr_set, dv_set = set(tr_dates), set(dv_dates)
+        tr = [i for i, (d, _) in enumerate(meta) if d in tr_set]
+        dv = [i for i, (d, _) in enumerate(meta) if d in dv_set]
+        out.append({"train_idx": tr, "dev_idx": dv,
+                    "train_range": [tr_dates[0], tr_dates[-1]],
+                    "dev_range": [dv_dates[0], dv_dates[-1]]})
+        start += step_days
+    return out
 
 
 # ═══════════════ Data prep: fixed 4wk-train / 2wk-dev window, full universe ═══════════════
