@@ -720,6 +720,10 @@ def _h_statements(scope, store, tid):
     if sh is not None:
         store.write("fundamental.shares_outstanding", scope, _today(), sh, trigger_id=tid); n += 1
     if st is not None:
+        # shares_outstanding travels WITH the statement at its publish_date, so S2 can
+        # read a PIT-correct market cap at any historical date (the standalone snapshot
+        # only accrues forward and is blank for older dates).
+        st = {**st, "shares_outstanding": sh}
         _typed().put("fundamentals", {                       # TYPED: line items as columns
             "ticker": scope, "publish_date": st["event_time"], "period_end": st.get("period_end"),
             "revenue": st.get("revenue"), "net_income": st.get("net_income"),

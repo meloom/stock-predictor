@@ -146,14 +146,19 @@ def fundamental_ratios(price: float | None, shares: float | None,
     ratios (roe, margins, fcf_yield) are consistent across tickers, so they
     rank correctly cross-sectionally even though they aren't annualized."""
     s = statements or {}
-    a = analyst or {}
     equity = s.get("total_equity")
+    ni = s.get("net_income")
+    # shares: prefer the value that travels PIT-correctly WITH the statement; fall back
+    # to the standalone snapshot. (Fixes market_cap being blank at historical dates.)
+    shares = shares or s.get("shares_outstanding")
     market_cap = price * shares if (price and shares) else None
     bvps = _div(equity, shares)
     return {
         "fund.market_cap": market_cap,
         "fund.book_to_price": _div(bvps, price),
-        "fund.earnings_yield": _div(a.get("trailing_eps"), price),
+        # earnings yield = E/P = net_income / market_cap (== EPS/price, but robust: EPS
+        # wasn't reliably available). analyst.trailing_eps was always absent -> None.
+        "fund.earnings_yield": _div(ni, market_cap),
         "fund.fcf_yield": _div(s.get("free_cash_flow"), market_cap),
         "fund.roe": _div(s.get("net_income"), equity),
         "fund.gross_profitability": _div(s.get("gross_profit"), s.get("total_assets")),

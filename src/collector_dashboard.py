@@ -370,7 +370,8 @@ details{margin:0 0 12px}summary{cursor:pointer;font-size:12px;color:var(--accent
 _STEPS = [
     ("S1", "Data Collection", "/data-collection", True,
      "Queue-driven collector: backfill progress, freshness heatmap, per-ticker×signal drill-down."),
-    ("S2", "Signals", None, False, "Engineered features from the collected data."),
+    ("S2", "Signal Processing", "/signal-processing", True,
+     "Feature lineage S1→S2→S3→S4, coverage, and the gaps: collected data not yet turned into features."),
     ("S3", "Predictors", None, False, "Model training, precision@k, champion registry."),
     ("S4", "Alpha", None, False, "Regime gate, event risk, position signals."),
     ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
@@ -416,6 +417,114 @@ def _page(report, tickers, auto_refresh=0):
             + render(report, tickers) + '</body></html>')
 
 
+def render_s2(rep: dict) -> str:
+    UNIV = 109
+    groups = rep["groups"]
+    total_feats = rep["s2_feature_count"]
+    produced = sum(1 for g in groups for f in g["features"] if f["scopes"] > 0)
+    gaps = rep["gaps"]
+    n_missing = sum(1 for g in gaps if g["severity"] == "missing")
+
+    cards = [("S2 features", f'{produced}/{total_feats}', "produced (≥1 ticker)"),
+             ("Feature groups", f'{len(groups)}', "lineage families"),
+             ("Gaps", f'{len(gaps)}', f'{n_missing} missing · {len(gaps)-n_missing} unused'),
+             ("Universe", f'{UNIV}', "target tickers/feature")]
+    card_html = "".join(f'<div class="card"><div class="eyebrow">{t}</div>'
+                        f'<div class="metric">{v}</div><div class="sub">{s}</div></div>'
+                        for t, v, s in cards)
+
+    # lineage groups — each with per-feature coverage
+    grp = ""
+    for g in groups:
+        warn = "⚠" in g["consumer"]
+        head = (f'<tr class="grphead"><td colspan="4"><span class="gname">{g["group"]}</span>'
+                f'<span class="gflow"><b>from</b> {g["derived_from"]} &nbsp;<b>→</b> '
+                f'<span class="{"gwarn" if warn else "gto"}">{g["consumer"]}</span></span></td></tr>')
+        rows = ""
+        for f in g["features"]:
+            pct = round(100 * f["scopes"] / UNIV)
+            cls = "ok" if pct >= 90 else ("run" if pct > 0 else "warn")
+            fresh = f'{f["fresh_h"]}h' if f["fresh_h"] is not None else "—"
+            rows += (f'<tr><td class="mono feat">{f["feature"]}</td>'
+                     f'<td class="barcell">{_bar(pct, cls)}</td>'
+                     f'<td class="mono num">{f["scopes"]}/{UNIV}</td>'
+                     f'<td class="mono muted">{(f["latest"] or "—")[:10]} · {fresh}</td></tr>')
+        grp += head + rows
+
+    # downstream contract
+    con = ""
+    for consumer, feats in rep["contract"].items():
+        ok = sum(1 for f in feats if f["produced"])
+        con += (f'<tr class="grphead"><td colspan="3"><span class="gname">{consumer}</span>'
+                f'<span class="gflow">{ok}/{len(feats)} inputs produced</span></td></tr>')
+        for f in feats:
+            mark = ('<span class="tag done">produced</span>' if f["produced"]
+                    else '<span class="tag err">absent</span>')
+            con += (f'<tr><td class="mono feat">{f["feature"]}</td><td>{mark}</td>'
+                    f'<td class="mono muted">{f["scopes"]} tickers</td></tr>')
+
+    # gaps
+    gp = ""
+    for g in gaps:
+        sev = ("crit" if g["severity"] == "missing" else "warn")
+        gp += (f'<div class="gap"><div class="gaptop"><span class="mono gsig">{g["signal"]}</span>'
+               f'<span class="chip {sev}">{g["severity"]}</span>'
+               f'<span class="muted">· S1 has {g["s1_tickers"]} tickers of data</span></div>'
+               f'<div class="gapissue">{g["issue"]}</div>'
+               f'<div class="gapfix"><b>proposed:</b> {g["proposed"]}</div></div>')
+
+    steps = ('<div class="flow"><span class="fstep done">S1 collect</span>→'
+             '<span class="fstep cur">S2 process</span>→'
+             '<span class="fstep">S3 predict</span>→<span class="fstep">S4 alpha</span></div>')
+    return f"""{_CSS}
+<style>
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:10px 0 4px;color:var(--mut)}}
+.fstep{{padding:3px 10px;border:1px solid var(--line);border-radius:16px}}
+.fstep.done{{color:var(--fresh);border-color:color-mix(in srgb,var(--fresh) 40%,transparent)}}
+.fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
+.grphead td{{padding-top:16px;border-bottom:1px solid var(--line)}}
+.gname{{font-weight:660;font-size:13px;margin-right:12px}}
+.gflow{{font-size:12px;color:var(--mut)}}.gflow b{{color:var(--fg);font-weight:600}}
+.gto{{color:var(--fresh)}}.gwarn{{color:#c9930b;font-weight:600}}
+.feat{{font-size:12.5px}}.gap{{border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:10px}}
+.gaptop{{display:flex;align-items:center;gap:10px;margin-bottom:6px}}
+.gsig{{font-weight:640}}.gapissue{{font-size:13px;line-height:1.5;margin-bottom:6px}}
+.gapfix{{font-size:12.5px;color:var(--mut)}}.gapfix b{{color:var(--accent)}}
+.chip.warn{{background:color-mix(in srgb,#c9930b 18%,transparent);color:#c9930b}}
+</style>
+<main>
+  <header>
+    <div class="brand"><span class="live"></span>S2 Signal Processing</div>
+    <div class="gen mono">live · {rep["generated_at"][:19].replace("T", " ")} UTC</div>
+  </header>
+  {steps}
+  <section class="cards">{card_html}</section>
+
+  <section class="panel"><h2>Feature lineage &amp; coverage
+    <span class="muted">— what each S2 feature is derived from, who consumes it, and how much of the universe is produced</span></h2>
+    <table class="queue"><thead><tr><th>Feature</th><th>Coverage</th><th>Tickers</th><th>Latest · fresh</th></tr></thead>
+    <tbody>{grp}</tbody></table>
+  </section>
+
+  <section class="panel"><h2>Downstream contract
+    <span class="muted">— every input S3/S4 declares, and whether S2 (or upstream) currently produces it</span></h2>
+    <table class="queue"><thead><tr><th>Required input</th><th>Status</th><th>Coverage</th></tr></thead>
+    <tbody>{con}</tbody></table>
+  </section>
+
+  <section class="panel"><h2>Gaps <span class="muted">— S1 data collected but not yet turned into a downstream-used S2 feature</span></h2>
+    {gp}
+  </section>
+</main>"""
+
+
+def _page_s2(rep):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>S2 Signal Processing</title></head><body>'
+            + render_s2(rep) + '</body></html>')
+
+
 def serve(port=8787):
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from urllib.parse import urlparse, parse_qs
@@ -438,6 +547,10 @@ def serve(port=8787):
                 ctype = "application/json"
             elif path == "/data-collection":          # THIS pipeline step's dashboard
                 payload = _page(col.coverage_report(), UNIVERSE, auto_refresh=0).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/signal-processing":        # S2 feature lineage + gaps
+                import pipeline_map
+                payload = _page_s2(pipeline_map.report()).encode()
                 ctype = "text/html; charset=utf-8"
             else:                                     # "/" index of all step dashboards
                 payload = _index_page().encode()
