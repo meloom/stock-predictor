@@ -38,7 +38,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core import FeatureStore, DEFAULT_DB, MARKET_SCOPE   # noqa: E402
 
 DAY = 86400
+BACKFILL_PRIORITY_BOOST = 1000   # backfill tasks run ahead of every routine refresh
 CREDENTIALS = Path.home() / ".credentials"
+# S1 kind -> its typed table (schema.py) for honest coverage/depth measurement.
+KIND_TABLE = {
+    "bars": "bars", "quote": "quotes", "macro": "macro", "short": "short_interest",
+    "implied_move": "options_implied", "earn_report": "earnings_reports",
+    "earn_date": "earnings_calendar", "insider": "insider_transactions",
+    "analyst_revisions": "analyst_revisions", "statements": "fundamentals",
+}
 
 _QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS collection_tasks (
@@ -99,13 +107,25 @@ class Collector:
         self.limits[source] = (limit, window_sec)
 
     def register_kind(self, kind, source, interval_sec, priority, handler,
-                      scope="ticker", est_calls=1, stage="S1"):
-        """Declare a data kind: its source, refresh cadence, priority, handler
-        fn(scope, store, trigger_id)->(n_rows, n_calls), scope type, API cost, and
-        the PIPELINE STAGE (S1 = raw collection, S2 = derived/processing, ...). The
-        data-collection dashboard shows S1; derived kinds belong to their stage."""
+                      scope="ticker", est_calls=1, stage="S1", backfill_days=90,
+                      mode="snapshot"):
+        """Declare a data kind: source, refresh cadence, priority, handler, scope,
+        API cost, pipeline STAGE (S1 raw / S2 derived), how far back to backfill
+        history on first collection (backfill_days), and the coverage MODE that says
+        how "done" is honestly measured:
+          history  — backfillable to depth (daily bars, macro): coverage = fraction
+                     of the expected trading-day window actually stored.
+          snapshot — source exposes only "now" (quote, short, analyst, next-earnings):
+                     cannot be backfilled; coverage = tickers with a current snapshot,
+                     and real history only accrues going forward.
+          rolling  — source returns a rolling list of past events (earnings reports,
+                     statements, revisions, insider txns): coverage = tickers covered
+                     plus the record count and date span actually held.
+        Declaring a kind is all it takes — reconcile() auto-enqueues its prioritized
+        backfill."""
         self.kinds[kind] = {"source": source, "interval": interval_sec, "priority": priority,
-                            "scope": scope, "est_calls": est_calls, "stage": stage}
+                            "scope": scope, "est_calls": est_calls, "stage": stage,
+                            "backfill_days": backfill_days, "mode": mode}
         self.handlers[(source, kind)] = handler
 
     # ── rate limiter (persistent, rolling window) ─────────────────────────────
@@ -165,6 +185,32 @@ class Collector:
             if k["scope"] != "market":
                 self.enqueue_backfill(kind, ticker)
 
+    def reconcile(self, tickers: list[str] | None = None) -> int:
+        """Declarative self-healing (replaces manual seed): ensure every declared
+        (kind, scope) has a task. A brand-new signal — or one that has never
+        successfully collected — is enqueued as a PRIORITIZED BACKFILL (priority
+        boosted below every routine refresh) so it's picked up first. Idempotent:
+        the daemon calls this on startup and on a timer, so registering a new kind
+        auto-backfills it with zero manual steps. Returns how many it (re)armed."""
+        tickers = tickers or list(UNIVERSE)
+        now = self._now().isoformat()
+        armed = 0
+        for kind, k in self.kinds.items():
+            scopes = [MARKET_SCOPE] if k["scope"] == "market" else tickers
+            bf_prio = k["priority"] - BACKFILL_PRIORITY_BOOST     # runs before all refreshes
+            for sc in scopes:
+                tid = f"{k['source']}:{kind}:{sc}"
+                row = self.c.execute("SELECT last_ok, status FROM collection_tasks WHERE task_id=?",
+                                     (tid,)).fetchone()
+                if row is None:                                  # brand-new signal/scope
+                    self._upsert(k["source"], kind, sc, bf_prio, k["interval"], now); armed += 1
+                elif row[0] is None and row[1] != "pending":     # never collected, not queued
+                    self.c.execute("UPDATE collection_tasks SET status='pending', priority=?, "
+                                   "next_due=?, last_error=NULL, updated_at=? WHERE task_id=?",
+                                   (bf_prio, now, now, tid)); armed += 1
+        self.c.commit()
+        return armed
+
     # ── worker ────────────────────────────────────────────────────────────────
     def tick(self):
         """Run at most one due task whose source has quota. Returns a summary
@@ -189,7 +235,10 @@ class Collector:
             try:
                 n_rows, n_calls = handler(scope, self.store, tid)
                 self._record_calls(source, n_calls)
-                self._reschedule(task_id, interval, now, n_rows)
+                # on success, restore the kind's BASE priority (a backfill task
+                # drops back to routine-refresh priority once it has data).
+                base_prio = self.kinds.get(kind, {}).get("priority")
+                self._reschedule(task_id, interval, now, n_rows, base_prio)
                 return {"task": task_id, "rows": n_rows, "calls": n_calls}
             except Exception as e:               # noqa: BLE001 — a failed call still cost quota
                 self._record_calls(source, 1)
@@ -211,22 +260,36 @@ class Collector:
                 done += 1
         return {"ran": done, "errors": errors}
 
-    def run_forever(self, sleep: float = 2.0):
+    def run_forever(self, sleep: float = 2.0, reconcile_every: float = 300):
+        """Daemon loop. Reconciles on startup and every `reconcile_every` seconds so
+        newly-declared kinds auto-backfill with no manual seed."""
+        try:
+            self.reconcile()
+        except Exception:                                    # noqa: BLE001
+            pass
+        last = self._now()
         while True:
+            if (self._now() - last).total_seconds() >= reconcile_every:
+                try:
+                    self.reconcile()
+                except Exception:                            # noqa: BLE001
+                    pass
+                last = self._now()
             if self.tick() is None:
                 time.sleep(sleep)
 
     # ── task state transitions ────────────────────────────────────────────────
-    def _reschedule(self, task_id, interval, now, n_rows):
+    def _reschedule(self, task_id, interval, now, n_rows, base_priority=None):
         nowi = now.isoformat()
+        prio = "" if base_priority is None else ", priority=%d" % base_priority
         if interval:
             nxt = (now + timedelta(seconds=interval)).isoformat()
-            self.c.execute("UPDATE collection_tasks SET status='pending', next_due=?, attempts=0, "
-                           "last_ok=?, last_error=NULL, updated_at=? WHERE task_id=?",
+            self.c.execute(f"UPDATE collection_tasks SET status='pending', next_due=?, attempts=0, "
+                           f"last_ok=?, last_error=NULL, updated_at=?{prio} WHERE task_id=?",
                            (nxt, nowi, nowi, task_id))
         else:
-            self.c.execute("UPDATE collection_tasks SET status='done', attempts=0, last_ok=?, "
-                           "updated_at=? WHERE task_id=?", (nowi, nowi, task_id))
+            self.c.execute(f"UPDATE collection_tasks SET status='done', attempts=0, last_ok=?, "
+                           f"updated_at=?{prio} WHERE task_id=?", (nowi, nowi, task_id))
         self.c.commit()
 
     def _backoff(self, task_id, attempts, now, err):
@@ -331,23 +394,51 @@ class Collector:
             except Exception:
                 return None
 
-        # per-kind queue progress. "collected" = succeeded (has last_ok AND no
-        # standing error) — an errored/disabled task does NOT count as collected,
-        # so the % reflects real coverage. Only S1 kinds show on this dashboard.
-        kinds = []
+        # per-kind queue aggregates (breadth / freshness / errors). "collected" =
+        # succeeded (has last_ok AND no standing error) — an errored task does NOT
+        # count. This is a PRESENCE signal; depth is measured separately below.
+        agg = {}
         for kind, total, collected, due, errs, last in self.c.execute(
                 "SELECT kind, COUNT(*), SUM(last_ok IS NOT NULL AND last_error IS NULL), "
                 "SUM(status='pending' AND next_due<=?), SUM(last_error IS NOT NULL), MAX(last_ok) "
                 "FROM collection_tasks GROUP BY kind", (nowi,)):
-            if self.kinds.get(kind, {}).get("stage", "S1") != "S1":
-                continue                                  # derived (S2+) — not data collection
-            kinds.append({"kind": kind, "source": self.kinds.get(kind, {}).get("source", "?"),
-                          "total": total, "collected": collected or 0, "due_now": due or 0,
-                          "errors": errs or 0, "pct": round(100 * (collected or 0) / total) if total else 0,
-                          "last_run_h": hours_since(last)})
-        # STABLE order (by collection priority, then name) — never reorder by progress,
-        # so rows don't jump around as the live page refreshes.
-        kinds.sort(key=lambda k: (self.kinds.get(k["kind"], {}).get("priority", 999), k["kind"]))
+            agg[kind] = {"total": total, "collected": collected or 0, "due": due or 0,
+                         "errors": errs or 0, "last": last}
+
+        # HONEST coverage vs EXPECTATION — measured per the kind's MODE, so a snapshot
+        # collected once is NOT reported the same as a fully backfilled daily series.
+        ts = _typed()
+        kinds = []
+        for kind, k in self.kinds.items():
+            if k.get("stage", "S1") != "S1":
+                continue                                  # derived (S2+) — not collection
+            a = agg.get(kind, {"total": 0, "collected": 0, "due": 0, "errors": 0, "last": None})
+            mode, table = k.get("mode", "snapshot"), KIND_TABLE.get(kind)
+            want = max(1, round(k.get("backfill_days", 90) * 5 / 7))   # trading days in window
+            breadth = round(100 * a["collected"] / a["total"]) if a["total"] else 0
+            e = {"kind": kind, "source": k.get("source", "?"), "mode": mode,
+                 "total": a["total"], "collected": a["collected"], "due_now": a["due"],
+                 "errors": a["errors"], "last_run_h": hours_since(a["last"])}
+            if mode == "history" and table:
+                d = ts.depth(table, cap=want)
+                ents = d["entities"] if k["scope"] == "market" else max(a["total"], d["entities"])
+                denom = (ents or 1) * want
+                e.update(pct=min(100, round(100 * d["capped_sum"] / denom)) if denom else 0,
+                         detail=f'{d["median"]}/{want} trading days deep · {d["entities"]} entities',
+                         expect=f'~{want} trading days of daily history (backfillable)')
+            elif mode == "rolling" and table:
+                cov = ts.coverage(table)
+                span = f'{(cov["first"] or "?")[:10]}→{(cov["last"] or "?")[:10]}'
+                e.update(pct=breadth,
+                         detail=f'{a["collected"]}/{a["total"]} tickers · {cov["rows"]} records · {span}',
+                         expect='rolling event history (as far back as the source returns)')
+            else:                                          # snapshot — accrues forward only
+                e.update(pct=breadth,
+                         detail=f'{a["collected"]}/{a["total"]} tickers · snapshot, history accrues forward',
+                         expect='current snapshot only — no back-history from this source')
+            kinds.append(e)
+        # STABLE order (by collection priority, then name) — never reorder by progress.
+        kinds.sort(key=lambda e: (self.kinds.get(e["kind"], {}).get("priority", 999), e["kind"]))
 
         # per-signal store coverage — only S1 RAW-collected features (derived S2+
         # signals belong to their own stage's dashboard).
@@ -391,9 +482,18 @@ class Collector:
         total_rows = self.c.execute("SELECT COUNT(*) FROM feature_values").fetchone()[0]
         all_total = sum(k["total"] for k in kinds)
         all_done = sum(k["collected"] for k in kinds)
+        # honest headline: average of the per-kind coverage-vs-expectation %, NOT
+        # "every task ran once". full = kinds actually at 100% of their expectation.
+        avg_pct = round(sum(k["pct"] for k in kinds) / len(kinds)) if kinds else 0
+        by_mode = {}
+        for k in kinds:
+            by_mode.setdefault(k["mode"], []).append(k["pct"])
         return {"generated_at": nowi, "quota": self.status()["quota"],
                 "overall": {"tasks": all_total, "collected": all_done,
-                            "pct": round(100 * all_done / all_total) if all_total else 0,
+                            "pct": avg_pct,
+                            "kinds_full": sum(1 for k in kinds if k["pct"] >= 100),
+                            "kinds_total": len(kinds),
+                            "by_mode": {m: round(sum(v) / len(v)) for m, v in by_mode.items()},
                             "data_points": total_rows, "due_now": self.status()["due_now"]},
                 "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix,
                 "queue": queue}
@@ -833,17 +933,17 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
     col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
     # kind, source, interval, priority, handler, scope, est_calls
-    col.register_kind("macro", "yfinance", DAY, 10, _h_macro, scope="market", est_calls=3)
-    col.register_kind("bars", "polygon", DAY, 20, _h_bars_polygon, est_calls=1)  # reliable vs yfinance throttle
-    col.register_kind("implied_move", "polygon", DAY, 25, _h_implied_move, est_calls=4)
-    col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1)
-    col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1)
-    col.register_kind("analyst_revisions", "yfinance", DAY, 41, _h_analyst_revisions, est_calls=1)
-    col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1)
-    col.register_kind("insider", "yfinance", 3 * DAY, 44, _h_insider, est_calls=1)
-    col.register_kind("earn_date", "yfinance", DAY, 45, _h_earn_date, est_calls=1)   # RAW next-earnings date/time
-    col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1)
-    col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1)
+    col.register_kind("macro", "yfinance", DAY, 10, _h_macro, scope="market", est_calls=3, mode="history")
+    col.register_kind("bars", "polygon", DAY, 20, _h_bars_polygon, est_calls=1, mode="history")  # reliable vs yfinance throttle
+    col.register_kind("implied_move", "polygon", DAY, 25, _h_implied_move, est_calls=4, mode="snapshot")
+    col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1, mode="snapshot")
+    col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1, mode="snapshot")
+    col.register_kind("analyst_revisions", "yfinance", DAY, 41, _h_analyst_revisions, est_calls=1, mode="rolling")
+    col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1, mode="snapshot")
+    col.register_kind("insider", "yfinance", 3 * DAY, 44, _h_insider, est_calls=1, mode="rolling")
+    col.register_kind("earn_date", "yfinance", DAY, 45, _h_earn_date, est_calls=1, mode="snapshot")   # RAW next-earnings date/time
+    col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1, mode="rolling")
+    col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1, mode="rolling")
     # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
     # they don't show on the data-collection dashboard. Each reads raw S1 data.
     col.register_kind("earn_analysis", "process", DAY, 55, _h_earn_analysis, est_calls=1, stage="S2")
@@ -871,15 +971,17 @@ def _cli():
     ap = argparse.ArgumentParser(description="S1 queue-driven collector")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("seed")
+    sub.add_parser("reconcile")
     p_add = sub.add_parser("add-ticker"); p_add.add_argument("ticker")
     p_dr = sub.add_parser("drain"); p_dr.add_argument("--seconds", type=float, default=55)
     sub.add_parser("run")
     sub.add_parser("status")
     args = ap.parse_args()
     col = default_collector()
-    if args.cmd == "seed":
-        from universe import UNIVERSE
-        col.seed(UNIVERSE); print(json.dumps(col.status(), indent=2, default=str))
+    if args.cmd in ("seed", "reconcile"):
+        n = col.reconcile()
+        print(f"reconciled: armed {n} prioritized backfill task(s)")
+        print(json.dumps(col.status(), indent=2, default=str))
     elif args.cmd == "add-ticker":
         col.add_ticker(args.ticker.upper()); print(f"enqueued backfill for {args.ticker.upper()}")
     elif args.cmd == "drain":

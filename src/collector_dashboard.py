@@ -67,7 +67,10 @@ def _due_label(q):
 def render(report: dict, tickers: list[str]) -> str:
     o = report["overall"]; cols = report["matrix_cols"]; mat = report["matrix"]
     quota = "".join(f'<span class="pill"><b>{s}</b> {v}</span>' for s, v in report["quota"].items())
-    cards = [("Backfill", f'{o["pct"]}%', f'{o["collected"]:,}/{o["tasks"]:,} tasks collected'),
+    bm = o.get("by_mode", {})
+    mode_sub = " · ".join(f'{m} {p}%' for m, p in sorted(bm.items())) or "—"
+    cards = [("Coverage vs expected", f'{o["pct"]}%',
+              f'{o.get("kinds_full", 0)}/{o.get("kinds_total", 0)} signals fully covered · {mode_sub}'),
              ("Data points", f'{o["data_points"]:,}', "rows in the store"),
              ("Due now", f'{o["due_now"]:,}', "tasks ready to run"),
              ("Signals live", f'{len(report["signals"])}', "features with data")]
@@ -75,15 +78,20 @@ def render(report: dict, tickers: list[str]) -> str:
                         f'<div class="metric">{v}</div><div class="sub">{s}</div></div>'
                         for t, v, s in cards)
 
+    # mode → how to read the bar. history is a true depth %; snapshot/rolling bars
+    # measure BREADTH (tickers covered), never "history complete" — the chip says so.
+    MODE_CLS = {"history": "hist", "snapshot": "snap", "rolling": "roll"}
     qrows = ""
     for k in report["kinds"]:
-        cls = "warn" if k["errors"] else ("ok" if k["pct"] == 100 else "run")
+        mode = k.get("mode", "snapshot")
+        cls = "warn" if k["errors"] else MODE_CLS.get(mode, "run")
         last = f'{k["last_run_h"]}h ago' if k["last_run_h"] is not None else "—"
         err = f'<span class="chip crit">{k["errors"]} err</span>' if k["errors"] else ""
         due = f'<span class="chip">{k["due_now"]} due</span>' if k["due_now"] else ""
-        qrows += (f'<tr><td class="mono kind">{k["kind"]}</td><td class="src">{k["source"]}</td>'
+        chip = f'<span class="mchip {MODE_CLS.get(mode,"run")}" title="{k.get("expect","")}">{mode}</span>'
+        qrows += (f'<tr><td class="mono kind">{k["kind"]} {chip}</td><td class="src">{k["source"]}</td>'
                   f'<td class="barcell">{_bar(k["pct"], cls)}</td>'
-                  f'<td class="mono num">{k["collected"]}/{k["total"]}</td>'
+                  f'<td class="detail muted">{k.get("detail","")}</td>'
                   f'<td>{due}{err}</td><td class="mono muted">{last}</td></tr>')
 
     # heatmap with per-cell time detail in the tooltip
@@ -142,9 +150,12 @@ def render(report: dict, tickers: list[str]) -> str:
   <section class="cards">{card_html}</section>
   <section class="quota"><span class="lbl">Rate-limit quota</span>{quota}</section>
 
-  <section class="panel"><h2>Queue &amp; backfill progress</h2>
-    <table class="queue"><thead><tr><th>Kind</th><th>Source</th><th>Progress</th>
-    <th>Collected</th><th>State</th><th>Last run</th></tr></thead><tbody>{qrows}</tbody></table>
+  <section class="panel"><h2>Coverage vs expectation
+    <span class="muted">— <b class="hist">history</b> = % of the expected daily window backfilled ·
+    <b class="snap">snapshot</b> = tickers with a current value (history accrues forward, not backfillable) ·
+    <b class="roll">rolling</b> = tickers covered by the source's event history</span></h2>
+    <table class="queue"><thead><tr><th>Kind</th><th>Source</th><th>Coverage</th>
+    <th>What we hold vs. expected</th><th>State</th><th>Last run</th></tr></thead><tbody>{qrows}</tbody></table>
   </section>
 
   <section class="panel"><h2>Coverage &amp; freshness <span class="muted">— {len(shown)} tickers × {len(cols)} signals · hover a cell for counts &amp; date span</span></h2>
@@ -272,6 +283,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .bar{display:inline-block;width:calc(100% - 46px);height:7px;border-radius:4px;background:var(--miss);vertical-align:middle;overflow:hidden}
 .fill{display:block;height:100%;border-radius:4px;background:var(--accent)}
 .fill.ok{background:var(--fresh)}.fill.warn{background:var(--stale)}.fill.run{background:var(--accent)}
+/* mode-colored fills: history=green depth, snapshot=amber breadth, rolling=blue breadth */
+.fill.hist{background:var(--fresh)}.fill.snap{background:#c9930b}.fill.roll{background:#3b82c4}
+b.hist,.mchip.hist{color:var(--fresh)}b.snap,.mchip.snap{color:#c9930b}b.roll,.mchip.roll{color:#3b82c4}
+.mchip{font-family:ui-monospace,monospace;font-size:10px;padding:1px 6px;border-radius:5px;margin-left:6px;
+  border:1px solid currentColor;opacity:.85;text-transform:uppercase;letter-spacing:.4px}
+td.detail{font-size:12px;color:var(--mut);max-width:340px}
 .pct{display:inline-block;width:40px;text-align:right;font-family:ui-monospace,monospace;font-size:12px;color:var(--mut)}
 .chip{font-family:ui-monospace,monospace;font-size:11px;padding:2px 7px;border-radius:6px;background:var(--miss);color:var(--mut);margin-right:5px}
 .chip.crit{background:color-mix(in srgb,var(--stale) 18%,transparent);color:var(--stale)}

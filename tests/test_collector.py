@@ -129,6 +129,31 @@ def test_earnings_processing_depends_on_raw(col):
     assert round(ana["revenue_yoy_pct"], 1) == 16.8
 
 
+def test_reconcile_auto_backfills_new_kind_as_prioritized(col):
+    """Declaring a new kind + reconcile() must auto-enqueue a PRIORITIZED backfill
+    task for it (no manual seed), at a priority band below every routine refresh."""
+    col.register_kind("newsig", "fake", interval_sec=3600, priority=30,
+                      handler=lambda s, st, t: (1, 1))
+    armed = col.reconcile(tickers=["AAA", "BBB"])
+    assert armed >= 2
+    pr, st = col.c.execute("SELECT priority, status FROM collection_tasks "
+                           "WHERE task_id='fake:newsig:AAA'").fetchone()
+    assert pr == 30 - 1000 and st == "pending"          # backfill band, ready to run
+    # idempotent: a second reconcile does not re-arm already-queued tasks
+    assert col.reconcile(tickers=["AAA", "BBB"]) == 0
+
+
+def test_backfill_priority_restores_to_base_after_success(col):
+    """Once a backfill collects, the task drops back to its routine-refresh priority."""
+    col.register_kind("newsig", "fake", interval_sec=3600, priority=30,
+                      handler=lambda s, st, t: (1, 1))
+    col._upsert("fake", "newsig", "AAA", 30 - 1000, 3600, col.clock().isoformat())
+    col.tick()                                          # runs the boosted backfill
+    p = col.c.execute("SELECT priority FROM collection_tasks "
+                      "WHERE task_id='fake:newsig:AAA'").fetchone()[0]
+    assert p == 30                                      # restored to routine refresh
+
+
 def test_status_reports_quota_and_counts(col):
     col.seed(["AAPL", "MSFT"])
     col.tick()

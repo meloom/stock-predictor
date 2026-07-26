@@ -118,6 +118,23 @@ class TypedStore:
     def count(self, table: str) -> int:
         return self.c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
+    def depth(self, table: str, cap: int | None = None) -> dict:
+        """Per-entity history DEPTH: distinct timestamps stored per entity. Used to
+        measure real coverage vs an expected window (a snapshot collected once has
+        depth 1; a fully backfilled daily series has depth ≈ trading days). `cap`
+        clips each entity's contribution to the expected depth so `capped_sum`
+        divided by (entities × cap) is an honest 'how full is the window' fraction."""
+        ent = "name" if table == "macro" else "ticker"
+        ts = SCHEMA[table][0]
+        counts = [r[0] for r in self.c.execute(
+            f"SELECT COUNT(DISTINCT {ts}) FROM {table} GROUP BY {ent}")]
+        if not counts:
+            return {"entities": 0, "median": 0, "max": 0, "total": 0, "capped_sum": 0}
+        counts.sort()
+        capped = sum(min(c, cap) for c in counts) if cap else sum(counts)
+        return {"entities": len(counts), "median": counts[len(counts) // 2],
+                "max": counts[-1], "total": sum(counts), "capped_sum": capped}
+
     def coverage(self, table: str) -> dict:
         ts_col = SCHEMA[table][0]
         ent = "name" if table == "macro" else "ticker"
