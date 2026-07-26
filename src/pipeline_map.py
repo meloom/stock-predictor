@@ -435,6 +435,176 @@ def model_detail(model: str, category: str = "", db_path=DEFAULT_DB) -> dict:
             "curve": curve, "top_errors": errs}
 
 
+def alpha_report(ticker: str, db_path=DEFAULT_DB) -> dict:
+    """A single-name ALPHA REPORT assembled from our real S1/S2/S3/S4 signals — the
+    structure in docs/alpha-report/README.md. Sections with pending inputs (per-ticker
+    predictor, sector, beta) are flagged, not faked."""
+    import json
+    ticker = (ticker or "").upper()
+    c = sqlite3.connect(Path(db_path))
+
+    def latest(feat, scope=None):
+        r = c.execute("SELECT event_time, value FROM feature_values WHERE feature=? AND scope=? "
+                      "ORDER BY event_time DESC, ingested_at DESC LIMIT 1",
+                      (feat, scope or ticker)).fetchone()
+        if not r:
+            return None, None
+        v = r[1]
+        if isinstance(v, str) and v[:1] in "{[":
+            try:
+                v = json.loads(v)
+            except Exception:
+                pass
+        else:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                pass
+        return r[0], v
+
+    asof, price = latest("price.close")
+    date = asof
+
+    def pctile(feat, invert=False):
+        """Cross-sectional percentile of `ticker` for `feat` on `date` (0..1)."""
+        rows = c.execute("SELECT scope, value FROM feature_values WHERE feature=? AND event_time=? "
+                         "GROUP BY scope", (feat, date)).fetchall()
+        vals, mine = [], None
+        for sc, v in rows:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            vals.append((sc, fv))
+            if sc == ticker:
+                mine = fv
+        if mine is None or len(vals) < 5:
+            return None
+        below = sum(1 for _, v in vals if v < mine)
+        p = below / (len(vals) - 1)
+        return round(1 - p if invert else p, 3)
+
+    # ── factor decomposition (percentile vs universe) ──
+    factors = [
+        ("Value", pctile("fund.earnings_yield"), "cheap vs peers (E/P, FCF/P)"),
+        ("Quality", pctile("fund.roe"), "ROE + gross-profitability"),
+        ("Momentum", pctile("tech.mom20"), "20d price momentum"),
+        ("Low-vol", pctile("tech.hvol20", invert=True), "inverse realized vol"),
+        ("Size", pctile("fund.market_cap"), "market cap (large→high)"),
+    ]
+    # blend the two value/quality legs
+    v2 = pctile("fund.fcf_yield"); q2 = pctile("fund.gross_profitability")
+    if factors[0][1] is not None and v2 is not None:
+        factors[0] = ("Value", round((factors[0][1] + v2) / 2, 3), factors[0][2])
+    if factors[1][1] is not None and q2 is not None:
+        factors[1] = ("Quality", round((factors[1][1] + q2) / 2, 3), factors[1][2])
+    fscore = [f[1] for f in factors[:4] if f[1] is not None]      # value/quality/mom/lowvol
+    factor_score = round(sum(fscore) / len(fscore), 3) if fscore else None
+
+    # ── catalysts ──
+    _, nx = latest("earnings.next_date")
+    dte = None
+    try:
+        from datetime import date as _d
+        nd = (nx or {}).get("next_earnings", "")[:10]
+        if nd:
+            dte = (_d.fromisoformat(nd) - _d.fromisoformat(date)).days
+    except Exception:
+        pass
+    _, impl = latest("opt.implied_move")
+    import schema
+    ts = schema.TypedStore(db_path)
+
+    def _typed_rows(table, days):
+        col = {"insider_transactions": "txn_date", "analyst_revisions": "revision_date"}[table]
+        cut = None
+        try:
+            from datetime import date as _d, timedelta
+            cut = (_d.fromisoformat(date) - timedelta(days=days)).isoformat()
+        except Exception:
+            pass
+        q = f"SELECT * FROM {table} WHERE ticker=?" + (f" AND {col} >= '{cut}'" if cut else "")
+        cols = [d[1] for d in ts.c.execute(f"PRAGMA table_info({table})")]
+        return [dict(zip(cols, r)) for r in ts.c.execute(q, (ticker,))]
+
+    rev = _typed_rows("analyst_revisions", 90)
+    rev_net = sum(1 for r in rev if (r.get("action") or "").lower() in ("up", "upgrade")) \
+        - sum(1 for r in rev if (r.get("action") or "").lower() in ("down", "downgrade"))
+    ins = _typed_rows("insider_transactions", 90)
+    ins_net = sum((r.get("value") or 0) * (-1 if r.get("is_sale") else 1) for r in ins)
+
+    # ── valuation + positioning ──
+    _, an = latest("fundamental.analyst_snapshot")
+    an = an if isinstance(an, dict) else {}
+    tgt = an.get("target_mean_price")
+    upside = round(tgt / price - 1, 3) if (tgt and price) else None
+    _, spf = latest("short.pct_float"); _, dtc = latest("short.days_to_cover")
+    _, er = latest("alpha.event_risk"); _, reg = latest("alpha.regime", "_market")
+    _, vix = latest("macro.vix", "_market"); _, breadth = latest("regime.breadth5", "_market")
+    _, hvol = latest("tech.hvol20")
+    _, surp = latest("earnings.report_raw")
+    surprise = (surp or {}).get("surprise_pct") if isinstance(surp, dict) else None
+
+    # ── recorded predictor efficacy for the driving 1d horizon ──
+    try:
+        cats = predictor_report(db_path)["categories"]
+        h1 = next((x for x in cats if x["key"] == "h1" and x["built"]), None)
+        eff = ({"production": h1["production"],
+                "down@1": next((m["down1"] for m in h1["models"] if m["production"]), None),
+                "up@1": next((m["up1"] for m in h1["models"] if m["production"]), None)}
+               if h1 else None)
+    except Exception:
+        eff = None
+
+    # ── composite action (transparent heuristic + hard gates) ──
+    er_level = (er or {}).get("level")
+    reg_decision = (reg or {}).get("decision")
+    near_high = None
+    _, dh = latest("xh.dist_hi252")
+    if dh is not None:
+        near_high = dh >= -0.02
+    if reg_decision == "CASH":
+        action, why = "STAND DOWN", "market regime is risk-off (CASH gate)"
+    elif er_level == "HIGH":
+        action, why = "AVOID", "earnings/event imminent — high event risk"
+    elif factor_score is not None and factor_score >= 0.7:
+        action, why = "LONG CANDIDATE", "strong factor tilt (value/quality/momentum)"
+    elif near_high and (hvol or 0) > 0.03:
+        action, why = "CRASH-WATCH", "extended near 52w high + elevated vol (error-analysis pattern)"
+    elif factor_score is not None and factor_score <= 0.3:
+        action, why = "AVOID / SHORT-LEAN", "weak factor tilt"
+    else:
+        action, why = "NEUTRAL", "no strong edge in the signals"
+
+    gaps = ["sector/industry classification (for sector-neutral factors & peers)",
+            "predicted beta & factor betas (computable from bars — not yet in S2)",
+            "per-ticker calibrated prediction (deploy the 1d/3d/5d/7d champions)",
+            "institutional ownership / 13F", "bid/ask spread for a cost model",
+            "NLP over sec_filings/transcripts (guidance tone, surprise-vs-narrative)"]
+
+    return {"generated_at": datetime.now(timezone.utc).isoformat(), "ticker": ticker,
+            "as_of": asof, "price": price, "sector": None,
+            "regime": {"vix": vix, "breadth": breadth, "decision": reg_decision,
+                       "score": (reg or {}).get("score")},
+            "action": action, "why": why, "factor_score": factor_score,
+            "factors": [{"name": n, "pct": p, "note": d} for n, p, d in factors],
+            "catalysts": {"days_to_earnings": dte, "next_earnings": (nx or {}).get("next_earnings"),
+                          "analyst_rev_net_90d": rev_net, "insider_net_90d_usd": round(ins_net),
+                          "implied_move": impl, "last_surprise_pct": surprise},
+            "valuation": {k: latest(f"fund.{k}")[1] for k in
+                          ("earnings_yield", "fcf_yield", "book_to_price", "roe",
+                           "net_margin", "gross_profitability", "market_cap")},
+            "valuation_ranks": {k: pctile(f"fund.{k}") for k in
+                                ("earnings_yield", "fcf_yield", "roe", "gross_profitability")},
+            "risk": {"hvol20": hvol, "event_risk": er, "short_pct_float": spf,
+                     "days_to_cover": dtc, "near_52w_high": near_high, "beta": None},
+            "positioning": {"short_pct_float": spf, "insider_net_90d_usd": round(ins_net),
+                            "target_price": tgt, "upside_to_target": upside,
+                            "recommendation_mean": an.get("recommendation_mean"),
+                            "n_analysts": an.get("n_analysts"), "rev_net_90d": rev_net},
+            "efficacy": eff, "gaps": gaps}
+
+
 def _step_of(feature: str) -> str:
     if feature.startswith("alpha."):
         return "S4 · Alpha"

@@ -374,7 +374,8 @@ _STEPS = [
      "Feature lineage S1→S2→S3→S4, coverage, and the gaps: collected data not yet turned into features."),
     ("S3", "Predictors", "/predictors", True,
      "Multi-horizon predictor models, OOS skill (IC / hit-rate), confidence intervals, production status."),
-    ("S4", "Alpha", None, False, "Regime gate, event risk, position signals."),
+    ("S4", "Alpha Report", "/alpha", True,
+     "Per-stock alpha report: factors, catalysts, valuation, risk, positioning, predictor efficacy."),
     ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
     ("↳", "Single Stock", "/single-stock", True,
      "One ticker across every step: all S1→S4 signals + the full raw collected rows."),
@@ -754,7 +755,7 @@ def render_single_stock(graph: dict, tickers: list) -> str:
 
 def _flow_nav(current):
     steps = [("S1", "/data-collection"), ("S2", "/signal-processing"),
-             ("S3 predictors", "/predictors"), ("S4 alpha", None)]
+             ("S3 predictors", "/predictors"), ("S4 alpha", "/alpha")]
     out = ['<a class="fstep home" href="/">☰ dashboards</a>']
     for i, (name, href) in enumerate(steps):
         cls = "fstep cur" if name.startswith(current) else "fstep"
@@ -865,6 +866,119 @@ function modelDetail(row){{
 </script>"""
 
 
+def render_alpha(rep: dict, tickers: list) -> str:
+    tk = rep["ticker"]
+    opts = "".join(f'<option{" selected" if t == tk else ""}>{t}</option>' for t in tickers)
+    ACT_CLS = {"LONG CANDIDATE": "fresh", "AVOID": "stale", "AVOID / SHORT-LEAN": "stale",
+               "CRASH-WATCH": "amber", "STAND DOWN": "amber", "NEUTRAL": "mut"}
+
+    def pct(x, d=1):
+        return "—" if x is None else f"{x * 100:.{d}f}%"
+
+    def sig(x, d=3):
+        return "—" if x is None else f"{x:.{d}f}"
+
+    def bar(p):
+        p = p or 0
+        col = "var(--fresh)" if p >= 0.66 else ("#c9930b" if p >= 0.33 else "var(--stale)")
+        return (f'<div class="fbar"><span style="width:{p*100:.0f}%;background:{col}"></span></div>'
+                f'<span class="fp">{p*100:.0f}</span>')
+
+    fac = "".join(f'<tr><td class="mono">{f["name"]}</td><td class="barcell">{bar(f["pct"])}</td>'
+                  f'<td class="mono muted">{f["note"]}</td></tr>' for f in rep["factors"])
+    cat = rep["catalysts"]; risk = rep["risk"]; pos = rep["positioning"]; val = rep["valuation"]
+    vr = rep["valuation_ranks"]; reg = rep["regime"]; eff = rep["efficacy"]
+
+    def money(x):
+        if x is None:
+            return "—"
+        a = abs(x)
+        return f'{"−" if x<0 else ""}${a/1e9:.1f}B' if a >= 1e9 else f'{"−" if x<0 else ""}${a/1e6:.1f}M'
+
+    catrows = [("Days to earnings", cat["days_to_earnings"], "event proximity"),
+               ("Options implied move", pct(cat["implied_move"]), "expected earnings move"),
+               ("Last EPS surprise", pct((cat["last_surprise_pct"] or 0) / 100, 1) if cat["last_surprise_pct"] else "—", "beat/miss"),
+               ("Analyst revisions 90d", f'{cat["analyst_rev_net_90d"]:+d}', "net up−down"),
+               ("Insider net 90d", money(cat["insider_net_90d_usd"]), "buy(+) / sell(−)")]
+    riskrows = [("Realized vol (20d)", pct(risk["hvol20"], 2), ""),
+                ("Event risk", (risk["event_risk"] or {}).get("level", "—"), "earnings proximity"),
+                ("Short % float", pct(risk["short_pct_float"]), "crowding"),
+                ("Days to cover", sig(risk["days_to_cover"], 1), "squeeze fuel"),
+                ("Near 52w high", "yes" if risk["near_52w_high"] else "no", "extension"),
+                ("Predicted beta", "— (gap)", "collectible from bars")]
+    posrows = [("Analyst target", f'${pos["target_price"]:.0f}' if pos["target_price"] else "—",
+                f'upside {pct(pos["upside_to_target"])}'),
+               ("Recommendation", sig(pos["recommendation_mean"], 2), f'{pos["n_analysts"] or "—"} analysts'),
+               ("Insider net 90d", money(pos["insider_net_90d_usd"]), ""),
+               ("Short % float", pct(pos["short_pct_float"]), "")]
+    valrows = [("Earnings yield", pct(val["earnings_yield"], 2), pct(vr["earnings_yield"]) + " pctile"),
+               ("FCF yield", pct(val["fcf_yield"], 2), pct(vr["fcf_yield"]) + " pctile"),
+               ("ROE", pct(val["roe"], 1), pct(vr["roe"]) + " pctile"),
+               ("Gross profitability", pct(val["gross_profitability"], 1), pct(vr["gross_profitability"]) + " pctile"),
+               ("Net margin", pct(val["net_margin"], 1), ""),
+               ("Market cap", money(val["market_cap"]), "")]
+
+    def tbl(rows):
+        return "".join(f'<tr><td class="mono lbl">{a}</td><td class="mono val"><b>{b}</b></td>'
+                       f'<td class="mono muted">{d}</td></tr>' for a, b, d in rows)
+
+    gaps = "".join(f'<li>{g}</li>' for g in rep["gaps"])
+    act_cls = ACT_CLS.get(rep["action"], "mut")
+
+    return f"""{_CSS}
+<style>
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:12px 0;flex-wrap:wrap}}
+.fstep{{padding:4px 11px;border:1px solid var(--line);border-radius:16px;text-decoration:none;color:var(--mut)}}
+.fstep:hover{{border-color:var(--accent);color:var(--fg)}}.fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
+.fstep.home{{color:var(--fg)}}
+.picker{{display:flex;gap:10px;align-items:center;margin:12px 0}}
+.picker select{{font-size:16px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-family:ui-monospace,monospace}}
+.actbanner{{display:flex;align-items:center;gap:16px;padding:16px 20px;border:1px solid var(--line);border-radius:14px;margin:12px 0}}
+.act{{font-size:22px;font-weight:740;letter-spacing:-.02em}}
+.act.fresh{{color:var(--fresh)}}.act.stale{{color:var(--stale)}}.act.amber{{color:#c9930b}}.act.mut{{color:var(--mut)}}
+.acsub{{color:var(--mut);font-size:13px}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}@media(max-width:820px){{.grid2{{grid-template-columns:1fr}}}}
+.fbar{{display:inline-block;width:calc(100% - 34px);height:8px;border-radius:4px;background:var(--miss);vertical-align:middle;overflow:hidden}}
+.fbar span{{display:block;height:100%;border-radius:4px}}.fp{{display:inline-block;width:28px;text-align:right;font-family:ui-monospace,monospace;font-size:12px;color:var(--mut)}}
+td.lbl{{color:var(--mut)}}td.val{{min-width:90px}}
+.gaps{{font-size:12.5px;color:var(--mut);line-height:1.7}}.gaps li{{margin-left:4px}}
+.eff{{font-size:12.5px;color:var(--mut)}}.eff b{{color:var(--fresh)}}
+</style>
+<main>
+  <header><div class="brand"><span class="live"></span>Alpha Report</div>
+    <div class="gen mono">as-of {rep["as_of"]} · {rep["generated_at"][:16].replace("T"," ")}Z</div></header>
+  {_flow_nav("S4")}
+  <form class="picker" method="get" action="/alpha"><label class="muted">Ticker</label>
+    <select name="ticker" onchange="this.form.submit()">{opts}</select>
+    <span class="muted mono">${sig(rep["price"],2)} · regime {reg["decision"]} (VIX {sig(reg["vix"],1)}, breadth {pct(reg["breadth"],0)})</span></form>
+  <div class="actbanner"><div><div class="act {act_cls}">{rep["action"]}</div>
+    <div class="acsub">{rep["why"]}</div></div>
+    <div style="margin-left:auto;text-align:right"><div class="metric">{pct(rep["factor_score"],0)}</div>
+    <div class="acsub">factor screen score</div></div></div>
+  <div class="grid2">
+    <section class="panel"><h2>Factor decomposition <span class="muted">— percentile vs universe</span></h2>
+      <table class="queue"><tbody>{fac}</tbody></table></section>
+    <section class="panel"><h2>Catalysts &amp; events</h2><table class="queue"><tbody>{tbl(catrows)}</tbody></table></section>
+    <section class="panel"><h2>Valuation <span class="muted">— vs peers</span></h2><table class="queue"><tbody>{tbl(valrows)}</tbody></table></section>
+    <section class="panel"><h2>Risk &amp; exposures</h2><table class="queue"><tbody>{tbl(riskrows)}</tbody></table></section>
+    <section class="panel"><h2>Positioning</h2><table class="queue"><tbody>{tbl(posrows)}</tbody></table></section>
+    <section class="panel"><h2>Predictor efficacy <span class="muted">— recorded 1d skill</span></h2>
+      <div class="eff">Production model: <b>{(eff or {}).get("production","—")}</b><br>
+      DOWN precision@1: <b>{(eff or {}).get("down@1","—")}</b> · UP precision@1: {(eff or {}).get("up@1","—")}<br>
+      <span class="muted">Per-ticker calibrated P(up)/P(down) is pending predictor deployment (see gaps).</span></div></section>
+  </div>
+  <section class="panel"><h2>Missing inputs <span class="muted">— to make this report complete (see docs/alpha-report)</span></h2>
+    <ul class="gaps">{gaps}</ul></section>
+</main>"""
+
+
+def _page_alpha(rep, tickers):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Alpha · {rep["ticker"]}</title></head><body>'
+            + render_alpha(rep, tickers) + '</body></html>')
+
+
 def _page_predictors(rep):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -915,6 +1029,12 @@ def serve(port=8787):
             elif path == "/predictors":               # S3 predictor models (recorded results)
                 import pipeline_map
                 payload = _page_predictors(pipeline_map.predictor_report()).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/alpha":                     # S4 per-stock alpha report
+                import pipeline_map
+                q = parse_qs(parsed.query)
+                tk = (q.get("ticker", [""])[0] or UNIVERSE[0]).upper()
+                payload = _page_alpha(pipeline_map.alpha_report(tk), list(UNIVERSE)).encode()
                 ctype = "text/html; charset=utf-8"
             elif path == "/api/model-detail":          # a model's precision@k curve + errors
                 import pipeline_map
