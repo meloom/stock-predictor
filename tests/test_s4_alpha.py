@@ -103,16 +103,16 @@ def test_event_risk_deterministic_and_unknown(store):
 
 def test_run_alpha_combines_prediction_regime_event(store):
     _seed_market(store)  # bullish -> regime TRADE
-    store.register("predict.eod_return", "float", "ticker", "S3", "daily", "pit")
+    store.register("predict.ret_1d", "float", "ticker", "S3", "daily", "pit")
     # GOOD: positive prediction, no event risk -> actionable
     store.write("calendar.days_to_earnings", "GOOD", "2026-06-30", 45, trigger_id="s")
-    store.write("predict.eod_return", "GOOD", "2026-06-30", 0.02, trigger_id="s")
+    store.write("predict.ret_1d", "GOOD", "2026-06-30", 0.02, trigger_id="s")
     # EARN: positive prediction BUT earnings in 1 day -> event veto, not actionable
     store.write("calendar.days_to_earnings", "EARN", "2026-06-30", 1, trigger_id="s")
-    store.write("predict.eod_return", "EARN", "2026-06-30", 0.02, trigger_id="s")
+    store.write("predict.ret_1d", "EARN", "2026-06-30", 0.02, trigger_id="s")
     # NEG: negative prediction -> not actionable
     store.write("calendar.days_to_earnings", "NEG", "2026-06-30", 45, trigger_id="s")
-    store.write("predict.eod_return", "NEG", "2026-06-30", -0.01, trigger_id="s")
+    store.write("predict.ret_1d", "NEG", "2026-06-30", -0.01, trigger_id="s")
 
     m = run_alpha(["GOOD", "EARN", "NEG"], "2026-06-30", store=store)
     assert m["regime_decision"] == "TRADE"
@@ -128,9 +128,9 @@ def test_run_alpha_cash_regime_blocks_all(store):
     # bearish market -> regime CASH -> nothing actionable even with good predictions
     _seed_market(store, breadth=0.1, vix=30.0,
                  spy_closes=[710.0] * 19 + [680.0])
-    store.register("predict.eod_return", "float", "ticker", "S3", "daily", "pit")
+    store.register("predict.ret_1d", "float", "ticker", "S3", "daily", "pit")
     store.write("calendar.days_to_earnings", "GOOD", "2026-06-30", 45, trigger_id="s")
-    store.write("predict.eod_return", "GOOD", "2026-06-30", 0.05, trigger_id="s")
+    store.write("predict.ret_1d", "GOOD", "2026-06-30", 0.05, trigger_id="s")
     m = run_alpha(["GOOD"], "2026-06-30", store=store)
     assert m["regime_decision"] == "CASH"
     assert m["actionable_signals"] == 0

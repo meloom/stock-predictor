@@ -562,6 +562,11 @@ svg#edges{position:absolute;top:0;left:0;z-index:0;pointer-events:none;overflow:
 .chart .cxbox{fill:var(--fg);opacity:.92}
 .chart .cxt{fill:var(--card);font-size:11px;font-family:ui-monospace,monospace}
 .chart .cxv{fill:var(--card);font-size:12px;font-weight:700;font-family:ui-monospace,monospace}
+.chart .cxci{stroke:var(--accent);stroke-width:1.5;opacity:.5}
+.chart .trainzone{fill:var(--mut);opacity:.10}
+.chart .trainbound{stroke:var(--stale);stroke-width:1.5;stroke-dasharray:4 3;opacity:.8}
+.chart .tzl{fill:var(--stale);font-size:10px;opacity:.85}.chart .tzl2{fill:var(--fresh);font-size:10px;opacity:.85}
+.tznote{color:var(--stale)}
 .cmeta{margin-top:8px;font-size:12px;color:var(--mut)}.cmeta b{color:var(--fg)}
 .json{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;
   overflow:auto;font-size:12px;line-height:1.5;max-height:460px}
@@ -614,65 +619,71 @@ function loadDetail(id){
 function esc(x){return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
 function view(s){
   var t='<div class="dhead"><span class="mono">'+esc(s.feature)+'</span> <span class="chip">'+s.kind+'</span></div>';
-  if(s.kind==='line') return t+lineChart(s.points, s.ci);
+  if(s.kind==='line') return t+lineChart(s.points, s.ciseries, s.train_end);
   if(s.kind==='raw') return t+rawTable(s);
   return t+'<pre class="json">'+esc(JSON.stringify(s.value,null,2))+'</pre>';
 }
 function fmtv(v){var a=Math.abs(v); return (a!==0&&a<0.01)?v.toPrecision(3):(a>=1000?v.toFixed(1):v.toPrecision(4));}
-function lineChart(pts, ci){
+function lineChart(pts, ciArr, trainEnd){
   if(!pts||!pts.length) return '<div class="muted">no numeric series</div>';
-  var W=940,H=320,pl=62,pr=64,pt=18,pb=40,n=pts.length,vals=pts.map(function(p){return p[1];});
-  var mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals);
-  if(ci){mn-=ci;mx+=ci;} if(mn===mx){mn-=1;mx+=1;}
-  var pad=(mx-mn)*0.06; mn-=pad; mx+=pad;
-  var C={n:n,mn:mn,mx:mx,pl:pl,pr:pr,pt:pt,pb:pb,W:W,H:H,pts:pts,ci:ci||0};
-  window.CHART=C;
+  var W=940,H=320,pl=64,pr=66,pt=22,pb=42,n=pts.length;
+  var mn=Infinity,mx=-Infinity;
+  for(var i0=0;i0<n;i0++){var v=pts[i0][1],c=(ciArr&&ciArr[i0])||0; if(v-c<mn)mn=v-c; if(v+c>mx)mx=v+c;}
+  if(mn===mx){mn-=1;mx+=1;} var pr2=(mx-mn)*0.06; mn-=pr2; mx+=pr2;
   function X(i){return pl+(W-pl-pr)*(n<2?0.5:i/(n-1));}
   function Y(v){return (H-pb)-((H-pb-pt))*((v-mn)/(mx-mn));}
+  var ti=-1; if(trainEnd){for(var q=0;q<n;q++){if(String(pts[q][0])<=trainEnd)ti=q;}}
+  window.CHART={n:n,mn:mn,mx:mx,pl:pl,pr:pr,pt:pt,pb:pb,W:W,H:H,pts:pts,ci:ciArr||null,trainEnd:trainEnd};
   var g='';
-  // y gridlines + labels
-  for(var k=0;k<=4;k++){var yv=mn+(mx-mn)*k/4, y=Y(yv).toFixed(1);
+  for(var k=0;k<=4;k++){var yv=mn+(mx-mn)*k/4,y=Y(yv).toFixed(1);
     g+='<line class="grid" x1="'+pl+'" y1="'+y+'" x2="'+(W-pr)+'" y2="'+y+'"></line>';
     g+='<text class="ax" x="'+(pl-8)+'" y="'+(+y+4)+'" text-anchor="end">'+fmtv(yv)+'</text>';}
-  // x date ticks
   var K=Math.min(6,n);
-  for(var j=0;j<K;j++){var xi=Math.round(j*(n-1)/(K-1||1)), x=X(xi).toFixed(1);
+  for(var j=0;j<K;j++){var xi=Math.round(j*(n-1)/(K-1||1)),x=X(xi).toFixed(1);
     g+='<line class="grid" x1="'+x+'" y1="'+pt+'" x2="'+x+'" y2="'+(H-pb)+'" opacity="0.5"></line>';
     g+='<text class="ax" x="'+x+'" y="'+(H-pb+18)+'" text-anchor="middle">'+esc(String(pts[xi][0]).slice(5))+'</text>';}
-  // CI band (constant ±1.96σ)
+  var tz='';
+  if(ti>=0&&ti<n-1){var bx=((X(ti)+X(ti+1))/2).toFixed(1);
+    tz='<rect class="trainzone" x="'+pl+'" y="'+pt+'" width="'+(bx-pl).toFixed(1)+'" height="'+(H-pb-pt)+'"></rect>'+
+       '<line class="trainbound" x1="'+bx+'" y1="'+pt+'" x2="'+bx+'" y2="'+(H-pb)+'"></line>'+
+       '<text class="ax tzl" x="'+(+bx-6)+'" y="'+(pt+11)+'" text-anchor="end">training · don\'t trust</text>'+
+       '<text class="ax tzl2" x="'+(+bx+6)+'" y="'+(pt+11)+'" text-anchor="start">out-of-sample →</text>';}
   var band='';
-  if(ci){var up='',lo='';
-    for(var b=0;b<n;b++){up+=(b?'L':'M')+X(b).toFixed(1)+' '+Y(pts[b][1]+ci).toFixed(1)+' ';}
-    for(var b2=n-1;b2>=0;b2--){lo+='L'+X(b2).toFixed(1)+' '+Y(pts[b2][1]-ci).toFixed(1)+' ';}
+  if(ciArr){var up='',lo='';
+    for(var b=0;b<n;b++){var cu=ciArr[b]||0; up+=(b?'L':'M')+X(b).toFixed(1)+' '+Y(pts[b][1]+cu).toFixed(1)+' ';}
+    for(var b2=n-1;b2>=0;b2--){var cl=ciArr[b2]||0; lo+='L'+X(b2).toFixed(1)+' '+Y(pts[b2][1]-cl).toFixed(1)+' ';}
     band='<path class="ciband" d="'+up+lo+'Z"></path>';}
-  // line + area
   var d='',a='M'+X(0).toFixed(1)+' '+(H-pb);
   for(var i=0;i<n;i++){var xx=X(i).toFixed(1),yy=Y(pts[i][1]).toFixed(1); d+=(i?'L':'M')+xx+' '+yy+' '; a+=' L'+xx+' '+yy;}
   a+=' L'+X(n-1).toFixed(1)+' '+(H-pb)+' Z';
   var last=pts[n-1];
   return '<svg viewBox="0 0 '+W+' '+H+'" class="chart" onmousemove="chartHover(event)" onmouseleave="clearCross()">'+
-    g+band+'<path d="'+a+'" class="area"></path><path d="'+d+'" class="ln"></path>'+
+    tz+g+band+'<path d="'+a+'" class="area"></path><path d="'+d+'" class="ln"></path>'+
     '<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(last[1]).toFixed(1)+'" r="3.5" class="pt"></circle>'+
     '<g id="cross"></g></svg>'+
-    '<div class="cmeta">'+pts[0][0]+' → '+last[0]+' · '+n+' points · latest <b>'+fmtv(last[1])+'</b>'+
-    (ci?' · 95% CI ±'+fmtv(ci):'')+' <span class="muted">(hover the chart to read any point)</span></div>';
+    '<div class="cmeta">'+pts[0][0]+' → '+last[0]+' · '+n+' pts · latest <b>'+fmtv(last[1])+'</b>'+
+    (trainEnd?' · <span class="tznote">grey = training window (≤'+trainEnd+', not trusted); right of the line is out-of-sample</span>':'')+
+    ' <span class="muted">(hover to read any point)</span></div>';
 }
 function chartHover(e){
   var C=window.CHART; if(!C) return;
   var svg=e.currentTarget, r=svg.getBoundingClientRect();
   function X(i){return C.pl+(C.W-C.pl-C.pr)*(C.n<2?0.5:i/(C.n-1));}
   function Y(v){return (C.H-C.pb)-((C.H-C.pb-C.pt))*((v-C.mn)/(C.mx-C.mn));}
-  var fx=(e.clientX-r.left)/r.width*C.W;
-  var df=(fx-C.pl)/(C.W-C.pl-C.pr); df=Math.max(0,Math.min(1,df));
-  var i=Math.round(df*(C.n-1)); var p=C.pts[i], cx=X(i), cy=Y(p[1]);
-  var lx=Math.max(C.pl+2,Math.min(cx,C.W-C.pr-150));
-  var val=fmtv(p[1])+(C.ci?'  ±'+fmtv(C.ci):'');
+  var fx=(e.clientX-r.left)/r.width*C.W, df=(fx-C.pl)/(C.W-C.pl-C.pr); df=Math.max(0,Math.min(1,df));
+  var i=Math.round(df*(C.n-1)), p=C.pts[i], cx=X(i), cy=Y(p[1]);
+  var ci=(C.ci&&C.ci[i]!=null)?C.ci[i]:null;
+  var trusted=(!C.trainEnd)||(String(p[0])>C.trainEnd);
+  var lx=Math.max(C.pl+2,Math.min(cx,C.W-C.pr-178));
+  var l1=String(p[0])+(C.trainEnd?(trusted?'  · OOS (trust)':'  · training'):'');
+  var l2=fmtv(p[1])+(ci!=null?'   95% CI ±'+fmtv(ci):'');
   document.getElementById('cross').innerHTML=
     '<line class="cx" x1="'+cx.toFixed(1)+'" y1="'+C.pt+'" x2="'+cx.toFixed(1)+'" y2="'+(C.H-C.pb)+'"></line>'+
+    (ci!=null?'<line class="cxci" x1="'+cx.toFixed(1)+'" y1="'+Y(p[1]-ci).toFixed(1)+'" x2="'+cx.toFixed(1)+'" y2="'+Y(p[1]+ci).toFixed(1)+'"></line>':'')+
     '<circle class="cxpt" cx="'+cx.toFixed(1)+'" cy="'+cy.toFixed(1)+'" r="4"></circle>'+
-    '<rect class="cxbox" x="'+lx.toFixed(1)+'" y="'+(C.pt+2)+'" width="152" height="34" rx="5"></rect>'+
-    '<text class="cxt" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+16)+'">'+esc(String(p[0]))+'</text>'+
-    '<text class="cxv" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+30)+'">'+val+'</text>';
+    '<rect class="cxbox" x="'+lx.toFixed(1)+'" y="'+(C.pt+2)+'" width="182" height="34" rx="5"></rect>'+
+    '<text class="cxt" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+16)+'">'+esc(l1)+'</text>'+
+    '<text class="cxv" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+30)+'">'+esc(l2)+'</text>';
 }
 function clearCross(){var c=document.getElementById('cross'); if(c)c.innerHTML='';}
 function rawTable(s){
@@ -772,7 +783,7 @@ def render_predictors(rep: dict) -> str:
         rows += (f'<tr><td class="mono feat"><span class="ndot {FAM_CLS.get(p["family"],"")}"></span>{p["feature"]}</td>'
                  f'<td>{p["family"]}</td><td class="mono muted">{p["horizon"]}</td>'
                  f'<td class="mono muted">{p["model"]}</td>'
-                 f'<td>{skill}</td><td class="mono num">{p["tickers"]}·{p["n"]:,}</td><td>{star}</td></tr>')
+                 f'<td>{skill}</td><td class="mono num">{p["tickers"]}t · {p.get("n_oos",0):,} OOS</td><td>{star}</td></tr>')
 
     return f"""{_CSS}
 <style>
@@ -793,13 +804,16 @@ def render_predictors(rep: dict) -> str:
     <span class="muted">— each family × horizon, its OOS skill (walk-forward predictions vs realized), and production status</span></h2>
     <table class="queue"><thead><tr><th>Output</th><th>Family</th><th>Horizon</th><th>Model</th>
     <th>OOS skill</th><th>coverage</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>
-    <div class="note">Skill is measured on the leakage-free walk-forward predictions vs. the realized
-    forward outcome. <b>IC</b> = Pearson corr(pred return, realized). <b>dir-hit / up-hit / down-hit</b> =
-    fraction correct. These are BUILT + MEASURED, not yet validated for capital — the §5 gate governs
-    real sizing. Predict from any of them via the trigger on <a href="/single-stock">/single-stock</a>.</div>
+    <div class="note">Skill is measured <b>OUT-OF-SAMPLE ONLY</b> — on predictions for dates strictly
+    after the production model's train_end ({(prod.get("train_end") or "—")}); predictions on training
+    dates overlap what the model saw and are NOT trusted. <b>IC</b> = Pearson corr(pred, realized);
+    <b>up-hit/down-hit</b> = fraction correct. Direction is DERIVED from the return forecast
+    (P(up)=Φ(ŷ/se), down=1−up) — one model, coherent, not a separate classifier. These are BUILT +
+    MEASURED, not yet validated for capital — the §5 gate governs real sizing. Predict via the trigger
+    on <a href="/single-stock">/single-stock</a>.</div>
   </section>
-  <section class="panel"><h2>Confidence intervals <span class="muted">— return CI half-width (95% = ±1.96σ)</span></h2>
-    <table class="queue"><thead><tr><th>Horizon</th><th>σ (residual)</th><th>95% CI half-width</th></tr></thead><tbody>
+  <section class="panel"><h2>Confidence intervals <span class="muted">— per-point interval is leverage-adjusted (ŷ ± 1.96·σ·√(1+xᵀMx)); below is the baseline σ per horizon</span></h2>
+    <table class="queue"><thead><tr><th>Horizon</th><th>σ (residual)</th><th>baseline 95% ±</th></tr></thead><tbody>
     {"".join(f'<tr><td class="mono">{k}</td><td class="mono">{v}</td><td class="mono">±{v*1.96*100:.1f}%</td></tr>' for k,v in rep["band"].items())}
     </tbody></table></section>
 </main>"""

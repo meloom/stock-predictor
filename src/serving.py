@@ -41,16 +41,10 @@ def promote(train_end: str, db_path=DEFAULT_DB) -> dict:
     models = {}
     for h in s3_multi.HORIZONS:
         tr = [r for r in pool if r["lab"].get(f"ret_{h}d") is not None]
-        if len(tr) >= 100:
-            models[f"ret_{h}d"] = s3_multi._fit_reg(
+        if len(tr) >= 100:                                   # one return model per horizon;
+            models[f"ret_{h}d"] = s3_multi._fit_reg(         # direction is derived from it
                 np.array([r["x"] for r in tr], dtype=float),
                 np.array([r["lab"][f"ret_{h}d"] for r in tr], dtype=float))
-        td = [r for r in pool if r["lab"].get(f"dir_{h}d") is not None]
-        if len(td) >= 100:
-            m = s3_multi._fit_clf(np.array([r["x"] for r in td], dtype=float),
-                                  np.array([r["lab"][f"dir_{h}d"] for r in td], dtype=float))
-            if m:
-                models[f"dir_{h}d"] = m
     vh = s3_multi.VOL_HORIZON
     tv = [r for r in pool if r["lab"].get(f"vol_{vh}d") is not None]
     if len(tv) >= 100:
@@ -117,19 +111,16 @@ def predict(ticker: str, asof: str, store: FeatureStore | None = None,
         rm = b["models"].get(f"ret_{h}d")
         if not rm:
             continue
-        ret = float(s3_multi._pred_reg(rm, X)[0]); sig = rm["sigma"]
-        pu = pd = None
-        dm = b["models"].get(f"dir_{h}d")
-        if dm:
-            pr = s3_multi._pred_proba(dm, X)[0]; cidx = {c: i for i, c in enumerate(dm["classes"])}
-            pu = round(float(pr[cidx[1]]), 4) if 1 in cidx else None
-            pd = round(float(pr[cidx[-1]]), 4) if -1 in cidx else None
+        ret = float(s3_multi._pred_reg(rm, X)[0])
+        se = float(s3_multi._pi_se(rm, X)[0])            # leverage-adjusted interval std
+        half = Z95 * se
+        up = s3_multi._norm_cdf(ret / se) if se > 0 else 0.5   # direction from the forecast
         preds[f"{h}d"] = {"ahead": f"+{h} trading days", "pred_return": round(ret, 6),
-                          "ci_low": round(ret - Z95 * sig, 6), "ci_high": round(ret + Z95 * sig, 6),
+                          "ci_low": round(ret - half, 6), "ci_high": round(ret + half, 6),
                           "pred_price": round(price * (1 + ret), 4),
-                          "price_low": round(price * (1 + ret - Z95 * sig), 4),
-                          "price_high": round(price * (1 + ret + Z95 * sig), 4),
-                          "p_up": pu, "p_down": pd}
+                          "price_low": round(price * (1 + ret - half), 4),
+                          "price_high": round(price * (1 + ret + half), 4),
+                          "p_up": round(up, 4), "p_down": round(1 - up, 4)}
     vh = b["vol_horizon"]; vm = b["models"].get(f"vol_{vh}d")
     vol = float(s3_multi._pred_reg(vm, X)[0]) if vm else None
     return {"status": "OK", "ticker": ticker, "asof": asof, "price": round(price, 4),

@@ -84,7 +84,7 @@ DOWNSTREAM_INPUTS = {                                                # for the c
         "xh.ret_21d", "xh.ret_63d", "xh.ret_126d", "xh.dist_hi252",
         "xh.new_high_flag", "xh.above_hi_streak"],
     "S4 alpha": ["regime.breadth5", "macro.vix", "macro.spy_close",
-                 "calendar.days_to_earnings", "predict.eod_return"],
+                 "calendar.days_to_earnings", "predict.ret_1d"],
 }
 
 
@@ -162,12 +162,10 @@ RAW_TABLE = {
     "price.current": "quotes", "sec_filings": "sec_filings",
     "xbrl_financials": "xbrl_financials", "transcripts": "transcripts",
 }
-# the multi-horizon predictors actually produced by s3_multi.backfill()
-_S3_LINE = ["predict.eod_return",
-            "predict.ret_1d", "predict.ret_5d", "predict.ret_21d",
-            "predict.up_1d", "predict.up_5d", "predict.up_21d",
-            "predict.down_1d", "predict.down_5d", "predict.down_21d",
-            "predict.vol_5d"]
+# S3 nodes: the FUTURE prediction (predict.*, one point at the latest date) and the
+# BACKTEST evaluation series (backtest.*, historical walk-forward — for measuring skill).
+_S3_PRED = ["predict.ret_1d", "predict.ret_5d", "predict.ret_21d", "predict.vol_5d"]
+_S3_BACKTEST = ["backtest.ret_1d", "backtest.ret_5d", "backtest.ret_21d", "backtest.vol_5d"]
 
 
 def _depends():
@@ -195,14 +193,12 @@ def _depends():
     d["calendar.days_to_earnings"] = ["earnings.next_date"]
     d["earnings.analysis"] = ["earnings.report_raw"]
     pf = list(s3_predictors.PREDICTOR_FEATURES)
-    for p in ["predict.eod_return", "predict.ret_1d", "predict.ret_5d", "predict.ret_21d",
-              "predict.up_1d", "predict.up_5d", "predict.up_21d",
-              "predict.down_1d", "predict.down_5d", "predict.down_21d", "predict.vol_5d"]:
-        d[p] = pf                                   # every predictor consumes the S2 vector
+    for p in _S3_PRED + _S3_BACKTEST:               # every predictor consumes the S2 vector
+        d[p] = pf
     d["predict.forecast"] = ["predict.ret_1d", "predict.ret_5d", "predict.ret_21d"]  # future rollup
     d["alpha.regime"] = ["regime.breadth5", "macro.vix", "macro.spy_close"]
     d["alpha.event_risk"] = ["calendar.days_to_earnings"]
-    d["alpha.signal"] = ["predict.eod_return", "alpha.regime", "alpha.event_risk"]
+    d["alpha.signal"] = ["predict.ret_1d", "alpha.regime", "alpha.event_risk"]
     return d
 
 
@@ -235,7 +231,9 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
     for group, feats, _, _ in LINEAGE:
         for f in feats:
             defs.append((f, "S2", "json" if f == "earnings.analysis" else "line"))
-    defs += [(f, "S3", "line") for f in _S3_LINE] + [("predict.forecast", "S3", "json")]
+    defs += ([("predict.forecast", "S3", "json")]
+             + [(f, "S3", "line") for f in _S3_PRED]
+             + [(f, "S3", "line") for f in _S3_BACKTEST])
     defs += [("alpha.regime", "S4", "json"), ("alpha.event_risk", "S4", "json"),
              ("alpha.signal", "S4", "json")]
 
@@ -250,9 +248,10 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
             n = typed_count(RAW_TABLE[fid]); nd, latest = n, None
         else:
             nd, latest = fv.get(fid, (0, None))
+        label = (("bt·" + fid.split(".", 1)[1]) if fid.startswith("backtest.")
+                 else (fid.split(".", 1)[-1] if "." in fid else fid))
         nodes.append({"id": fid, "stage": stage, "kind": kind,
-                      "produced": (nd or 0) > 0, "n": nd or 0, "latest": latest,
-                      "label": fid.split(".", 1)[-1] if "." in fid else fid})
+                      "produced": (nd or 0) > 0, "n": nd or 0, "latest": latest, "label": label})
     nodeset = {n["id"] for n in nodes}
     edges = [[u, v] for v, us in deps.items() for u in us if u in nodeset and v in nodeset]
     latest = fv.get("price.close", (0, None))[1]
@@ -296,16 +295,24 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
     if pts and nonnum is None:
         out = {"kind": "line", "feature": feature, "points": pts,
                "latest": pts[-1][1], "n": len(pts)}
-        if feature.startswith("predict.ret_"):        # attach the 95% CI half-width (1.96σ)
-            band = c.execute("SELECT value FROM feature_values WHERE feature='predict.band' "
-                             "AND scope='_market' ORDER BY ingested_at DESC LIMIT 1").fetchone()
-            if band:
+        if feature.startswith(("predict.", "backtest.")):   # mark the training/OOS trust boundary
+            try:
+                out["train_end"] = json.loads(
+                    (RUNTIME_DIR / "production_model.json").read_text()).get("train_end")
+            except Exception:
+                pass
+        if feature.startswith(("predict.ret_", "backtest.ret_")):  # per-point 95% PI half-width
+            cif = feature.replace(".ret_", ".ci_ret_")
+            ciby = {}
+            for et, val, _ in c.execute(
+                    "SELECT event_time, value, MAX(ingested_at) FROM feature_values "
+                    "WHERE feature=? AND scope=? GROUP BY event_time", (cif, ticker)):
                 try:
-                    sig = json.loads(band[0]).get(feature.split(".", 1)[1])
-                    if sig:
-                        out["ci"] = round(1.96 * float(sig), 6)
-                except Exception:
+                    ciby[et[:10]] = float(val)
+                except (TypeError, ValueError):
                     pass
+            if ciby:
+                out["ciseries"] = [ciby.get(d) for d, _ in pts]
         return out
     # structured / json latest
     latest = rows[-1] if rows else None
@@ -392,48 +399,56 @@ def predictor_report(db_path=DEFAULT_DB) -> dict:
         pass
     promoted = set(prod.get("predictors", []))
 
+    # skill is trusted only OUT-OF-SAMPLE — dates strictly after the production model's
+    # train_end (predictions on training dates overlap what the model saw).
+    train_end = prod.get("train_end")
+
+    def oos(k):
+        return (not train_end) or k[1] > train_end
+
+    # skill is measured on the BACKTEST (historical walk-forward), OOS-only.
     predictors = []
     for h in HORIZONS:
         rr = realized_ret(h)
-        ps = series(f"predict.ret_{h}d")
-        pr = [(v, rr[k]) for k, v in ps.items() if k in rr]
+        ps = series(f"backtest.ret_{h}d")
+        pr = [(v, rr[k]) for k, v in ps.items() if k in rr and oos(k)]
         ic = pearson([a for a, _ in pr], [b for _, b in pr]) if pr else None
         hit = (sum(1 for a, b in pr if (a > 0) == (b > 0)) / len(pr)) if pr else None
         predictors.append({
-            "feature": f"predict.ret_{h}d", "family": "return", "horizon": f"{h}d",
-            "model": "Ridge", "n": len(ps), "tickers": len({k[0] for k in ps}),
+            "feature": f"ret_{h}d", "family": "return", "horizon": f"{h}d",
+            "model": "Ridge", "n": len(ps), "n_oos": len(pr), "tickers": len({k[0] for k in ps}),
             "metric": "IC / hit", "ic": ic, "hit": hit,
             "ci95": round(1.96 * band[f"ret_{h}d"], 4) if f"ret_{h}d" in band else None,
             "promoted": f"ret_{h}d" in promoted})
-        up, dn = series(f"predict.up_{h}d"), series(f"predict.down_{h}d")
-        up_sel = [(v, rr[k]) for k, v in up.items() if k in rr and v > 0.5]
-        dn_sel = [(v, rr[k]) for k, v in dn.items() if k in rr and v > 0.5]
+        up, dn = series(f"backtest.up_{h}d"), series(f"backtest.down_{h}d")
+        up_sel = [(v, rr[k]) for k, v in up.items() if k in rr and oos(k) and v > 0.5]
+        dn_sel = [(v, rr[k]) for k, v in dn.items() if k in rr and oos(k) and v > 0.5]
         predictors.append({
-            "feature": f"predict.up_{h}d / down_{h}d", "family": "direction", "horizon": f"{h}d",
-            "model": "Logistic (3-class)", "n": len(up), "tickers": len({k[0] for k in up}),
-            "metric": "up-hit / down-hit",
+            "feature": f"up_{h}d / down_{h}d", "family": "direction", "horizon": f"{h}d",
+            "model": "derived: Φ(ŷ/se)", "n": len(up), "n_oos": len(up_sel),
+            "tickers": len({k[0] for k in up}), "metric": "up-hit / down-hit",
             "up_hit": (sum(1 for _, r in up_sel if r > 0) / len(up_sel)) if up_sel else None,
             "down_hit": (sum(1 for _, r in dn_sel if r < 0) / len(dn_sel)) if dn_sel else None,
-            "promoted": f"dir_{h}d" in promoted})
+            "promoted": f"ret_{h}d" in promoted})           # direction derives from the return model
     rv = realized_vol(VOL_HORIZON)
-    vs = series(f"predict.vol_{VOL_HORIZON}d")
-    vp = [(v, rv[k]) for k, v in vs.items() if k in rv]
+    vs = series(f"backtest.vol_{VOL_HORIZON}d")
+    vp = [(v, rv[k]) for k, v in vs.items() if k in rv and oos(k)]
     predictors.append({
-        "feature": f"predict.vol_{VOL_HORIZON}d", "family": "volatility", "horizon": f"{VOL_HORIZON}d",
-        "model": "Ridge", "n": len(vs), "tickers": len({k[0] for k in vs}),
+        "feature": f"vol_{VOL_HORIZON}d", "family": "volatility", "horizon": f"{VOL_HORIZON}d",
+        "model": "Ridge", "n": len(vs), "n_oos": len(vp), "tickers": len({k[0] for k in vs}),
         "metric": "corr(realized)",
         "vol_corr": pearson([a for a, _ in vp], [b for _, b in vp]) if vp else None,
         "promoted": f"vol_{VOL_HORIZON}d" in promoted})
 
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
-            "predictors": predictors, "production": prod,
+            "predictors": predictors, "production": prod, "train_end": train_end,
             "n_promoted": len(promoted), "band": band}
 
 
 def _step_of(feature: str) -> str:
     if feature.startswith("alpha."):
         return "S4 · Alpha"
-    if feature.startswith("predict."):
+    if feature.startswith(("predict.", "backtest.")):
         return "S3 · Predictors"
     if (feature.startswith(("tech.", "fund.", "xsec.", "xh.", "regime."))
             or feature in ("calendar.days_to_earnings", "earnings.analysis",

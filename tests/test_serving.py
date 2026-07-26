@@ -14,8 +14,7 @@ def promoted(tmp_path, monkeypatch):
     feats = list(serving.PREDICTOR_FEATURES)
     rng = np.random.RandomState(1)
     X = rng.randn(300, len(feats))
-    models = {"ret_1d": s3_multi._fit_reg(X, X[:, 0] * 0.01 + rng.randn(300) * 0.001),
-              "dir_1d": s3_multi._fit_clf(X, np.sign(X[:, 0]).astype(float))}
+    models = {"ret_1d": s3_multi._fit_reg(X, X[:, 0] * 0.01 + rng.randn(300) * 0.001)}
     import pickle
     bundle = {"train_start": "2025-07-01", "train_end": "2026-03-31", "features": feats,
               "models": models, "horizons": [1], "vol_horizon": 5, "n_train_rows": 300}

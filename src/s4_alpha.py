@@ -10,7 +10,7 @@ Components:
                  informational.
   event risk   — deterministic from calendar.days_to_earnings; missing = UNKNOWN,
                  never silently LOW.
-  combine      — reads S3's predict.eod_return per ticker and gates it: no
+  combine      — reads S3's predict.ret_1d per ticker and gates it: no
                  trade if regime is CASH; HIGH event risk vetoes a name. Output
                  is an alpha signal per stock, OBSERVATION mode until the
                  upstream predictor passes §5.
@@ -124,7 +124,7 @@ def run_alpha(universe: list[str], event_date: str,
                         trigger_id=trig.trigger_id)
 
             # combine S3's prediction with the gate + event veto
-            pred = store.read_asof("predict.eod_return", t, event_date, as_known_at)
+            pred = store.read_asof("predict.ret_1d", t, event_date, as_known_at)
             pred_ret = pred["value"] if pred else None
             is_actionable = bool(regime_ok and level != "HIGH" and pred_ret is not None
                                  and pred_ret > 0)
@@ -141,6 +141,6 @@ def run_alpha(universe: list[str], event_date: str,
             regime_decision=regime["decision"], regime_score=regime["score"],
             event_risk_counts=risk_counts,
             has_predictions=bool(universe and store.read_asof(
-                "predict.eod_return", universe[0], event_date)),
+                "predict.ret_1d", universe[0], event_date)),
             actionable_signals=actionable)
         return {"trigger_id": trig.trigger_id, **trig.metrics}
