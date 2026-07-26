@@ -13,12 +13,9 @@ def promoted(tmp_path, monkeypatch):
     monkeypatch.setattr(serving, "PROD_META", tmp_path / "prod.json")
     feats = list(serving.PREDICTOR_FEATURES)
     rng = np.random.RandomState(1)
-    models = {}
-    for lab, kind in [("ret_h1", "ridge"), ("up_h1", "logistic")]:
-        X = rng.randn(300, len(feats)); y = X[:, 0] * 0.01 + rng.randn(300) * 0.001
-        if kind == "logistic":
-            y = (y > 0).astype(float)
-        models[lab] = s3_multi._fit(X, y, kind)
+    X = rng.randn(300, len(feats))
+    models = {"ret_1d": s3_multi._fit_reg(X, X[:, 0] * 0.01 + rng.randn(300) * 0.001),
+              "dir_1d": s3_multi._fit_clf(X, np.sign(X[:, 0]).astype(float))}
     import pickle
     bundle = {"train_start": "2025-07-01", "train_end": "2026-03-31", "features": feats,
               "models": models, "horizons": [1], "vol_horizon": 5, "n_train_rows": 300}
@@ -49,5 +46,7 @@ def test_oos_asof_passes_the_leakage_gate(promoted, monkeypatch):
         def read_asof(self, feat, tk, asof, *a):
             return {"value": 100.0} if feat == "price.close" else {"value": 0.5}
     r = serving.predict("AAPL", "2026-05-01", store=_Store(), trigger_s2=False)
-    assert r["status"] == "OK" and "1" in r["predictions"]
-    assert r["predictions"]["1"]["pred_price"] is not None
+    assert r["status"] == "OK" and "1d" in r["predictions"]
+    p = r["predictions"]["1d"]
+    assert p["pred_price"] is not None
+    assert p["ci_low"] <= p["pred_return"] <= p["ci_high"]        # confidence interval

@@ -5,37 +5,44 @@ import s3_multi
 
 
 def test_walk_forward_is_leakage_free():
-    """An OOS prediction at date d must come from a model trained only on dates < its
-    block start — never on d's own future. We assert no prediction exists before the
-    warmup boundary, and predictions only appear on dates that had a prior training pool."""
-    # synthetic rows: 200 dates, 3 tickers, random features, ret label = f(x)+noise
+    """An OOS prediction at date d comes from a model trained only on dates < its block
+    start — never on d's own future. Assert predictions only appear at/after warmup."""
     rng = np.random.RandomState(0)
-    dates = [f"2026-01-{i:03d}" for i in range(1, 201)]   # sortable synthetic dates
+    dates = [f"2026-01-{i:03d}" for i in range(1, 201)]
     rows = []
     for d in dates:
         for t in ("A", "B", "C"):
             x = rng.randn(len(s3_multi.PREDICTOR_FEATURES)).tolist()
             rows.append({"d": d, "t": t, "x": x,
-                         "lab": {"ret_h1": float(x[0] * 0.01 + rng.randn() * 0.001)},
+                         "lab": {"ret_1d": float(x[0] * 0.01 + rng.randn() * 0.001)},
                          "close": 100.0})
-    out = s3_multi._walk_forward(rows, s3_multi.PREDICTOR_FEATURES, "ret_h1", "ridge")
+    out = s3_multi._walk_reg(rows, "ret_1d")
     assert out, "walk-forward produced no predictions"
     warmup_date = dates[int(len(dates) * s3_multi.WARMUP_FRAC)]
-    # every predicted date is at/after the warmup boundary (trained on earlier dates)
     assert all(d >= warmup_date for (_, d) in out)
 
 
-def test_fit_predict_handle_all_nan_column():
-    """A feature that is entirely NaN in a block must not crash or leak NaN."""
+def test_reg_fit_predict_handle_all_nan_column():
     X = np.array([[1.0, np.nan, 3.0], [2.0, np.nan, 1.0], [3.0, np.nan, 2.0]])
     y = np.array([0.1, 0.2, 0.3])
-    m = s3_multi._fit(X, y, "ridge")
-    p = s3_multi._pred(m, np.array([[1.5, np.nan, 2.0]]))
-    assert np.isfinite(p).all()
+    m = s3_multi._fit_reg(X, y)
+    assert "sigma" in m and np.isfinite(m["sigma"])          # CI width computed
+    assert np.isfinite(s3_multi._pred_reg(m, np.array([[1.5, np.nan, 2.0]]))).all()
 
 
-def test_horizons_and_registration_cover_the_three_families():
+def test_direction_classifier_gives_up_and_down():
+    rng = np.random.RandomState(2)
+    X = rng.randn(300, len(s3_multi.PREDICTOR_FEATURES))
+    y = np.sign(X[:, 0]).astype(float)                       # classes {-1,0,1}-ish
+    m = s3_multi._fit_clf(X, y)
+    proba = s3_multi._pred_proba(m, X[:3])
+    assert proba.shape[1] >= 2 and set(m["classes"]) <= {-1.0, 0.0, 1.0}
+
+
+def test_naming_is_Nd_not_hN_and_covers_up_down_vol():
     names = {n for n, *_ in s3_multi.S3M_FEATURES}
     for h in (1, 5, 21):
-        assert f"predict.ret_h{h}" in names and f"predict.up_h{h}" in names
-    assert "predict.vol_h5" in names and "predict.forecast" in names
+        assert f"predict.ret_{h}d" in names
+        assert f"predict.up_{h}d" in names and f"predict.down_{h}d" in names
+        assert f"predict.ret_h{h}" not in names              # old naming gone
+    assert "predict.vol_5d" in names and "predict.forecast" in names and "predict.band" in names

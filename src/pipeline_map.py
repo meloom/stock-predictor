@@ -12,7 +12,7 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from core import DEFAULT_DB                                          # noqa: E402
+from core import DEFAULT_DB, RUNTIME_DIR                             # noqa: E402
 
 # ── S2 feature lineage: s2_feature -> (derived-from S1/S2 inputs, downstream consumer) ──
 # This is the design contract, hand-authored from the stage code (s2/s3/s4).
@@ -164,8 +164,10 @@ RAW_TABLE = {
 }
 # the multi-horizon predictors actually produced by s3_multi.backfill()
 _S3_LINE = ["predict.eod_return",
-            "predict.ret_h1", "predict.ret_h5", "predict.ret_h21",
-            "predict.up_h1", "predict.up_h5", "predict.up_h21", "predict.vol_h5"]
+            "predict.ret_1d", "predict.ret_5d", "predict.ret_21d",
+            "predict.up_1d", "predict.up_5d", "predict.up_21d",
+            "predict.down_1d", "predict.down_5d", "predict.down_21d",
+            "predict.vol_5d"]
 
 
 def _depends():
@@ -193,10 +195,11 @@ def _depends():
     d["calendar.days_to_earnings"] = ["earnings.next_date"]
     d["earnings.analysis"] = ["earnings.report_raw"]
     pf = list(s3_predictors.PREDICTOR_FEATURES)
-    for p in ["predict.eod_return", "predict.ret_h1", "predict.ret_h5", "predict.ret_h21",
-              "predict.up_h1", "predict.up_h5", "predict.up_h21", "predict.vol_h5"]:
+    for p in ["predict.eod_return", "predict.ret_1d", "predict.ret_5d", "predict.ret_21d",
+              "predict.up_1d", "predict.up_5d", "predict.up_21d",
+              "predict.down_1d", "predict.down_5d", "predict.down_21d", "predict.vol_5d"]:
         d[p] = pf                                   # every predictor consumes the S2 vector
-    d["predict.forecast"] = ["predict.ret_h1", "predict.ret_h5", "predict.ret_h21"]  # future rollup
+    d["predict.forecast"] = ["predict.ret_1d", "predict.ret_5d", "predict.ret_21d"]  # future rollup
     d["alpha.regime"] = ["regime.breadth5", "macro.vix", "macro.spy_close"]
     d["alpha.event_risk"] = ["calendar.days_to_earnings"]
     d["alpha.signal"] = ["predict.eod_return", "alpha.regime", "alpha.event_risk"]
@@ -291,8 +294,19 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
         except (TypeError, ValueError):
             nonnum = val                                      # JSON/text -> not a line
     if pts and nonnum is None:
-        return {"kind": "line", "feature": feature, "points": pts,
-                "latest": pts[-1][1], "n": len(pts)}
+        out = {"kind": "line", "feature": feature, "points": pts,
+               "latest": pts[-1][1], "n": len(pts)}
+        if feature.startswith("predict.ret_"):        # attach the 95% CI half-width (1.96σ)
+            band = c.execute("SELECT value FROM feature_values WHERE feature='predict.band' "
+                             "AND scope='_market' ORDER BY ingested_at DESC LIMIT 1").fetchone()
+            if band:
+                try:
+                    sig = json.loads(band[0]).get(feature.split(".", 1)[1])
+                    if sig:
+                        out["ci"] = round(1.96 * float(sig), 6)
+                except Exception:
+                    pass
+        return out
     # structured / json latest
     latest = rows[-1] if rows else None
     v = latest[1] if latest else None
@@ -303,6 +317,117 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
             pass
     return {"kind": "json", "feature": feature,
             "event_time": latest[0] if latest else None, "value": v}
+
+
+def predictor_report(db_path=DEFAULT_DB) -> dict:
+    """One row per predictor model: family, horizon, coverage, OOS skill (return IC +
+    directional hit-rate; up/down hit-rates; vol correlation), CI width, and whether it's
+    the promoted production model. Skill is measured on the walk-forward OOS predictions
+    vs. realized forward outcomes — the number you watch before promoting."""
+    import json
+    import math
+    from s3_multi import HORIZONS, VOL_HORIZON
+    con = sqlite3.connect(Path(db_path))
+    price = {}
+    for sc, et, val in con.execute(
+            "SELECT scope, event_time, value FROM feature_values WHERE feature='price.close'"):
+        try:
+            price.setdefault(sc, {})[et] = float(val)
+        except (TypeError, ValueError):
+            pass
+
+    def series(feat):
+        out = {}
+        for sc, et, val, _ in con.execute(
+                "SELECT scope, event_time, value, MAX(ingested_at) FROM feature_values "
+                "WHERE feature=? GROUP BY scope, event_time", (feat,)):
+            try:
+                out[(sc, et)] = float(val)
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def realized_ret(h):
+        r = {}
+        for t, pm in price.items():
+            ds = sorted(pm); cl = [pm[d] for d in ds]
+            for i, d in enumerate(ds):
+                if i + h < len(cl) and cl[i]:
+                    r[(t, d)] = cl[i + h] / cl[i] - 1
+        return r
+
+    def realized_vol(h):
+        r = {}
+        for t, pm in price.items():
+            ds = sorted(pm); cl = [pm[d] for d in ds]
+            dr = [cl[i + 1] / cl[i] - 1 for i in range(len(cl) - 1) if cl[i]]
+            for i, d in enumerate(ds):
+                w = dr[i:i + h]
+                if len(w) == h:
+                    m = sum(w) / h
+                    r[(t, d)] = math.sqrt(sum((x - m) ** 2 for x in w) / h)
+        return r
+
+    def pearson(xs, ys):
+        n = len(xs)
+        if n < 3:
+            return None
+        mx = sum(xs) / n; my = sum(ys) / n
+        num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+        dx = math.sqrt(sum((a - mx) ** 2 for a in xs)); dy = math.sqrt(sum((b - my) ** 2 for b in ys))
+        return num / (dx * dy) if dx and dy else None
+
+    band = {}
+    row = con.execute("SELECT value FROM feature_values WHERE feature='predict.band' "
+                      "ORDER BY ingested_at DESC LIMIT 1").fetchone()
+    if row:
+        try:
+            band = json.loads(row[0])
+        except Exception:
+            pass
+    prod = {}
+    try:
+        prod = json.loads((RUNTIME_DIR / "production_model.json").read_text())
+    except Exception:
+        pass
+    promoted = set(prod.get("predictors", []))
+
+    predictors = []
+    for h in HORIZONS:
+        rr = realized_ret(h)
+        ps = series(f"predict.ret_{h}d")
+        pr = [(v, rr[k]) for k, v in ps.items() if k in rr]
+        ic = pearson([a for a, _ in pr], [b for _, b in pr]) if pr else None
+        hit = (sum(1 for a, b in pr if (a > 0) == (b > 0)) / len(pr)) if pr else None
+        predictors.append({
+            "feature": f"predict.ret_{h}d", "family": "return", "horizon": f"{h}d",
+            "model": "Ridge", "n": len(ps), "tickers": len({k[0] for k in ps}),
+            "metric": "IC / hit", "ic": ic, "hit": hit,
+            "ci95": round(1.96 * band[f"ret_{h}d"], 4) if f"ret_{h}d" in band else None,
+            "promoted": f"ret_{h}d" in promoted})
+        up, dn = series(f"predict.up_{h}d"), series(f"predict.down_{h}d")
+        up_sel = [(v, rr[k]) for k, v in up.items() if k in rr and v > 0.5]
+        dn_sel = [(v, rr[k]) for k, v in dn.items() if k in rr and v > 0.5]
+        predictors.append({
+            "feature": f"predict.up_{h}d / down_{h}d", "family": "direction", "horizon": f"{h}d",
+            "model": "Logistic (3-class)", "n": len(up), "tickers": len({k[0] for k in up}),
+            "metric": "up-hit / down-hit",
+            "up_hit": (sum(1 for _, r in up_sel if r > 0) / len(up_sel)) if up_sel else None,
+            "down_hit": (sum(1 for _, r in dn_sel if r < 0) / len(dn_sel)) if dn_sel else None,
+            "promoted": f"dir_{h}d" in promoted})
+    rv = realized_vol(VOL_HORIZON)
+    vs = series(f"predict.vol_{VOL_HORIZON}d")
+    vp = [(v, rv[k]) for k, v in vs.items() if k in rv]
+    predictors.append({
+        "feature": f"predict.vol_{VOL_HORIZON}d", "family": "volatility", "horizon": f"{VOL_HORIZON}d",
+        "model": "Ridge", "n": len(vs), "tickers": len({k[0] for k in vs}),
+        "metric": "corr(realized)",
+        "vol_corr": pearson([a for a, _ in vp], [b for _, b in vp]) if vp else None,
+        "promoted": f"vol_{VOL_HORIZON}d" in promoted})
+
+    return {"generated_at": datetime.now(timezone.utc).isoformat(),
+            "predictors": predictors, "production": prod,
+            "n_promoted": len(promoted), "band": band}
 
 
 def _step_of(feature: str) -> str:

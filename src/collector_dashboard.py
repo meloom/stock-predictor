@@ -372,7 +372,8 @@ _STEPS = [
      "Queue-driven collector: backfill progress, freshness heatmap, per-ticker×signal drill-down."),
     ("S2", "Signal Processing", "/signal-processing", True,
      "Feature lineage S1→S2→S3→S4, coverage, and the gaps: collected data not yet turned into features."),
-    ("S3", "Predictors", None, False, "Model training, precision@k, champion registry."),
+    ("S3", "Predictors", "/predictors", True,
+     "Multi-horizon predictor models, OOS skill (IC / hit-rate), confidence intervals, production status."),
     ("S4", "Alpha", None, False, "Regime gate, event risk, position signals."),
     ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
     ("↳", "Single Stock", "/single-stock", True,
@@ -549,10 +550,18 @@ svg#edges{position:absolute;top:0;left:0;z-index:0;pointer-events:none;overflow:
 .edge{fill:none;stroke:var(--line);stroke-width:1;opacity:.14}
 .edge.hot{stroke:var(--accent);stroke-width:2;opacity:1}
 .dhead{display:flex;gap:10px;align-items:center;margin-bottom:12px;font-size:14px}
-.chart{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
+.chart{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:12px;cursor:crosshair}
 .chart .ln{fill:none;stroke:var(--accent);stroke-width:2}
-.chart .area{fill:color-mix(in srgb,var(--accent) 12%,transparent);stroke:none}
-.chart .pt{fill:var(--accent)}.chart .ct{fill:var(--mut);font-size:11px;font-family:ui-monospace,monospace}
+.chart .area{fill:color-mix(in srgb,var(--accent) 10%,transparent);stroke:none}
+.chart .ciband{fill:color-mix(in srgb,var(--accent) 16%,transparent);stroke:none}
+.chart .pt{fill:var(--accent)}
+.chart .grid{stroke:var(--line);stroke-width:1;opacity:.5}
+.chart .ax{fill:var(--mut);font-size:11px;font-family:ui-monospace,monospace}
+.chart .cx{stroke:var(--accent);stroke-width:1;opacity:.6;stroke-dasharray:3 3}
+.chart .cxpt{fill:var(--accent);stroke:var(--card);stroke-width:1.5}
+.chart .cxbox{fill:var(--fg);opacity:.92}
+.chart .cxt{fill:var(--card);font-size:11px;font-family:ui-monospace,monospace}
+.chart .cxv{fill:var(--card);font-size:12px;font-weight:700;font-family:ui-monospace,monospace}
 .cmeta{margin-top:8px;font-size:12px;color:var(--mut)}.cmeta b{color:var(--fg)}
 .json{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;
   overflow:auto;font-size:12px;line-height:1.5;max-height:460px}
@@ -605,27 +614,67 @@ function loadDetail(id){
 function esc(x){return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
 function view(s){
   var t='<div class="dhead"><span class="mono">'+esc(s.feature)+'</span> <span class="chip">'+s.kind+'</span></div>';
-  if(s.kind==='line') return t+lineChart(s.points);
+  if(s.kind==='line') return t+lineChart(s.points, s.ci);
   if(s.kind==='raw') return t+rawTable(s);
   return t+'<pre class="json">'+esc(JSON.stringify(s.value,null,2))+'</pre>';
 }
-function lineChart(pts){
+function fmtv(v){var a=Math.abs(v); return (a!==0&&a<0.01)?v.toPrecision(3):(a>=1000?v.toFixed(1):v.toPrecision(4));}
+function lineChart(pts, ci){
   if(!pts||!pts.length) return '<div class="muted">no numeric series</div>';
-  var w=900,h=280,pad=44,n=pts.length,vals=pts.map(function(p){return p[1];});
-  var mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals); if(mn===mx){mn-=1;mx+=1;}
-  function X(i){return pad+(w-2*pad)*(n<2?0.5:i/(n-1));}
-  function Y(v){return h-pad-(h-2*pad)*((v-mn)/(mx-mn));}
-  var d='',a='M'+X(0).toFixed(1)+' '+(h-pad);
-  for(var i=0;i<n;i++){var x=X(i).toFixed(1),y=Y(pts[i][1]).toFixed(1); d+=(i?'L':'M')+x+' '+y+' '; a+=' L'+x+' '+y;}
-  a+=' L'+X(n-1).toFixed(1)+' '+(h-pad)+' Z';
+  var W=940,H=320,pl=62,pr=64,pt=18,pb=40,n=pts.length,vals=pts.map(function(p){return p[1];});
+  var mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals);
+  if(ci){mn-=ci;mx+=ci;} if(mn===mx){mn-=1;mx+=1;}
+  var pad=(mx-mn)*0.06; mn-=pad; mx+=pad;
+  var C={n:n,mn:mn,mx:mx,pl:pl,pr:pr,pt:pt,pb:pb,W:W,H:H,pts:pts,ci:ci||0};
+  window.CHART=C;
+  function X(i){return pl+(W-pl-pr)*(n<2?0.5:i/(n-1));}
+  function Y(v){return (H-pb)-((H-pb-pt))*((v-mn)/(mx-mn));}
+  var g='';
+  // y gridlines + labels
+  for(var k=0;k<=4;k++){var yv=mn+(mx-mn)*k/4, y=Y(yv).toFixed(1);
+    g+='<line class="grid" x1="'+pl+'" y1="'+y+'" x2="'+(W-pr)+'" y2="'+y+'"></line>';
+    g+='<text class="ax" x="'+(pl-8)+'" y="'+(+y+4)+'" text-anchor="end">'+fmtv(yv)+'</text>';}
+  // x date ticks
+  var K=Math.min(6,n);
+  for(var j=0;j<K;j++){var xi=Math.round(j*(n-1)/(K-1||1)), x=X(xi).toFixed(1);
+    g+='<line class="grid" x1="'+x+'" y1="'+pt+'" x2="'+x+'" y2="'+(H-pb)+'" opacity="0.5"></line>';
+    g+='<text class="ax" x="'+x+'" y="'+(H-pb+18)+'" text-anchor="middle">'+esc(String(pts[xi][0]).slice(5))+'</text>';}
+  // CI band (constant ±1.96σ)
+  var band='';
+  if(ci){var up='',lo='';
+    for(var b=0;b<n;b++){up+=(b?'L':'M')+X(b).toFixed(1)+' '+Y(pts[b][1]+ci).toFixed(1)+' ';}
+    for(var b2=n-1;b2>=0;b2--){lo+='L'+X(b2).toFixed(1)+' '+Y(pts[b2][1]-ci).toFixed(1)+' ';}
+    band='<path class="ciband" d="'+up+lo+'Z"></path>';}
+  // line + area
+  var d='',a='M'+X(0).toFixed(1)+' '+(H-pb);
+  for(var i=0;i<n;i++){var xx=X(i).toFixed(1),yy=Y(pts[i][1]).toFixed(1); d+=(i?'L':'M')+xx+' '+yy+' '; a+=' L'+xx+' '+yy;}
+  a+=' L'+X(n-1).toFixed(1)+' '+(H-pb)+' Z';
   var last=pts[n-1];
-  return '<svg viewBox="0 0 '+w+' '+h+'" class="chart">'+
-    '<path d="'+a+'" class="area"></path><path d="'+d+'" class="ln"></path>'+
+  return '<svg viewBox="0 0 '+W+' '+H+'" class="chart" onmousemove="chartHover(event)" onmouseleave="clearCross()">'+
+    g+band+'<path d="'+a+'" class="area"></path><path d="'+d+'" class="ln"></path>'+
     '<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(last[1]).toFixed(1)+'" r="3.5" class="pt"></circle>'+
-    '<text x="6" y="'+(Y(mx)+4)+'" class="ct">'+mx.toPrecision(4)+'</text>'+
-    '<text x="6" y="'+(Y(mn)+4)+'" class="ct">'+mn.toPrecision(4)+'</text></svg>'+
-    '<div class="cmeta">'+pts[0][0]+' → '+last[0]+' · '+n+' points · latest <b>'+Number(last[1]).toPrecision(5)+'</b></div>';
+    '<g id="cross"></g></svg>'+
+    '<div class="cmeta">'+pts[0][0]+' → '+last[0]+' · '+n+' points · latest <b>'+fmtv(last[1])+'</b>'+
+    (ci?' · 95% CI ±'+fmtv(ci):'')+' <span class="muted">(hover the chart to read any point)</span></div>';
 }
+function chartHover(e){
+  var C=window.CHART; if(!C) return;
+  var svg=e.currentTarget, r=svg.getBoundingClientRect();
+  function X(i){return C.pl+(C.W-C.pl-C.pr)*(C.n<2?0.5:i/(C.n-1));}
+  function Y(v){return (C.H-C.pb)-((C.H-C.pb-C.pt))*((v-C.mn)/(C.mx-C.mn));}
+  var fx=(e.clientX-r.left)/r.width*C.W;
+  var df=(fx-C.pl)/(C.W-C.pl-C.pr); df=Math.max(0,Math.min(1,df));
+  var i=Math.round(df*(C.n-1)); var p=C.pts[i], cx=X(i), cy=Y(p[1]);
+  var lx=Math.max(C.pl+2,Math.min(cx,C.W-C.pr-150));
+  var val=fmtv(p[1])+(C.ci?'  ±'+fmtv(C.ci):'');
+  document.getElementById('cross').innerHTML=
+    '<line class="cx" x1="'+cx.toFixed(1)+'" y1="'+C.pt+'" x2="'+cx.toFixed(1)+'" y2="'+(C.H-C.pb)+'"></line>'+
+    '<circle class="cxpt" cx="'+cx.toFixed(1)+'" cy="'+cy.toFixed(1)+'" r="4"></circle>'+
+    '<rect class="cxbox" x="'+lx.toFixed(1)+'" y="'+(C.pt+2)+'" width="152" height="34" rx="5"></rect>'+
+    '<text class="cxt" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+16)+'">'+esc(String(p[0]))+'</text>'+
+    '<text class="cxv" x="'+(lx+8).toFixed(1)+'" y="'+(C.pt+30)+'">'+val+'</text>';
+}
+function clearCross(){var c=document.getElementById('cross'); if(c)c.innerHTML='';}
 function rawTable(s){
   var h='<div class="tswrap"><table class="ts"><thead><tr>';
   for(var i=0;i<s.columns.length;i++) h+='<th>'+esc(s.columns[i])+'</th>';
@@ -692,6 +741,76 @@ def render_single_stock(graph: dict, tickers: list) -> str:
     return _CSS + "<style>" + _SS_CSS + "</style>" + body + data + "<script>" + _SS_JS + "</script>"
 
 
+def render_predictors(rep: dict) -> str:
+    prod = rep["production"]
+    FAM_CLS = {"return": "k-line", "direction": "k-json", "volatility": "k-raw"}
+    cards = [("Predictors", str(len(rep["predictors"])), "models × horizons"),
+             ("Promoted", str(rep["n_promoted"]), "in production"),
+             ("Production window", f'{(prod.get("train_start") or "—")[:10]} → {(prod.get("train_end") or "—")[:10]}',
+              "training range (serving rejects asof ≤ end)"),
+             ("Train rows", f'{prod.get("n_train_rows", 0):,}', "labeled (date×ticker)")]
+    ch = "".join(f'<div class="card"><div class="eyebrow">{t}</div><div class="metric">{v}</div>'
+                 f'<div class="sub">{s}</div></div>' for t, v, s in cards)
+
+    def pct(x):
+        return "—" if x is None else f"{x * 100:.1f}%"
+
+    def num(x, d=3):
+        return "—" if x is None else f"{x:.{d}f}"
+
+    rows = ""
+    for p in rep["predictors"]:
+        if p["family"] == "return":
+            skill = (f'<span class="mono">IC {num(p["ic"])}</span> · dir-hit '
+                     f'<b>{pct(p["hit"])}</b> · CI ±{pct(p.get("ci95"))}')
+        elif p["family"] == "direction":
+            skill = f'up-hit <b>{pct(p.get("up_hit"))}</b> · down-hit <b>{pct(p.get("down_hit"))}</b>'
+        else:
+            skill = f'corr(realized) <b>{num(p.get("vol_corr"))}</b>'
+        star = ('<span class="chip done">production</span>' if p["promoted"]
+                else '<span class="chip">candidate</span>')
+        rows += (f'<tr><td class="mono feat"><span class="ndot {FAM_CLS.get(p["family"],"")}"></span>{p["feature"]}</td>'
+                 f'<td>{p["family"]}</td><td class="mono muted">{p["horizon"]}</td>'
+                 f'<td class="mono muted">{p["model"]}</td>'
+                 f'<td>{skill}</td><td class="mono num">{p["tickers"]}·{p["n"]:,}</td><td>{star}</td></tr>')
+
+    return f"""{_CSS}
+<style>
+.ndot{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}}
+.ndot.k-line{{background:var(--accent)}}.ndot.k-json{{background:#3b82c4}}.ndot.k-raw{{background:#c9930b}}
+.note{{font-size:12.5px;color:var(--mut);line-height:1.6;margin-top:6px}}
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:10px 0;color:var(--mut)}}
+.fstep{{padding:3px 10px;border:1px solid var(--line);border-radius:16px}}
+.fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
+</style>
+<main>
+  <header><div class="brand"><span class="live"></span>Predictors</div>
+    <div class="gen mono">live · {rep["generated_at"][:19].replace("T", " ")} UTC</div></header>
+  <div class="flow"><span class="fstep">S1</span>→<span class="fstep">S2</span>→
+    <span class="fstep cur">S3 predictors</span>→<span class="fstep">S4 alpha</span></div>
+  <section class="cards">{ch}</section>
+  <section class="panel"><h2>Predictor models
+    <span class="muted">— each family × horizon, its OOS skill (walk-forward predictions vs realized), and production status</span></h2>
+    <table class="queue"><thead><tr><th>Output</th><th>Family</th><th>Horizon</th><th>Model</th>
+    <th>OOS skill</th><th>coverage</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>
+    <div class="note">Skill is measured on the leakage-free walk-forward predictions vs. the realized
+    forward outcome. <b>IC</b> = Pearson corr(pred return, realized). <b>dir-hit / up-hit / down-hit</b> =
+    fraction correct. These are BUILT + MEASURED, not yet validated for capital — the §5 gate governs
+    real sizing. Predict from any of them via the trigger on <a href="/single-stock">/single-stock</a>.</div>
+  </section>
+  <section class="panel"><h2>Confidence intervals <span class="muted">— return CI half-width (95% = ±1.96σ)</span></h2>
+    <table class="queue"><thead><tr><th>Horizon</th><th>σ (residual)</th><th>95% CI half-width</th></tr></thead><tbody>
+    {"".join(f'<tr><td class="mono">{k}</td><td class="mono">{v}</td><td class="mono">±{v*1.96*100:.1f}%</td></tr>' for k,v in rep["band"].items())}
+    </tbody></table></section>
+</main>"""
+
+
+def _page_predictors(rep):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Predictors</title></head><body>' + render_predictors(rep) + '</body></html>')
+
+
 def _page_single(graph, tickers):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -732,6 +851,10 @@ def serve(port=8787):
             elif path == "/signal-processing":        # S2 feature lineage + gaps
                 import pipeline_map
                 payload = _page_s2(pipeline_map.report()).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/predictors":               # S3 predictor models + OOS skill
+                import pipeline_map
+                payload = _page_predictors(pipeline_map.predictor_report()).encode()
                 ctype = "text/html; charset=utf-8"
             elif path == "/single-stock":             # per-ticker dataflow DAG
                 import pipeline_map
