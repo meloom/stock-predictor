@@ -31,14 +31,19 @@ from __future__ import annotations
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core import FeatureStore, DEFAULT_DB, MARKET_SCOPE   # noqa: E402
+from universe import UNIVERSE                             # noqa: E402
 
 DAY = 86400
 BACKFILL_PRIORITY_BOOST = 1000   # backfill tasks run ahead of every routine refresh
+# Fixed history horizon: collect every backfillable signal from this date until now,
+# then keep accruing forward. History-mode fetch ranges and coverage expectations are
+# measured against this start, NOT a rolling window.
+COLLECTION_START = date(2025, 7, 1)
 CREDENTIALS = Path.home() / ".credentials"
 # S1 kind -> its typed table (schema.py) for honest coverage/depth measurement.
 KIND_TABLE = {
@@ -187,27 +192,57 @@ class Collector:
 
     def reconcile(self, tickers: list[str] | None = None) -> int:
         """Declarative self-healing (replaces manual seed): ensure every declared
-        (kind, scope) has a task. A brand-new signal — or one that has never
-        successfully collected — is enqueued as a PRIORITIZED BACKFILL (priority
-        boosted below every routine refresh) so it's picked up first. Idempotent:
-        the daemon calls this on startup and on a timer, so registering a new kind
-        auto-backfills it with zero manual steps. Returns how many it (re)armed."""
+        (kind, scope) is actually COVERED. A (kind, scope) is re-armed as a
+        PRIORITIZED BACKFILL (priority boosted below every routine refresh) when it
+        is:
+          • brand-new (no task yet), OR
+          • never successfully collected (null last_ok, not already queued), OR
+          • missing from the TYPED store — a task the legacy feature_values
+            projection marked 'collected' but which has no typed row is NOT covered,
+            so we re-backfill it until a real typed row exists.
+        Coverage is judged against the typed tables (schema.py), never the queue's
+        presence flag. Idempotent: the daemon calls this on startup and every 5 min,
+        so declaring a new kind — or a half-migrated one — heals to real coverage
+        with zero manual steps. Returns how many it (re)armed."""
         tickers = tickers or list(UNIVERSE)
         now = self._now().isoformat()
         armed = 0
+        # entities actually present in the typed store, per kind (real coverage).
+        # Only built for kinds that HAVE a typed table, so tests with plain kinds
+        # never touch the typed store.
+        present = {}
+        typed_kinds = [kd for kd in self.kinds if kd in KIND_TABLE]
+        if typed_kinds:
+            tc = _typed().c
+            for kd in typed_kinds:
+                tbl = KIND_TABLE[kd]
+                ent = "name" if tbl == "macro" else "ticker"
+                try:
+                    present[kd] = {r[0] for r in tc.execute(f"SELECT DISTINCT {ent} FROM {tbl}")}
+                except Exception:
+                    present[kd] = set()
         for kind, k in self.kinds.items():
             scopes = [MARKET_SCOPE] if k["scope"] == "market" else tickers
             bf_prio = k["priority"] - BACKFILL_PRIORITY_BOOST     # runs before all refreshes
+            pres = present.get(kind)                              # None if no typed table
             for sc in scopes:
                 tid = f"{k['source']}:{kind}:{sc}"
-                row = self.c.execute("SELECT last_ok, status FROM collection_tasks WHERE task_id=?",
-                                     (tid,)).fetchone()
+                row = self.c.execute("SELECT last_ok, status, next_due FROM collection_tasks "
+                                     "WHERE task_id=?", (tid,)).fetchone()
+                # missing from the typed store (ticker scope only; market handled by depth)
+                missing_typed = (pres is not None and k["scope"] != "market" and sc not in pres)
+                due_now = row is not None and row[2] is not None and row[2] <= now
                 if row is None:                                  # brand-new signal/scope
                     self._upsert(k["source"], kind, sc, bf_prio, k["interval"], now); armed += 1
-                elif row[0] is None and row[1] != "pending":     # never collected, not queued
-                    self.c.execute("UPDATE collection_tasks SET status='pending', priority=?, "
-                                   "next_due=?, last_error=NULL, updated_at=? WHERE task_id=?",
-                                   (bf_prio, now, now, tid)); armed += 1
+                elif row[0] is None or missing_typed:
+                    # never collected, OR marked 'collected' by the legacy projection
+                    # but with no typed row -> (re)arm as prioritized backfill and pull
+                    # it DUE NOW, even if it is 'pending' but scheduled in the future
+                    # (which is exactly why the typed backfill was never running).
+                    if row[1] != "pending" or not due_now:
+                        self.c.execute("UPDATE collection_tasks SET status='pending', priority=?, "
+                                       "next_due=?, last_error=NULL, updated_at=? WHERE task_id=?",
+                                       (bf_prio, now, now, tid)); armed += 1
         self.c.commit()
         return armed
 
@@ -414,7 +449,9 @@ class Collector:
                 continue                                  # derived (S2+) — not collection
             a = agg.get(kind, {"total": 0, "collected": 0, "due": 0, "errors": 0, "last": None})
             mode, table = k.get("mode", "snapshot"), KIND_TABLE.get(kind)
-            want = max(1, round(k.get("backfill_days", 90) * 5 / 7))   # trading days in window
+            # expected depth = trading days from the fixed COLLECTION_START to today
+            span_days = max(1, (now.date() - COLLECTION_START).days)
+            want = max(1, round(span_days * 5 / 7))            # trading days since start
             breadth = round(100 * a["collected"] / a["total"]) if a["total"] else 0
             e = {"kind": kind, "source": k.get("source", "?"), "mode": mode,
                  "total": a["total"], "collected": a["collected"], "due_now": a["due"],
@@ -461,17 +498,32 @@ class Collector:
             signals.append({"feature": feature, "rows": nrows, "scopes": nscopes,
                             "latest_event": latest_evt, "fresh_h": hours_since(latest_ing)})
 
-        # ticker × signal matrix, with the TIME detail per cell (count + event span)
-        cols = matrix_features or ["price.close", "price.current", "short.pct_float",
-                                   "opt.implied_move", "fundamental.analyst_snapshot",
-                                   "fundamental.statements", "earnings.next_date"]
+        # ticker × signal freshness matrix — read from the TYPED store (real data),
+        # NOT the feature_values projection. An uncollected ticker then shows
+        # 'missing' instead of a false green from a projection-era row.
+        import schema
+        MATRIX = [("Bars", "bars"), ("Quote", "quotes"), ("Short%", "short_interest"),
+                  ("ImplMove", "options_implied"), ("Fundmls", "fundamentals"),
+                  ("NextEarn", "earnings_calendar"), ("Analyst", None)]
+        cols = [label for label, _ in MATRIX]
         matrix = {}
-        for feature, scope, ing, cnt, first_e, last_e in self.c.execute(
-                "SELECT feature, scope, MAX(ingested_at), COUNT(*), MIN(event_time), MAX(event_time) "
-                "FROM feature_values WHERE feature IN (%s) GROUP BY feature, scope"
-                % ",".join("?" * len(cols)), cols):
-            matrix.setdefault(scope, {})[feature] = {
-                "fresh_h": hours_since(ing), "count": cnt, "first": first_e, "last": last_e}
+        for label, table in MATRIX:
+            if table:
+                tcol = schema.SCHEMA[table][0]
+                try:
+                    rows_ = ts.c.execute(
+                        f"SELECT ticker, MAX(ingested_at), COUNT(*), MIN({tcol}), MAX({tcol}) "
+                        f"FROM {table} GROUP BY ticker").fetchall()
+                except Exception:
+                    rows_ = []
+            else:                                     # analyst snapshot lives in feature_values
+                rows_ = self.c.execute(
+                    "SELECT scope, MAX(ingested_at), COUNT(*), MIN(event_time), MAX(event_time) "
+                    "FROM feature_values WHERE feature='fundamental.analyst_snapshot' "
+                    "GROUP BY scope").fetchall()
+            for scope, ing, cnt, first_e, last_e in rows_:
+                matrix.setdefault(scope, {})[label] = {
+                    "fresh_h": hours_since(ing), "count": cnt, "first": first_e, "last": last_e}
 
         # full queue schedule (per source/kind/scope task, sorted by what's next)
         queue = []
@@ -554,9 +606,8 @@ def _h_bars_polygon(scope, store, tid):
         raise RuntimeError("no POLYGON_API_KEY")
     import s1_data
     _reg_s1(store)
-    from datetime import date, timedelta
     to = date.today().isoformat()
-    frm = (date.today() - timedelta(days=400)).isoformat()
+    frm = COLLECTION_START.isoformat()                        # fixed history horizon
     d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/day/{frm}/{to}"
                   f"?adjusted=true&sort=asc&limit=50000", key)
     res = d.get("results") or []
@@ -577,7 +628,8 @@ def _h_bars_polygon(scope, store, tid):
 def _h_macro(scope, store, tid):
     import s1_data
     _reg_s1(store)
-    macro = s1_data.fetch_macro("1y")
+    span_days = (date.today() - COLLECTION_START).days + 5     # cover the fixed horizon
+    macro = s1_data.fetch_macro(f"{span_days}d")
     typed = [{"name": k, "date": pt["date"], "value": pt["value"]}
              for k, series in macro.items() for pt in series]
     proj = [(f"macro.{k}", MARKET_SCOPE, pt["date"], pt["value"])
