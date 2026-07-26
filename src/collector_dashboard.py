@@ -44,6 +44,28 @@ def _fresh_class(h):
     return "fresh" if h <= 24 else ("aging" if h <= 168 else "stale")
 
 
+def _fresh_class_sla(sec, sla):
+    """Color a cell by its signal's own freshness SLA: ≤green→fresh, ≤yellow→aging,
+    else stale; None→missing. (Quote's SLA is 5min/30min, so a stale quote reddens
+    within the hour, while a daily signal stays green for a day.)"""
+    if sec is None:
+        return "miss"
+    green, yellow = sla
+    return "fresh" if sec <= green else ("aging" if sec <= yellow else "stale")
+
+
+def _dur(sec):
+    if sec is None:
+        return "—"
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{round(sec/60)}m"
+    if sec < 172800:
+        return f"{round(sec/3600)}h"
+    return f"{round(sec/86400)}d"
+
+
 def _bar(pct, cls="run"):
     return (f'<div class="bar"><span class="fill {cls}" style="width:{pct}%"></span>'
             f'</div><span class="pct">{pct}%</span>')
@@ -88,26 +110,27 @@ def render(report: dict, tickers: list[str]) -> str:
         last = f'{k["last_run_h"]}h ago' if k["last_run_h"] is not None else "—"
         err = f'<span class="chip crit">{k["errors"]} err</span>' if k["errors"] else ""
         due = f'<span class="chip">{k["due_now"]} due</span>' if k["due_now"] else ""
-        chip = f'<span class="mchip {MODE_CLS.get(mode,"run")}" title="{k.get("expect","")}">{mode}</span>'
+        freq = k.get("frequency", mode)
+        chip = f'<span class="mchip {MODE_CLS.get(mode,"run")}" title="{k.get("expect","")}">{freq}</span>'
         qrows += (f'<tr><td class="mono kind">{k["kind"]} {chip}</td><td class="src">{k["source"]}</td>'
                   f'<td class="barcell">{_bar(k["pct"], cls)}</td>'
                   f'<td class="detail muted">{k.get("detail","")}</td>'
                   f'<td>{due}{err}</td><td class="mono muted">{last}</td></tr>')
 
-    # heatmap with per-cell time detail in the tooltip
-    head = "".join(f'<th class="rot"><span>{SIGNAL_LABELS.get(c, c)}</span></th>' for c in cols)
+    # heatmap with per-cell time detail — each column colored by its OWN freshness SLA
+    head = "".join(f'<th class="rot"><span>{c["label"]}</span></th>' for c in cols)
     body = ""
     shown = [t for t in tickers if t in mat] + [t for t in tickers if t not in mat]
     for t in shown:
         cells = ""; row = mat.get(t, {})
         for c in cols:
-            cell = row.get(c); h = cell["fresh_h"] if cell else None
+            cell = row.get(c["label"]); sec = cell["fresh_sec"] if cell else None
             if cell:
                 span = f'{cell["first"]}→{cell["last"]}' if cell["first"] != cell["last"] else cell["first"]
-                tip = f'{t} · {SIGNAL_LABELS.get(c, c)} — {cell["count"]} pts · {span} · collected {h}h ago'
+                tip = f'{t} · {c["label"]} — {cell["count"]} pts · {span} · collected {_dur(sec)} ago'
             else:
-                tip = f'{t} · {SIGNAL_LABELS.get(c, c)} — no data yet'
-            cells += f'<td class="cell {_fresh_class(h)}" title="{tip}"></td>'
+                tip = f'{t} · {c["label"]} — no data yet'
+            cells += f'<td class="cell {_fresh_class_sla(sec, c["sla"])}" title="{tip}"></td>'
         body += f'<tr><th class="tick mono">{t}</th>{cells}</tr>'
 
     # full queue schedule — per signal × ticker × time
@@ -158,9 +181,9 @@ def render(report: dict, tickers: list[str]) -> str:
     <th>What we hold vs. expected</th><th>State</th><th>Last run</th></tr></thead><tbody>{qrows}</tbody></table>
   </section>
 
-  <section class="panel"><h2>Coverage &amp; freshness <span class="muted">— {len(shown)} tickers × {len(cols)} signals · hover a cell for counts &amp; date span</span></h2>
-    <div class="legend"><span><i class="cell fresh"></i>≤24h</span><span><i class="cell aging"></i>≤7d</span>
-    <span><i class="cell stale"></i>&gt;7d</span><span><i class="cell miss"></i>missing</span></div>
+  <section class="panel"><h2>Coverage &amp; freshness <span class="muted">— {len(shown)} tickers × {len(cols)} signals · each column colored by its OWN freshness SLA (e.g. Quote: ≤5m green, ≤30m amber, then red) · hover for counts, span &amp; age</span></h2>
+    <div class="legend"><span><i class="cell fresh"></i>fresh</span><span><i class="cell aging"></i>aging</span>
+    <span><i class="cell stale"></i>stale</span><span><i class="cell miss"></i>missing</span></div>
     <div class="heatwrap"><table class="heat"><thead><tr><th class="corner"></th>{head}</tr></thead>
     <tbody>{body}</tbody></table></div>
   </section>

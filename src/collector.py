@@ -44,6 +44,17 @@ BACKFILL_PRIORITY_BOOST = 1000   # backfill tasks run ahead of every routine ref
 # then keep accruing forward. History-mode fetch ranges and coverage expectations are
 # measured against this start, NOT a rolling window.
 COLLECTION_START = date(2025, 7, 1)
+# Native signal FREQUENCY taxonomy. Fixed cadences (5min..weekly) are regular time
+# series measured by depth; 'event' is irregular/undefined (collect all new from the
+# last watermark to now); 'snapshot' is point-in-time state that accrues forward.
+FREQ_SECONDS = {"5min": 300, "hourly": 3600, "daily": DAY, "weekly": 7 * DAY}
+FREQ_PPD = {"5min": 78, "hourly": 7, "daily": 1, "weekly": 0.2}   # points per TRADING day
+FREQ_MODE = {"5min": "history", "hourly": "history", "daily": "history",
+             "weekly": "history", "event": "rolling", "snapshot": "snapshot"}
+# freshness SLA per frequency: (green_max_sec, yellow_max_sec); beyond yellow = red.
+DEFAULT_SLA = {"5min": (300, 1800), "hourly": (3600, 10800), "daily": (DAY, 7 * DAY),
+               "weekly": (7 * DAY, 14 * DAY), "event": (3 * DAY, 7 * DAY),
+               "snapshot": (6 * 3600, DAY)}
 CREDENTIALS = Path.home() / ".credentials"
 # S1 kind -> its typed table (schema.py) for honest coverage/depth measurement.
 KIND_TABLE = {
@@ -111,26 +122,26 @@ class Collector:
     def register_source(self, source: str, limit: int, window_sec: int):
         self.limits[source] = (limit, window_sec)
 
-    def register_kind(self, kind, source, interval_sec, priority, handler,
-                      scope="ticker", est_calls=1, stage="S1", backfill_days=90,
-                      mode="snapshot"):
-        """Declare a data kind: source, refresh cadence, priority, handler, scope,
-        API cost, pipeline STAGE (S1 raw / S2 derived), how far back to backfill
-        history on first collection (backfill_days), and the coverage MODE that says
-        how "done" is honestly measured:
-          history  — backfillable to depth (daily bars, macro): coverage = fraction
-                     of the expected trading-day window actually stored.
-          snapshot — source exposes only "now" (quote, short, analyst, next-earnings):
-                     cannot be backfilled; coverage = tickers with a current snapshot,
-                     and real history only accrues going forward.
-          rolling  — source returns a rolling list of past events (earnings reports,
-                     statements, revisions, insider txns): coverage = tickers covered
-                     plus the record count and date span actually held.
-        Declaring a kind is all it takes — reconcile() auto-enqueues its prioritized
-        backfill."""
-        self.kinds[kind] = {"source": source, "interval": interval_sec, "priority": priority,
+    def register_kind(self, kind, source, priority, handler, frequency="snapshot",
+                      interval_sec=None, scope="ticker", est_calls=1, stage="S1",
+                      fresh_sla=None):
+        """Declare a data kind by its native FREQUENCY:
+          5min|hourly|daily|weekly — fixed-cadence time series. Coverage = fraction of
+              the expected points in [COLLECTION_START, now] at that cadence that are
+              actually stored. Poll interval defaults to the cadence.
+          event  — irregular / undefined (insider, revisions, earnings, short prints):
+              collect ALL new records from the last-collected watermark to now; coverage
+              = tickers covered + record count + span, not a fixed depth.
+          snapshot — point-in-time state (quote, analyst consensus, implied move, next-
+              earnings date): re-sampled each poll; history accrues forward.
+        `interval_sec` overrides the default poll cadence (e.g. quote polled every 5 min
+        for freshness). `fresh_sla=(green_sec, yellow_sec)` overrides the freshness
+        thresholds. Declaring a kind is all it takes — reconcile() auto-backfills it."""
+        interval = interval_sec if interval_sec is not None else FREQ_SECONDS.get(frequency, DAY)
+        self.kinds[kind] = {"source": source, "interval": interval, "priority": priority,
                             "scope": scope, "est_calls": est_calls, "stage": stage,
-                            "backfill_days": backfill_days, "mode": mode}
+                            "frequency": frequency, "mode": FREQ_MODE.get(frequency, "snapshot"),
+                            "sla": fresh_sla or DEFAULT_SLA.get(frequency, DEFAULT_SLA["snapshot"])}
         self.handlers[(source, kind)] = handler
 
     # ── rate limiter (persistent, rolling window) ─────────────────────────────
@@ -449,11 +460,14 @@ class Collector:
                 continue                                  # derived (S2+) — not collection
             a = agg.get(kind, {"total": 0, "collected": 0, "due": 0, "errors": 0, "last": None})
             mode, table = k.get("mode", "snapshot"), KIND_TABLE.get(kind)
-            # expected depth = trading days from the fixed COLLECTION_START to today
-            span_days = max(1, (now.date() - COLLECTION_START).days)
-            want = max(1, round(span_days * 5 / 7))            # trading days since start
+            freq = k.get("frequency", "snapshot")
+            # expected points = trading days since COLLECTION_START × points-per-day at
+            # the signal's native cadence (daily→1, hourly→7, 5min→78, weekly→0.2).
+            trading_days = max(1, round((now.date() - COLLECTION_START).days * 5 / 7))
+            want = max(1, round(trading_days * FREQ_PPD.get(freq, 1)))
             breadth = round(100 * a["collected"] / a["total"]) if a["total"] else 0
             e = {"kind": kind, "source": k.get("source", "?"), "mode": mode,
+                 "frequency": freq, "sla": k.get("sla"),
                  "total": a["total"], "collected": a["collected"], "due_now": a["due"],
                  "errors": a["errors"], "last_run_h": hours_since(a["last"])}
             # coverage is measured from the REAL typed store (schema.py), never the
@@ -464,14 +478,15 @@ class Collector:
                 d = ts.depth(table, cap=want)
                 denom = exp_ents * want
                 e.update(pct=min(100, round(100 * d["capped_sum"] / denom)) if denom else 0,
-                         detail=f'{d["entities"]}/{exp_ents} tickers · {d["median"]}/{want} trading days deep',
-                         expect=f'~{want} trading days of daily history (backfillable)')
+                         detail=f'{d["entities"]}/{exp_ents} tickers · {d["median"]}/{want} {freq} bars deep',
+                         expect=f'~{want} {freq} points since {COLLECTION_START} (backfillable)')
             elif mode == "rolling" and table:
                 cov = ts.coverage(table)
                 span = f'{(cov["first"] or "?")[:10]}→{(cov["last"] or "?")[:10]}'
+                avg = round(cov["rows"] / cov["entities"], 1) if cov["entities"] else 0
                 e.update(pct=round(100 * cov["entities"] / exp_ents) if exp_ents else 0,
-                         detail=f'{cov["entities"]}/{exp_ents} tickers · {cov["rows"]} records · {span}',
-                         expect='rolling event history (as far back as the source returns)')
+                         detail=f'{cov["entities"]}/{exp_ents} tickers · {cov["rows"]} recs (~{avg}/ticker) · {span}',
+                         expect='event history — collect all new from last watermark to now')
             elif table:                                    # snapshot WITH a typed table
                 cov = ts.coverage(table)
                 e.update(pct=round(100 * cov["entities"] / exp_ents) if exp_ents else 0,
@@ -502,12 +517,15 @@ class Collector:
         # NOT the feature_values projection. An uncollected ticker then shows
         # 'missing' instead of a false green from a projection-era row.
         import schema
-        MATRIX = [("Bars", "bars"), ("Quote", "quotes"), ("Short%", "short_interest"),
-                  ("ImplMove", "options_implied"), ("Fundmls", "fundamentals"),
-                  ("NextEarn", "earnings_calendar"), ("Analyst", None)]
-        cols = [label for label, _ in MATRIX]
+        MATRIX = [("Bars", "bars", "bars"), ("Quote", "quotes", "quote"),
+                  ("Short%", "short_interest", "short"), ("ImplMove", "options_implied", "implied_move"),
+                  ("Fundmls", "fundamentals", "statements"), ("NextEarn", "earnings_calendar", "earn_date"),
+                  ("Analyst", None, "analyst")]
+        def _sla(kd):                                     # freshness thresholds for a column's kind
+            return self.kinds.get(kd, {}).get("sla", DEFAULT_SLA["snapshot"])
+        cols = [{"label": label, "sla": _sla(kd)} for label, _, kd in MATRIX]
         matrix = {}
-        for label, table in MATRIX:
+        for label, table, kd in MATRIX:
             if table:
                 tcol = schema.SCHEMA[table][0]
                 try:
@@ -522,8 +540,10 @@ class Collector:
                     "FROM feature_values WHERE feature='fundamental.analyst_snapshot' "
                     "GROUP BY scope").fetchall()
             for scope, ing, cnt, first_e, last_e in rows_:
+                fh = hours_since(ing)
                 matrix.setdefault(scope, {})[label] = {
-                    "fresh_h": hours_since(ing), "count": cnt, "first": first_e, "last": last_e}
+                    "fresh_h": fh, "fresh_sec": None if fh is None else round(fh * 3600),
+                    "count": cnt, "first": first_e, "last": last_e}
 
         # full queue schedule (per source/kind/scope task, sorted by what's next)
         queue = []
@@ -599,8 +619,10 @@ def _h_bars(scope, store, tid):
 
 
 def _h_bars_polygon(scope, store, tid):
-    """Daily bars from Polygon (reliable — yfinance throttles rapid download bursts).
-    One call per ticker for ~13 months of history."""
+    """HOURLY bars from Polygon (reliable — yfinance throttles rapid download bursts).
+    One call per ticker for the full [COLLECTION_START, today] range. Stores every
+    hourly bar in the typed `bars` table (bar_ts), and projects the DAILY EOD close /
+    summed volume to feature_values so the daily S2/model consumers keep working."""
     key = load_secret("POLYGON_API_KEY")
     if not key:
         raise RuntimeError("no POLYGON_API_KEY")
@@ -608,19 +630,26 @@ def _h_bars_polygon(scope, store, tid):
     _reg_s1(store)
     to = date.today().isoformat()
     frm = COLLECTION_START.isoformat()                        # fixed history horizon
-    d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/day/{frm}/{to}"
+    d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/hour/{frm}/{to}"
                   f"?adjusted=true&sort=asc&limit=50000", key)
     res = d.get("results") or []
     if not res:
         raise RuntimeError(f"no Polygon bars for {scope} — will retry")
-    typed, proj = [], []
+    typed = []
+    eod = {}                                                  # session date -> (last close, summed volume)
     for b in res:
-        dt = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date().isoformat()
-        typed.append({"ticker": scope, "date": dt, "open": b.get("o"), "high": b.get("h"),
-                      "low": b.get("l"), "close": b.get("c"), "volume": b.get("v")})
-        proj.append(("price.close", scope, dt, b["c"]))       # scalar projection for S2
-        proj.append(("price.volume", scope, dt, b["v"]))
-    _typed().put_many("bars", typed)                          # TYPED: full OHLCV, one row/day
+        dtm = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc)
+        typed.append({"ticker": scope, "bar_ts": dtm.isoformat(),
+                      "open": b.get("o"), "high": b.get("h"), "low": b.get("l"),
+                      "close": b.get("c"), "volume": b.get("v")})
+        day = dtm.date().isoformat()
+        c, v = eod.get(day, (None, 0.0))
+        eod[day] = (b.get("c"), v + (b.get("v") or 0))        # bars are sorted asc -> last close wins
+    _typed().put_many("bars", typed)                          # TYPED: full hourly OHLCV
+    proj = []
+    for day, (c, v) in eod.items():                           # DAILY EOD projection for S2
+        proj.append(("price.close", scope, day, c))
+        proj.append(("price.volume", scope, day, v))
     store.write_many(proj, trigger_id=tid)
     return len(typed), 1
 
@@ -839,47 +868,50 @@ def _num(v):
         return None
 
 
-def fetch_earnings_report(ticker: str) -> dict | None:
-    """Download the raw earnings report for the most recent REPORTED quarter:
-    EPS estimate/reported/surprise (from the earnings calendar) + latest quarterly
-    revenue & net income. event_time = the announcement date (PIT-correct)."""
+def fetch_earnings_reports(ticker: str) -> list[dict]:
+    """Download EVERY reported quarter yfinance exposes (typically 4–8), newest-first
+    — NOT just the latest. Each report: EPS estimate/reported/surprise (from the
+    earnings calendar) + that quarter's revenue & net income (mapped by column order),
+    with revenue_year_ago four quarters back for YoY. event_time = announcement date
+    (PIT-correct). Event-frequency signal: we collect all from the source and dedup by
+    (ticker, report_date)."""
     import yfinance as yf
     from datetime import date
     try:
         tk = yf.Ticker(ticker)
-        ed = tk.get_earnings_dates(limit=12)
+        ed = tk.get_earnings_dates(limit=16)
     except Exception:
-        return None
+        return []
     if ed is None or len(ed) == 0:
-        return None
-    today = date.today()
-    rep = None
-    for idx, row in ed.iterrows():                    # sorted newest-first
-        d = idx.date() if hasattr(idx, "date") else idx
-        if d <= today and _num(row.get("Reported EPS")) is not None:
-            rep = (d, row); break
-    if rep is None:
-        return None
-    d, row = rep
-    raw = {"event_time": d.isoformat(),
-           "eps_estimate": _num(row.get("EPS Estimate")),
-           "eps_reported": _num(row.get("Reported EPS")),
-           "surprise_pct": _num(row.get("Surprise(%)"))}
+        return []
     try:
         q = tk.quarterly_income_stmt
-        if q is not None and q.shape[1] >= 1:
-            def line(labels, col):
-                for lab in labels:
-                    if lab in q.index:
-                        return _num(q.loc[lab].iloc[col])
-                return None
-            raw["revenue"] = line(["Total Revenue", "Revenue"], 0)
-            raw["net_income"] = line(["Net Income", "Net Income Common Stockholders"], 0)
-            if q.shape[1] >= 5:
-                raw["revenue_year_ago"] = line(["Total Revenue", "Revenue"], 4)
     except Exception:
-        pass
-    return raw
+        q = None
+
+    def line(labels, col):
+        if q is None or col >= q.shape[1]:
+            return None
+        for lab in labels:
+            if lab in q.index:
+                return _num(q.loc[lab].iloc[col])
+        return None
+
+    today, out, qi = date.today(), [], 0
+    for idx, row in ed.iterrows():                    # sorted newest-first
+        d = idx.date() if hasattr(idx, "date") else idx
+        if d > today or _num(row.get("Reported EPS")) is None:
+            continue                                  # only past, actually-reported quarters
+        raw = {"event_time": d.isoformat(),
+               "eps_estimate": _num(row.get("EPS Estimate")),
+               "eps_reported": _num(row.get("Reported EPS")),
+               "surprise_pct": _num(row.get("Surprise(%)")),
+               "revenue": line(["Total Revenue", "Revenue"], qi),
+               "net_income": line(["Net Income", "Net Income Common Stockholders"], qi),
+               "revenue_year_ago": line(["Total Revenue", "Revenue"], qi + 4)}
+        out.append(raw)
+        qi += 1
+    return out
 
 
 def analyze_earnings(raw: dict) -> dict:
@@ -899,16 +931,18 @@ def analyze_earnings(raw: dict) -> dict:
 def _h_earn_report(scope, store, tid):
     for n, dt, sk, cd, r in _EARN_FEATURES:
         store.register(n, dt, sk, "S1", cd, r)
-    raw = fetch_earnings_report(scope)
-    if not raw or not raw.get("event_time"):
+    reports = fetch_earnings_reports(scope)                   # ALL reported quarters
+    if not reports:
         return 0, 1
-    _typed().put("earnings_reports", {                        # TYPED: EPS/revenue columns
-        "ticker": scope, "report_date": raw["event_time"],
-        "eps_estimate": raw.get("eps_estimate"), "eps_reported": raw.get("eps_reported"),
-        "surprise_pct": raw.get("surprise_pct"), "revenue": raw.get("revenue"),
-        "net_income": raw.get("net_income"), "revenue_year_ago": raw.get("revenue_year_ago")})
-    store.write("earnings.report_raw", scope, raw["event_time"], raw, trigger_id=tid)
-    return 1, 1
+    _typed().put_many("earnings_reports", [{                  # TYPED: one row per quarter
+        "ticker": scope, "report_date": r["event_time"],
+        "eps_estimate": r.get("eps_estimate"), "eps_reported": r.get("eps_reported"),
+        "surprise_pct": r.get("surprise_pct"), "revenue": r.get("revenue"),
+        "net_income": r.get("net_income"), "revenue_year_ago": r.get("revenue_year_ago")}
+        for r in reports])
+    for r in reports:                                         # projection, one per event_time
+        store.write("earnings.report_raw", scope, r["event_time"], r, trigger_id=tid)
+    return len(reports), 1
 
 
 def _h_earn_analysis(scope, store, tid):
@@ -993,21 +1027,24 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
     col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
     # kind, source, interval, priority, handler, scope, est_calls
-    col.register_kind("macro", "yfinance", DAY, 10, _h_macro, scope="market", est_calls=3, mode="history")
-    col.register_kind("bars", "polygon", DAY, 20, _h_bars_polygon, est_calls=1, mode="history")  # reliable vs yfinance throttle
-    col.register_kind("implied_move", "polygon", DAY, 25, _h_implied_move, est_calls=4, mode="snapshot")
-    col.register_kind("quote", "yfinance", 21600, 30, _h_quote, est_calls=1, mode="snapshot")
-    col.register_kind("analyst", "yfinance", DAY, 40, _h_analyst, est_calls=1, mode="snapshot")
-    col.register_kind("analyst_revisions", "yfinance", DAY, 41, _h_analyst_revisions, est_calls=1, mode="rolling")
-    col.register_kind("short", "yfinance", 3 * DAY, 42, _h_short, est_calls=1, mode="snapshot")
-    col.register_kind("insider", "yfinance", 3 * DAY, 44, _h_insider, est_calls=1, mode="rolling")
-    col.register_kind("earn_date", "yfinance", DAY, 45, _h_earn_date, est_calls=1, mode="snapshot")   # RAW next-earnings date/time
-    col.register_kind("earn_report", "yfinance", DAY, 46, _h_earn_report, est_calls=1, mode="rolling")
-    col.register_kind("statements", "yfinance", DAY, 50, _h_statements, est_calls=1, mode="rolling")
+    # kind, source, priority, handler, frequency=…  (poll interval defaults to cadence)
+    col.register_kind("macro", "yfinance", 10, _h_macro, frequency="daily", scope="market", est_calls=3)
+    col.register_kind("bars", "polygon", 20, _h_bars_polygon, frequency="hourly", est_calls=1)  # intraday OHLCV
+    col.register_kind("implied_move", "polygon", 25, _h_implied_move, frequency="snapshot", est_calls=4)
+    # quote polled every 5 min; fresh ≤5m green, ≤30m yellow, >30m red
+    col.register_kind("quote", "yfinance", 30, _h_quote, frequency="snapshot",
+                      interval_sec=300, fresh_sla=(300, 1800))
+    col.register_kind("analyst", "yfinance", 40, _h_analyst, frequency="snapshot")
+    col.register_kind("analyst_revisions", "yfinance", 41, _h_analyst_revisions, frequency="event")
+    col.register_kind("short", "yfinance", 42, _h_short, frequency="snapshot", interval_sec=3 * DAY)
+    col.register_kind("insider", "yfinance", 44, _h_insider, frequency="event", interval_sec=3 * DAY)
+    col.register_kind("earn_date", "yfinance", 45, _h_earn_date, frequency="snapshot")   # next-earnings date/time
+    col.register_kind("earn_report", "yfinance", 46, _h_earn_report, frequency="event")
+    col.register_kind("statements", "yfinance", 50, _h_statements, frequency="event")
     # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
     # they don't show on the data-collection dashboard. Each reads raw S1 data.
-    col.register_kind("earn_analysis", "process", DAY, 55, _h_earn_analysis, est_calls=1, stage="S2")
-    col.register_kind("days_to_earn", "process", DAY, 56, _h_days_to_earn, est_calls=1, stage="S2")
+    col.register_kind("earn_analysis", "process", 55, _h_earn_analysis, frequency="daily", stage="S2")
+    col.register_kind("days_to_earn", "process", 56, _h_days_to_earn, frequency="daily", stage="S2")
     return col
 
 

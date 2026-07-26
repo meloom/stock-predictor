@@ -20,7 +20,7 @@ from core import DEFAULT_DB                                      # noqa: E402
 
 # domain -> (timestamp column, [other columns]). ticker/name is the entity key.
 SCHEMA = {
-    "bars": ("date", ["ticker", "open", "high", "low", "close", "volume"]),
+    "bars": ("bar_ts", ["ticker", "open", "high", "low", "close", "volume"]),
     "quotes": ("quote_ts", ["ticker", "price", "session"]),
     "macro": ("date", ["name", "value"]),
     "short_interest": ("settlement_date", ["ticker", "shares_short", "pct_float",
@@ -44,11 +44,11 @@ SCHEMA = {
 # text vs real typing (everything else defaults REAL if it looks numeric, else TEXT)
 _TEXT = {"ticker", "name", "session", "expiry", "position", "insider", "firm",
          "action", "from_grade", "to_grade", "next_earnings_ts", "period_end",
-         "date", "quote_ts", "settlement_date", "snap_date", "report_date",
+         "date", "bar_ts", "quote_ts", "settlement_date", "snap_date", "report_date",
          "txn_date", "revision_date", "publish_date"}
 # per-table PRIMARY KEY (entity + timestamp, plus disambiguators for lists)
 _PK = {
-    "bars": ["ticker", "date"], "quotes": ["ticker", "quote_ts"],
+    "bars": ["ticker", "bar_ts"], "quotes": ["ticker", "quote_ts"],
     "macro": ["name", "date"], "short_interest": ["ticker", "settlement_date"],
     "options_implied": ["ticker", "snap_date"],
     "earnings_reports": ["ticker", "report_date"],
@@ -76,8 +76,24 @@ class TypedStore:
     def __init__(self, db_path=DEFAULT_DB):
         self.c = sqlite3.connect(Path(db_path))
         self.c.execute("PRAGMA busy_timeout=5000")
+        self._migrate()
         for t in SCHEMA:
             self.c.execute(_ddl(t))
+        self.c.commit()
+
+    def _migrate(self):
+        """Drop-and-recreate a table whose stored columns no longer match SCHEMA (the
+        data is re-backfilled from source, so dropping is safe). Currently: `bars`
+        moved from a daily `date` PK to an hourly `bar_ts` PK."""
+        for t in SCHEMA:
+            exists = self.c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+            if not exists:
+                continue
+            have = {r[1] for r in self.c.execute(f"PRAGMA table_info({t})")}
+            want = set(dict.fromkeys(SCHEMA[t][1] + [SCHEMA[t][0]])) | {"ingested_at"}
+            if have != want:
+                self.c.execute(f"DROP TABLE {t}")
         self.c.commit()
 
     def _now(self):
