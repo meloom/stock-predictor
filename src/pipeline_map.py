@@ -140,3 +140,89 @@ def report(db_path=DEFAULT_DB) -> dict:
     return {"generated_at": now.isoformat(), "groups": groups,
             "contract": contract, "gaps": gaps,
             "s2_feature_count": sum(len(g["features"]) for g in groups)}
+
+
+def _step_of(feature: str) -> str:
+    if feature.startswith("alpha."):
+        return "S4 · Alpha"
+    if feature.startswith("predict."):
+        return "S3 · Predictors"
+    if (feature.startswith(("tech.", "fund.", "xsec.", "xh.", "regime."))
+            or feature in ("calendar.days_to_earnings", "earnings.analysis",
+                           "fundamental.earnings_signal")):
+        return "S2 · Signals"
+    return "S1 · Raw"
+
+
+STEP_ORDER = ["S1 · Raw", "S2 · Signals", "S3 · Predictors", "S4 · Alpha"]
+
+
+def _fmt(v):
+    """Compact display for a stored value (float/int/dict/long text)."""
+    import json
+    if isinstance(v, str) and v[:1] in "{[":
+        try:
+            v = json.loads(v)
+        except Exception:
+            pass
+    if isinstance(v, dict):
+        return ", ".join(f"{k}={_fmt(val)}" for k, val in list(v.items())[:8])
+    if isinstance(v, float):
+        return f"{v:,.4g}"
+    if isinstance(v, str) and len(v) > 120:
+        return v[:120] + f"… ({len(v)} chars)"
+    return str(v)
+
+
+def single_stock(ticker: str, db_path=DEFAULT_DB) -> dict:
+    """Everything the pipeline holds for ONE stock: every signal at every step (S1→S4)
+    with its latest value + time-series depth, plus the FULL raw S1 rows underneath."""
+    import schema
+    ticker = (ticker or "").upper()
+    c = sqlite3.connect(Path(db_path))
+    now = datetime.now(timezone.utc)
+
+    # latest value per feature for this ticker (and the market context it rides on)
+    latest = c.execute(
+        "SELECT fv.feature, fv.event_time, fv.value, fv.ingested_at "
+        "FROM feature_values fv JOIN (SELECT feature, scope, MAX(event_time) me "
+        "  FROM feature_values WHERE scope IN (?, '_market') GROUP BY feature, scope) m "
+        "ON fv.feature=m.feature AND fv.scope=m.scope AND fv.event_time=m.me "
+        "WHERE fv.scope IN (?, '_market')", (ticker, ticker)).fetchall()
+    ndates = {f: n for f, n in c.execute(
+        "SELECT feature, COUNT(DISTINCT event_time) FROM feature_values "
+        "WHERE scope IN (?, '_market') GROUP BY feature", (ticker,))}
+
+    # dedup per feature: a value can have several ingested_at at the same event_time
+    # (bitemporal re-collection) — keep the newest (event_time, then ingested_at).
+    best = {}
+    for feature, et, value, ing in latest:
+        cur = best.get(feature)
+        if cur is None or (et or "", ing or "") > (cur[1] or "", cur[3] or ""):
+            best[feature] = (feature, et, value, ing)
+
+    steps = {s: [] for s in STEP_ORDER}
+    for feature, et, value, ing in best.values():
+        steps[_step_of(feature)].append({
+            "feature": feature, "value": _fmt(value), "event_time": et,
+            "n_dates": ndates.get(feature, 0), "fresh_h": _hours_since(ing, now)})
+    for s in steps:
+        steps[s].sort(key=lambda x: x["feature"])
+
+    # FULL raw S1 rows from the typed tables (the actual collected data)
+    ts = schema.TypedStore(db_path)
+    raw = []
+    for table in schema.SCHEMA:
+        if table == "macro":
+            continue                                        # market-wide, not per-stock
+        r = ts.rows(table, ticker, limit=6)
+        if r["rows"]:
+            for row in r["rows"]:                           # truncate long text columns
+                for k, v in row.items():
+                    if isinstance(v, str) and len(v) > 90:
+                        row[k] = v[:90] + f"… ({len(v)})"
+            raw.append(r)
+
+    return {"generated_at": now.isoformat(), "ticker": ticker, "steps": steps,
+            "step_order": STEP_ORDER, "raw": raw,
+            "signal_count": sum(len(v) for v in steps.values())}

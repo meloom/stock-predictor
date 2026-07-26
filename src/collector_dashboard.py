@@ -375,6 +375,8 @@ _STEPS = [
     ("S3", "Predictors", None, False, "Model training, precision@k, champion registry."),
     ("S4", "Alpha", None, False, "Regime gate, event risk, position signals."),
     ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
+    ("↳", "Single Stock", "/single-stock", True,
+     "One ticker across every step: all S1→S4 signals + the full raw collected rows."),
 ]
 
 
@@ -520,6 +522,77 @@ def render_s2(rep: dict) -> str:
 </main>"""
 
 
+def render_single_stock(rep: dict, tickers: list) -> str:
+    tk = rep["ticker"]
+    STEP_CLS = {"S1 · Raw": "snap", "S2 · Signals": "cur", "S3 · Predictors": "roll",
+                "S4 · Alpha": "hist"}
+    opts = "".join(f'<option{" selected" if t == tk else ""}>{t}</option>' for t in tickers)
+
+    # per-step signal sections
+    secs = ""
+    for step in rep["step_order"]:
+        items = rep["steps"].get(step, [])
+        rows = ""
+        for s in items:
+            fresh = f'{s["fresh_h"]}h' if s["fresh_h"] is not None else "—"
+            rows += (f'<tr><td class="mono feat">{s["feature"]}</td>'
+                     f'<td class="mono val">{s["value"]}</td>'
+                     f'<td class="mono num">{s["n_dates"]}</td>'
+                     f'<td class="mono muted">{(s["event_time"] or "—")[:10]} · {fresh}</td></tr>')
+        if not rows:
+            rows = '<tr><td colspan="4" class="muted">— no signals yet —</td></tr>'
+        secs += (f'<section class="panel"><h2><span class="mchip {STEP_CLS.get(step,"run")}">{step.split(" · ")[0]}</span> '
+                 f'{step.split(" · ")[1]} <span class="muted">— {len(items)} signals</span></h2>'
+                 f'<table class="queue"><thead><tr><th>Signal</th><th>Latest value</th>'
+                 f'<th>Dates</th><th>As of · fresh</th></tr></thead><tbody>{rows}</tbody></table></section>')
+
+    # FULL raw S1 rows (typed tables) at the bottom
+    raws = ""
+    for r in rep["raw"]:
+        head = "".join(f'<th>{c}</th>' for c in r["columns"])
+        body = ""
+        for row in r["rows"]:
+            body += "<tr>" + "".join(
+                f'<td class="mono {"tscol" if c == r["ts_col"] else ""}">{row.get(c) if row.get(c) is not None else "—"}</td>'
+                for c in r["columns"]) + "</tr>"
+        raws += (f'<div class="rawtbl"><div class="rawname mono">{r["table"]}</div>'
+                 f'<div class="tswrap"><table class="ts"><thead><tr>{head}</tr></thead>'
+                 f'<tbody>{body}</tbody></table></div></div>')
+
+    return f"""{_CSS}
+<style>
+.picker{{display:flex;gap:10px;align-items:center;margin:12px 0}}
+.picker select{{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);
+  background:var(--card);color:var(--fg);font-family:ui-monospace,monospace}}
+.val{{font-size:12.5px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.rawtbl{{margin-bottom:18px}}.rawname{{font-weight:640;font-size:13px;margin-bottom:6px}}
+.mchip.cur{{color:var(--accent)}}.mchip.snap{{color:#c9930b}}.mchip.roll{{color:#3b82c4}}.mchip.hist{{color:var(--fresh)}}
+.ts td.tscol{{color:var(--accent)}}
+</style>
+<main>
+  <header>
+    <div class="brand"><span class="live"></span>Single Stock · {tk}</div>
+    <div class="gen mono">live · {rep["generated_at"][:19].replace("T", " ")} UTC</div>
+  </header>
+  <form class="picker" method="get" action="/single-stock">
+    <label class="muted">Ticker</label>
+    <select name="ticker" onchange="this.form.submit()">{opts}</select>
+    <span class="muted">{rep["signal_count"]} signals across all steps</span>
+  </form>
+  {secs}
+  <section class="panel"><h2>Full raw signals <span class="muted">— the actual collected S1 rows for {tk} (typed tables)</span></h2>
+    {raws or '<div class="muted">no raw rows yet</div>'}
+  </section>
+</main>"""
+
+
+def _page_single(rep, tickers):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Single Stock · {rep["ticker"]}</title></head><body>'
+            + render_single_stock(rep, tickers) + '</body></html>')
+
+
 def _page_s2(rep):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -553,6 +626,12 @@ def serve(port=8787):
             elif path == "/signal-processing":        # S2 feature lineage + gaps
                 import pipeline_map
                 payload = _page_s2(pipeline_map.report()).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/single-stock":             # per-ticker: all signals, all steps
+                import pipeline_map
+                q = parse_qs(parsed.query)
+                tk = (q.get("ticker", [""])[0] or UNIVERSE[0]).upper()
+                payload = _page_single(pipeline_map.single_stock(tk), list(UNIVERSE)).encode()
                 ctype = "text/html; charset=utf-8"
             else:                                     # "/" index of all step dashboards
                 payload = _index_page().encode()

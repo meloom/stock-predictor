@@ -19,6 +19,21 @@ def test_every_predictor_feature_is_produced_by_an_s2_group():
         assert f in produced, f"{f} consumed by S3 but not in any S2 lineage group"
 
 
+def test_step_classification_is_correct():
+    """The single-stock page must file each signal under the right pipeline step —
+    note fundamental.* is S1 but fund.* is S2 (distinct prefixes)."""
+    f = pipeline_map._step_of
+    assert f("price.close") == "S1 · Raw"
+    assert f("fundamental.statements") == "S1 · Raw"      # S1, not fund.*
+    assert f("short.pct_float") == "S1 · Raw"
+    assert f("tech.intraday_ret") == "S2 · Signals"
+    assert f("fund.market_cap") == "S2 · Signals"          # fund.* is S2
+    assert f("earnings.analysis") == "S2 · Signals"        # derived, not raw
+    assert f("earnings.report_raw") == "S1 · Raw"
+    assert f("predict.eod_return") == "S3 · Predictors"
+    assert f("alpha.signal") == "S4 · Alpha"
+
+
 def test_gaps_reference_real_s1_tables():
     from schema import SCHEMA
     for g in pipeline_map.GAPS:
