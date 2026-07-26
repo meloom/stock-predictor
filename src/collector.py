@@ -870,11 +870,11 @@ def _num(v):
 
 def fetch_earnings_reports(ticker: str) -> list[dict]:
     """Download EVERY reported quarter yfinance exposes (typically 4–8), newest-first
-    — NOT just the latest. Each report: EPS estimate/reported/surprise (from the
-    earnings calendar) + that quarter's revenue & net income (mapped by column order),
-    with revenue_year_ago four quarters back for YoY. event_time = announcement date
-    (PIT-correct). Event-frequency signal: we collect all from the source and dedup by
-    (ticker, report_date)."""
+    — NOT just the latest — and save the COMPLETE RAW as reported for that quarter:
+    the full earnings-date calendar row + every income-statement line item, verbatim in
+    `raw`. Only this-quarter figures; NO derived/cross-quarter fields (YoY, margins,
+    beat/miss are S2). event_time = announcement date (PIT-correct). Event-frequency:
+    collect all from the source, dedup by (ticker, report_date)."""
     import yfinance as yf
     from datetime import date
     try:
@@ -902,22 +902,30 @@ def fetch_earnings_reports(ticker: str) -> list[dict]:
         d = idx.date() if hasattr(idx, "date") else idx
         if d > today or _num(row.get("Reported EPS")) is None:
             continue                                  # only past, actually-reported quarters
+        # COMPLETE raw payload for this quarter, verbatim from the source
+        cal_row = {str(k): _num(v) for k, v in row.items()}
+        inc_stmt = ({str(q.index[r]): _num(q.iloc[r, qi]) for r in range(len(q.index))}
+                    if (q is not None and qi < q.shape[1]) else {})
         raw = {"event_time": d.isoformat(),
                "eps_estimate": _num(row.get("EPS Estimate")),
                "eps_reported": _num(row.get("Reported EPS")),
                "surprise_pct": _num(row.get("Surprise(%)")),
                "revenue": line(["Total Revenue", "Revenue"], qi),
                "net_income": line(["Net Income", "Net Income Common Stockholders"], qi),
-               "revenue_year_ago": line(["Total Revenue", "Revenue"], qi + 4)}
+               "gross_profit": line(["Gross Profit"], qi),
+               "operating_income": line(["Operating Income", "Operating Income Or Loss"], qi),
+               "raw": {"earnings_date_row": cal_row, "income_statement": inc_stmt}}
         out.append(raw)
         qi += 1
     return out
 
 
-def analyze_earnings(raw: dict) -> dict:
-    """PROCESS a raw earnings report into the analysis outcome."""
+def analyze_earnings(raw: dict, prev_revenue: float | None = None) -> dict:
+    """PROCESS a raw earnings report into the analysis outcome (S2). YoY is derived here
+    from the year-ago quarter's raw revenue (`prev_revenue`), which S2 looks up from the
+    raw store — it is NOT a field of the raw report."""
     s = raw.get("surprise_pct")
-    rev, prev, ni = raw.get("revenue"), raw.get("revenue_year_ago"), raw.get("net_income")
+    rev, prev, ni = raw.get("revenue"), prev_revenue, raw.get("net_income")
     yoy = ((rev - prev) / prev * 100) if (rev and prev and prev > 0) else None
     margin = (ni / rev * 100) if (ni is not None and rev) else None
     beat = None if s is None else ("beat" if s > 0.5 else ("miss" if s < -0.5 else "inline"))
@@ -934,13 +942,15 @@ def _h_earn_report(scope, store, tid):
     reports = fetch_earnings_reports(scope)                   # ALL reported quarters
     if not reports:
         return 0, 1
-    _typed().put_many("earnings_reports", [{                  # TYPED: one row per quarter
+    _typed().put_many("earnings_reports", [{                  # TYPED: one raw row per quarter
         "ticker": scope, "report_date": r["event_time"],
         "eps_estimate": r.get("eps_estimate"), "eps_reported": r.get("eps_reported"),
         "surprise_pct": r.get("surprise_pct"), "revenue": r.get("revenue"),
-        "net_income": r.get("net_income"), "revenue_year_ago": r.get("revenue_year_ago")}
+        "net_income": r.get("net_income"), "gross_profit": r.get("gross_profit"),
+        "operating_income": r.get("operating_income"),
+        "raw_json": json.dumps(r.get("raw", {}))}             # COMPLETE source payload
         for r in reports])
-    for r in reports:                                         # projection, one per event_time
+    for r in reports:                                         # full raw dict, one per event_time
         store.write("earnings.report_raw", scope, r["event_time"], r, trigger_id=tid)
     return len(reports), 1
 
@@ -954,7 +964,18 @@ def _h_earn_analysis(scope, store, tid):
     if not rec:
         return 0, 0                                   # raw not downloaded yet
     raw = rec["value"]
-    store.write("earnings.analysis", scope, raw["event_time"], analyze_earnings(raw), trigger_id=tid)
+    # YoY is derived HERE (S2) from the year-ago quarter's raw revenue: read the raw
+    # report as-of ~350 days before this one -> the same quarter last year.
+    prev_rev = None
+    try:
+        ya_asof = (date.fromisoformat(raw["event_time"]) - timedelta(days=350)).isoformat()
+        ya = store.read_asof("earnings.report_raw", scope, ya_asof)
+        if ya:
+            prev_rev = ya["value"].get("revenue")
+    except Exception:
+        pass
+    store.write("earnings.analysis", scope, raw["event_time"],
+                analyze_earnings(raw, prev_rev), trigger_id=tid)
     return 1, 0                                       # local processing, no external call
 
 

@@ -116,17 +116,20 @@ def test_earnings_processing_depends_on_raw(col):
     import collector as C
     # analysis before any raw is downloaded -> no-op (0 rows, 0 calls)
     assert C._h_earn_analysis("AAPL", col.store, "t") == (0, 0)
-    # simulate the raw download having run
-    raw = {"event_time": "2026-04-30", "eps_estimate": 1.94, "eps_reported": 2.01,
-           "surprise_pct": 3.46, "revenue": 111.0, "net_income": 29.0, "revenue_year_ago": 95.0}
     for n, dt, sk, cd, r in C._EARN_FEATURES:
         col.store.register(n, dt, sk, "S1", cd, r)
+    # raw reports are per-quarter, this-quarter-only (NO revenue_year_ago field). YoY is
+    # derived in S2 from the year-ago quarter's raw revenue, so we store BOTH quarters.
+    ya = {"event_time": "2025-04-30", "revenue": 95.0, "net_income": 25.0}
+    raw = {"event_time": "2026-04-30", "eps_estimate": 1.94, "eps_reported": 2.01,
+           "surprise_pct": 3.46, "revenue": 111.0, "net_income": 29.0}
+    col.store.write("earnings.report_raw", "AAPL", "2025-04-30", ya, trigger_id="t")
     col.store.write("earnings.report_raw", "AAPL", "2026-04-30", raw, trigger_id="t")
-    # now the processing task derives + stores the analysis at the report date
+    # the S2 processing task derives YoY from the two raw quarters + stores the analysis
     assert C._h_earn_analysis("AAPL", col.store, "t") == (1, 0)
     ana = col.store.read_asof("earnings.analysis", "AAPL", "2026-04-30")["value"]
     assert ana["beat_miss"] == "beat" and ana["processed"] is True
-    assert round(ana["revenue_yoy_pct"], 1) == 16.8
+    assert round(ana["revenue_yoy_pct"], 1) == 16.8      # (111-95)/95, computed in S2
 
 
 def test_reconcile_auto_backfills_new_kind_as_prioritized(col):

@@ -27,9 +27,11 @@ SCHEMA = {
                                            "days_to_cover", "change_pct"]),
     "options_implied": ("snap_date", ["ticker", "underlying", "expiry", "atm_call",
                                       "atm_put", "straddle_pct", "implied_move"]),
+    # RAW as reported for THIS quarter only — no cross-quarter/derived fields (YoY etc.
+    # are S2). raw_json preserves the COMPLETE source payload verbatim.
     "earnings_reports": ("report_date", ["ticker", "eps_estimate", "eps_reported",
                                          "surprise_pct", "revenue", "net_income",
-                                         "revenue_year_ago"]),
+                                         "gross_profit", "operating_income", "raw_json"]),
     "earnings_calendar": ("snap_date", ["ticker", "next_earnings_ts"]),
     "insider_transactions": ("txn_date", ["ticker", "value", "shares", "position",
                                           "insider", "is_sale"]),
@@ -45,7 +47,7 @@ SCHEMA = {
 _TEXT = {"ticker", "name", "session", "expiry", "position", "insider", "firm",
          "action", "from_grade", "to_grade", "next_earnings_ts", "period_end",
          "date", "bar_ts", "quote_ts", "settlement_date", "snap_date", "report_date",
-         "txn_date", "revision_date", "publish_date"}
+         "txn_date", "revision_date", "publish_date", "raw_json"}
 # per-table PRIMARY KEY (entity + timestamp, plus disambiguators for lists)
 _PK = {
     "bars": ["ticker", "bar_ts"], "quotes": ["ticker", "quote_ts"],
