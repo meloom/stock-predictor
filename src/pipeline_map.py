@@ -142,6 +142,151 @@ def report(db_path=DEFAULT_DB) -> dict:
             "s2_feature_count": sum(len(g["features"]) for g in groups)}
 
 
+# ── the dataflow DAG: nodes (signals) + dependency edges, per stage ──
+# S1 collected signals (id, kind). kind drives the click-view: line|raw|json.
+S1_SIGNALS = [
+    ("price.close", "line"), ("price.volume", "line"), ("price.current", "raw"),
+    ("macro.vix", "line"), ("macro.spy_close", "line"), ("macro.yield10y", "line"),
+    ("short.pct_float", "line"), ("opt.implied_move", "line"),
+    ("earnings.report_raw", "raw"), ("earnings.next_date", "json"),
+    ("fundamental.statements", "raw"), ("fundamental.shares_outstanding", "line"),
+    ("fundamental.analyst_snapshot", "json"),
+    ("analyst.revisions_raw", "raw"), ("insider.transactions_raw", "raw"),
+    ("sec_filings", "raw"), ("xbrl_financials", "raw"), ("transcripts", "raw"),
+]
+# feature/node -> typed table for the raw view
+RAW_TABLE = {
+    "earnings.report_raw": "earnings_reports", "analyst.revisions_raw": "analyst_revisions",
+    "insider.transactions_raw": "insider_transactions", "fundamental.statements": "fundamentals",
+    "price.current": "quotes", "sec_filings": "sec_filings",
+    "xbrl_financials": "xbrl_financials", "transcripts": "transcripts",
+}
+_S3_LINE = ["predict.eod_return", "predict.eod_price", "predict.p_up", "predict.p_down",
+            "predict.confidence", "predict.direction"]
+
+
+def _depends():
+    """downstream signal -> [upstream signals]. Built once, uses S3's real vector."""
+    import s3_predictors
+    d = {}
+    for x in ["rsi14", "mom5", "mom20", "hvol20", "vr20", "ret_lag1", "ret_lag2",
+              "ret_lag3", "ret_lag4", "ret_lag5", "ret_lag6", "ret_lag7"]:
+        d[f"tech.{x}"] = ["price.close", "price.volume"]
+    for x in ["intraday_ret", "overnight_gap", "intraday_vol5"]:
+        d[f"tech.{x}"] = ["price.close"]
+    for x in ["ret_21d", "ret_63d", "ret_126d", "dist_hi252", "new_high_flag", "above_hi_streak"]:
+        d[f"xh.{x}"] = ["price.close"]
+    for x in ["market_cap", "book_to_price", "earnings_yield", "fcf_yield"]:
+        d[f"fund.{x}"] = ["fundamental.statements", "price.close"]
+    for x in ["roe", "gross_profitability", "net_margin"]:
+        d[f"fund.{x}"] = ["fundamental.statements"]
+    d["xsec.rank_rsi14"] = ["tech.rsi14"]; d["xsec.rank_mom5"] = ["tech.mom5"]
+    d["xsec.rank_earnings_yield"] = ["fund.earnings_yield"]
+    d["xsec.rank_fcf_yield"] = ["fund.fcf_yield"]
+    d["xsec.rank_roe"] = ["fund.roe"]
+    d["xsec.rank_gross_profitability"] = ["fund.gross_profitability"]
+    d["regime.breadth5"] = ["tech.mom5"]
+    d["calendar.days_to_earnings"] = ["earnings.next_date"]
+    d["earnings.analysis"] = ["earnings.report_raw"]
+    d["predict.eod_return"] = list(s3_predictors.PREDICTOR_FEATURES)
+    d["alpha.regime"] = ["regime.breadth5", "macro.vix", "macro.spy_close"]
+    d["alpha.event_risk"] = ["calendar.days_to_earnings"]
+    d["alpha.signal"] = ["predict.eod_return", "alpha.regime", "alpha.event_risk"]
+    return d
+
+
+def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
+    """The per-stock dataflow DAG: every signal as a node (stage + kind + produced?),
+    and dependency edges upstream→downstream."""
+    ticker = (ticker or "").upper()
+    c = sqlite3.connect(Path(db_path))
+    import schema
+    ts = schema.TypedStore(db_path)
+
+    # coverage for feature_values features (ndates + latest), deduped by scope
+    fv = {}
+    for feat, nd, latest in c.execute(
+            "SELECT feature, COUNT(DISTINCT event_time), MAX(event_time) FROM feature_values "
+            "WHERE scope IN (?, '_market') GROUP BY feature", (ticker,)):
+        fv[feat] = (nd, latest)
+
+    def typed_count(table):
+        try:
+            ent = "ticker"
+            return ts.c.execute(f"SELECT COUNT(*) FROM {table} WHERE {ent}=?",
+                                (ticker,)).fetchone()[0]
+        except Exception:
+            return 0
+
+    deps = _depends()
+    # assemble node defs across stages
+    defs = [(f, "S1", k) for f, k in S1_SIGNALS]
+    for group, feats, _, _ in LINEAGE:
+        for f in feats:
+            defs.append((f, "S2", "json" if f == "earnings.analysis" else "line"))
+    defs += [(f, "S3", "line") for f in _S3_LINE] + [("predict.eod_meta", "S3", "json")]
+    defs += [("alpha.regime", "S4", "json"), ("alpha.event_risk", "S4", "json"),
+             ("alpha.signal", "S4", "json")]
+
+    seen, nodes = set(), []
+    for fid, stage, kind in defs:
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if fid in RAW_TABLE and fid not in fv:                # typed-only S1 (sec_filings…)
+            n = typed_count(RAW_TABLE[fid]); nd, latest = n, None
+        else:
+            nd, latest = fv.get(fid, (0, None))
+        nodes.append({"id": fid, "stage": stage, "kind": kind,
+                      "produced": (nd or 0) > 0, "n": nd or 0, "latest": latest,
+                      "label": fid.split(".", 1)[-1] if "." in fid else fid})
+    nodeset = {n["id"] for n in nodes}
+    edges = [[u, v] for v, us in deps.items() for u in us if u in nodeset and v in nodeset]
+    return {"ticker": ticker, "nodes": nodes, "edges": edges,
+            "stages": ["S1", "S2", "S3", "S4"]}
+
+
+def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
+    """The best view of ONE signal for a stock: a numeric time series (line), the raw
+    typed rows (raw), or the latest structured value (json)."""
+    import json
+    ticker = (ticker or "").upper()
+    c = sqlite3.connect(Path(db_path))
+    if feature in RAW_TABLE:                                   # raw document / event list
+        import schema
+        r = schema.TypedStore(db_path).rows(RAW_TABLE[feature], ticker, limit=40)
+        for row in r["rows"]:
+            for k, v in row.items():
+                if isinstance(v, str) and len(v) > 200:
+                    row[k] = v[:200] + f"… ({len(v)} chars)"
+        return {"kind": "raw", "feature": feature, "table": r["table"],
+                "columns": r["columns"], "ts_col": r["ts_col"], "rows": r["rows"]}
+    # time series from feature_values (dedup to latest ingested_at per event_time)
+    rows = c.execute(
+        "SELECT event_time, value, MAX(ingested_at) FROM feature_values "
+        "WHERE feature=? AND scope IN (?, '_market') GROUP BY event_time ORDER BY event_time",
+        (feature, ticker)).fetchall()
+    pts, nonnum = [], None
+    for et, val, _ in rows:
+        try:
+            pts.append([et[:10], float(val)])
+        except (TypeError, ValueError):
+            nonnum = val                                      # JSON/text -> not a line
+    if pts and nonnum is None:
+        return {"kind": "line", "feature": feature, "points": pts,
+                "latest": pts[-1][1], "n": len(pts)}
+    # structured / json latest
+    latest = rows[-1] if rows else None
+    v = latest[1] if latest else None
+    if isinstance(v, str) and v[:1] in "{[":
+        try:
+            v = json.loads(v)
+        except Exception:
+            pass
+    return {"kind": "json", "feature": feature,
+            "event_time": latest[0] if latest else None, "value": v}
+
+
 def _step_of(feature: str) -> str:
     if feature.startswith("alpha."):
         return "S4 · Alpha"

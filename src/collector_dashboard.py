@@ -522,75 +522,152 @@ def render_s2(rep: dict) -> str:
 </main>"""
 
 
-def render_single_stock(rep: dict, tickers: list) -> str:
-    tk = rep["ticker"]
-    STEP_CLS = {"S1 · Raw": "snap", "S2 · Signals": "cur", "S3 · Predictors": "roll",
-                "S4 · Alpha": "hist"}
+_SS_CSS = r"""
+.picker{display:flex;gap:10px;align-items:center;margin:12px 0;flex-wrap:wrap}
+.picker select{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);
+  background:var(--card);color:var(--fg);font-family:ui-monospace,monospace}
+.legend2{display:flex;gap:10px;align-items:center;font-size:12px;color:var(--mut)}
+.legend2 i{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:3px}
+.sgwrap{position:relative;margin-top:14px;overflow-x:auto}
+svg#edges{position:absolute;top:0;left:0;z-index:0;pointer-events:none;overflow:visible}
+.cols{position:relative;z-index:1;display:flex;gap:72px;align-items:flex-start;min-width:760px}
+.col{flex:1;min-width:150px}
+.colhead{font-family:ui-monospace,monospace;font-size:11px;color:var(--mut);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:10px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.node{position:relative;display:flex;align-items:center;gap:7px;padding:6px 9px;margin-bottom:7px;
+  border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer;
+  font-size:12px;font-family:ui-monospace,monospace;transition:border-color .12s,box-shadow .12s}
+.node:hover{border-color:var(--accent)}
+.node.off{opacity:.4}
+.node.sel{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 30%,transparent)}
+.node.up{border-color:#3b82c4}.node.down{border-color:var(--fresh)}
+.node .nlbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ndot{width:8px;height:8px;border-radius:50%;background:var(--mut);flex:none}
+.k-line .ndot,i.k-line{background:var(--accent)}.k-raw .ndot,i.k-raw{background:#c9930b}
+.k-json .ndot,i.k-json{background:#3b82c4}
+.nmeta{margin-left:auto;color:var(--mut);font-size:10px}
+.edge{fill:none;stroke:var(--line);stroke-width:1;opacity:.55}
+.edge.hot{stroke:var(--accent);stroke-width:2;opacity:1}
+.dhead{display:flex;gap:10px;align-items:center;margin-bottom:12px;font-size:14px}
+.chart{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
+.chart .ln{fill:none;stroke:var(--accent);stroke-width:2}
+.chart .area{fill:color-mix(in srgb,var(--accent) 12%,transparent);stroke:none}
+.chart .pt{fill:var(--accent)}.chart .ct{fill:var(--mut);font-size:11px;font-family:ui-monospace,monospace}
+.cmeta{margin-top:8px;font-size:12px;color:var(--mut)}.cmeta b{color:var(--fg)}
+.json{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;
+  overflow:auto;font-size:12px;line-height:1.5;max-height:460px}
+.ts td.tscol{color:var(--accent)}
+"""
+
+_SS_JS = r"""
+function el(id){return document.querySelector('.node[data-id="'+id+'"]');}
+function layout(){
+  var cols=document.getElementById('cols'), svg=document.getElementById('edges');
+  var br=cols.getBoundingClientRect();
+  svg.setAttribute('width',cols.scrollWidth); svg.setAttribute('height',cols.scrollHeight);
+  var p='';
+  for(var i=0;i<EDGES.length;i++){
+    var u=EDGES[i][0], v=EDGES[i][1], a=el(u), b=el(v); if(!a||!b) continue;
+    var ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect();
+    var x1=ra.right-br.left, y1=ra.top-br.top+ra.height/2;
+    var x2=rb.left-br.left, y2=rb.top-br.top+rb.height/2, mx=(x1+x2)/2;
+    p+='<path d="M'+x1+' '+y1+' C '+mx+' '+y1+' '+mx+' '+y2+' '+x2+' '+y2+'" class="edge" data-u="'+u+'" data-v="'+v+'"></path>';
+  }
+  svg.innerHTML=p;
+}
+function pick(node){
+  var id=node.getAttribute('data-id');
+  var ns=document.querySelectorAll('.node'); for(var i=0;i<ns.length;i++) ns[i].classList.remove('sel','up','down');
+  var es=document.querySelectorAll('.edge'); for(var j=0;j<es.length;j++) es[j].classList.remove('hot');
+  node.classList.add('sel');
+  for(var k=0;k<EDGES.length;k++){var u=EDGES[k][0],v=EDGES[k][1];
+    if(u===id||v===id){
+      var pth=document.querySelector('.edge[data-u="'+u+'"][data-v="'+v+'"]'); if(pth)pth.classList.add('hot');
+      var o=el(u===id?v:u); if(o)o.classList.add(u===id?'down':'up');
+    }}
+  loadDetail(id);
+}
+function loadDetail(id){
+  var d=document.getElementById('detail'); d.innerHTML='<div class="muted">loading '+id+'…</div>';
+  fetch('/api/stock-signal?ticker='+encodeURIComponent(TK)+'&feature='+encodeURIComponent(id))
+    .then(function(r){return r.json();}).then(function(s){d.innerHTML=view(s);});
+}
+function esc(x){return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function view(s){
+  var t='<div class="dhead"><span class="mono">'+esc(s.feature)+'</span> <span class="chip">'+s.kind+'</span></div>';
+  if(s.kind==='line') return t+lineChart(s.points);
+  if(s.kind==='raw') return t+rawTable(s);
+  return t+'<pre class="json">'+esc(JSON.stringify(s.value,null,2))+'</pre>';
+}
+function lineChart(pts){
+  if(!pts||!pts.length) return '<div class="muted">no numeric series</div>';
+  var w=900,h=280,pad=44,n=pts.length,vals=pts.map(function(p){return p[1];});
+  var mn=Math.min.apply(null,vals),mx=Math.max.apply(null,vals); if(mn===mx){mn-=1;mx+=1;}
+  function X(i){return pad+(w-2*pad)*(n<2?0.5:i/(n-1));}
+  function Y(v){return h-pad-(h-2*pad)*((v-mn)/(mx-mn));}
+  var d='',a='M'+X(0).toFixed(1)+' '+(h-pad);
+  for(var i=0;i<n;i++){var x=X(i).toFixed(1),y=Y(pts[i][1]).toFixed(1); d+=(i?'L':'M')+x+' '+y+' '; a+=' L'+x+' '+y;}
+  a+=' L'+X(n-1).toFixed(1)+' '+(h-pad)+' Z';
+  var last=pts[n-1];
+  return '<svg viewBox="0 0 '+w+' '+h+'" class="chart">'+
+    '<path d="'+a+'" class="area"></path><path d="'+d+'" class="ln"></path>'+
+    '<circle cx="'+X(n-1).toFixed(1)+'" cy="'+Y(last[1]).toFixed(1)+'" r="3.5" class="pt"></circle>'+
+    '<text x="6" y="'+(Y(mx)+4)+'" class="ct">'+mx.toPrecision(4)+'</text>'+
+    '<text x="6" y="'+(Y(mn)+4)+'" class="ct">'+mn.toPrecision(4)+'</text></svg>'+
+    '<div class="cmeta">'+pts[0][0]+' → '+last[0]+' · '+n+' points · latest <b>'+Number(last[1]).toPrecision(5)+'</b></div>';
+}
+function rawTable(s){
+  var h='<div class="tswrap"><table class="ts"><thead><tr>';
+  for(var i=0;i<s.columns.length;i++) h+='<th>'+esc(s.columns[i])+'</th>';
+  h+='</tr></thead><tbody>';
+  for(var r=0;r<s.rows.length;r++){h+='<tr>';
+    for(var c=0;c<s.columns.length;c++){var col=s.columns[c],val=s.rows[r][col];
+      h+='<td class="mono'+(col===s.ts_col?' tscol':'')+'">'+(val==null?'—':esc(val))+'</td>';}
+    h+='</tr>';}
+  return h+'</tbody></table></div>';
+}
+window.addEventListener('load',function(){layout(); var d=el('price.close')||document.querySelector('.node'); if(d)pick(d);});
+window.addEventListener('resize',layout);
+"""
+
+
+def render_single_stock(graph: dict, tickers: list) -> str:
+    tk = graph["ticker"]
     opts = "".join(f'<option{" selected" if t == tk else ""}>{t}</option>' for t in tickers)
-
-    # per-step signal sections
-    secs = ""
-    for step in rep["step_order"]:
-        items = rep["steps"].get(step, [])
-        rows = ""
-        for s in items:
-            fresh = f'{s["fresh_h"]}h' if s["fresh_h"] is not None else "—"
-            rows += (f'<tr><td class="mono feat">{s["feature"]}</td>'
-                     f'<td class="mono val">{s["value"]}</td>'
-                     f'<td class="mono num">{s["n_dates"]}</td>'
-                     f'<td class="mono muted">{(s["event_time"] or "—")[:10]} · {fresh}</td></tr>')
-        if not rows:
-            rows = '<tr><td colspan="4" class="muted">— no signals yet —</td></tr>'
-        secs += (f'<section class="panel"><h2><span class="mchip {STEP_CLS.get(step,"run")}">{step.split(" · ")[0]}</span> '
-                 f'{step.split(" · ")[1]} <span class="muted">— {len(items)} signals</span></h2>'
-                 f'<table class="queue"><thead><tr><th>Signal</th><th>Latest value</th>'
-                 f'<th>Dates</th><th>As of · fresh</th></tr></thead><tbody>{rows}</tbody></table></section>')
-
-    # FULL raw S1 rows (typed tables) at the bottom
-    raws = ""
-    for r in rep["raw"]:
-        head = "".join(f'<th>{c}</th>' for c in r["columns"])
-        body = ""
-        for row in r["rows"]:
-            body += "<tr>" + "".join(
-                f'<td class="mono {"tscol" if c == r["ts_col"] else ""}">{row.get(c) if row.get(c) is not None else "—"}</td>'
-                for c in r["columns"]) + "</tr>"
-        raws += (f'<div class="rawtbl"><div class="rawname mono">{r["table"]}</div>'
-                 f'<div class="tswrap"><table class="ts"><thead><tr>{head}</tr></thead>'
-                 f'<tbody>{body}</tbody></table></div></div>')
-
-    return f"""{_CSS}
-<style>
-.picker{{display:flex;gap:10px;align-items:center;margin:12px 0}}
-.picker select{{font-size:15px;padding:6px 10px;border-radius:8px;border:1px solid var(--line);
-  background:var(--card);color:var(--fg);font-family:ui-monospace,monospace}}
-.val{{font-size:12.5px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-.rawtbl{{margin-bottom:18px}}.rawname{{font-weight:640;font-size:13px;margin-bottom:6px}}
-.mchip.cur{{color:var(--accent)}}.mchip.snap{{color:#c9930b}}.mchip.roll{{color:#3b82c4}}.mchip.hist{{color:var(--fresh)}}
-.ts td.tscol{{color:var(--accent)}}
-</style>
-<main>
-  <header>
-    <div class="brand"><span class="live"></span>Single Stock · {tk}</div>
-    <div class="gen mono">live · {rep["generated_at"][:19].replace("T", " ")} UTC</div>
-  </header>
-  <form class="picker" method="get" action="/single-stock">
-    <label class="muted">Ticker</label>
-    <select name="ticker" onchange="this.form.submit()">{opts}</select>
-    <span class="muted">{rep["signal_count"]} signals across all steps</span>
-  </form>
-  {secs}
-  <section class="panel"><h2>Full raw signals <span class="muted">— the actual collected S1 rows for {tk} (typed tables)</span></h2>
-    {raws or '<div class="muted">no raw rows yet</div>'}
-  </section>
-</main>"""
+    STAGE_NAMES = {"S1": "S1 · Raw collected", "S2": "S2 · Signals",
+                   "S3": "S3 · Predictors", "S4": "S4 · Alpha"}
+    cols_html = ""
+    for stage in graph["stages"]:
+        ns = [n for n in graph["nodes"] if n["stage"] == stage]
+        chips = ""
+        for n in ns:
+            off = "" if n["produced"] else " off"
+            meta = str(n["n"]) if n["n"] else ""
+            chips += (f'<div class="node k-{n["kind"]}{off}" data-id="{n["id"]}" onclick="pick(this)">'
+                      f'<span class="ndot"></span><span class="nlbl">{n["label"]}</span>'
+                      f'<span class="nmeta">{meta}</span></div>')
+        cols_html += (f'<div class="col"><div class="colhead">{STAGE_NAMES[stage]} '
+                      f'<span class="muted">({len(ns)})</span></div>{chips}</div>')
+    data = (f'<script>var TK={_json.dumps(tk)};'
+            f'var EDGES={_json.dumps(graph["edges"])};</script>')
+    body = (
+        f'<main><header><div class="brand"><span class="live"></span>Single Stock · {tk}</div>'
+        f'<div class="gen mono">dataflow · click a node to inspect</div></header>'
+        f'<form class="picker" method="get" action="/single-stock"><label class="muted">Ticker</label>'
+        f'<select name="ticker" onchange="this.form.submit()">{opts}</select>'
+        f'<span class="legend2"><i class="k-line"></i>line <i class="k-raw"></i>raw '
+        f'<i class="k-json"></i>json <span class="muted">· dim = not produced</span></span></form>'
+        f'<div class="sgwrap"><svg id="edges"></svg><div class="cols" id="cols">{cols_html}</div></div>'
+        f'<div id="detail" class="panel"><div class="muted">Click a node to inspect its signal '
+        f'(line chart, raw rows, or structured value).</div></div></main>')
+    return _CSS + "<style>" + _SS_CSS + "</style>" + body + data + "<script>" + _SS_JS + "</script>"
 
 
-def _page_single(rep, tickers):
+def _page_single(graph, tickers):
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>Single Stock · {rep["ticker"]}</title></head><body>'
-            + render_single_stock(rep, tickers) + '</body></html>')
+            f'<title>Single Stock · {graph["ticker"]}</title></head><body>'
+            + render_single_stock(graph, tickers) + '</body></html>')
 
 
 def _page_s2(rep):
@@ -627,12 +704,18 @@ def serve(port=8787):
                 import pipeline_map
                 payload = _page_s2(pipeline_map.report()).encode()
                 ctype = "text/html; charset=utf-8"
-            elif path == "/single-stock":             # per-ticker: all signals, all steps
+            elif path == "/single-stock":             # per-ticker dataflow DAG
                 import pipeline_map
                 q = parse_qs(parsed.query)
                 tk = (q.get("ticker", [""])[0] or UNIVERSE[0]).upper()
-                payload = _page_single(pipeline_map.single_stock(tk), list(UNIVERSE)).encode()
+                payload = _page_single(pipeline_map.stock_graph(tk), list(UNIVERSE)).encode()
                 ctype = "text/html; charset=utf-8"
+            elif path == "/api/stock-signal":         # one signal's best view (line/raw/json)
+                import pipeline_map
+                q = parse_qs(parsed.query)
+                payload = _json.dumps(pipeline_map.stock_signal(
+                    q.get("ticker", [""])[0], q.get("feature", [""])[0]), default=str).encode()
+                ctype = "application/json"
             else:                                     # "/" index of all step dashboards
                 payload = _index_page().encode()
                 ctype = "text/html; charset=utf-8"
