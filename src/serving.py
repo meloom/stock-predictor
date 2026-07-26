@@ -28,7 +28,7 @@ from universe import UNIVERSE                                     # noqa: E402
 
 PROD_PKL = RUNTIME_DIR / "production_model.pkl"
 PROD_META = RUNTIME_DIR / "production_model.json"
-Z95 = s3_multi.Z95
+CI_Z = s3_multi.CI_Z
 
 
 def promote(train_end: str, db_path=DEFAULT_DB) -> dict:
@@ -62,6 +62,72 @@ def promote(train_end: str, db_path=DEFAULT_DB) -> dict:
             "predictors": sorted(models)}
     with open(PROD_META, "w") as f:
         json.dump(meta, f, indent=2)
+    return meta
+
+
+def deploy(months: int = 3, db_path=DEFAULT_DB, store=None) -> dict:
+    """DEPLOYMENT (≠ model building): train on the LAST `months` of data up to now, then
+    forecast the FUTURE. Model building uses a held-out backtest to pick/validate a model;
+    deployment retrains that model on the freshest window and predicts forward. Writes the
+    production bundle AND predict.* / predict.forecast (the future prediction)."""
+    import numpy as np
+    from datetime import date, timedelta
+    rows, cols, latest = s3_multi._panel(db_path)
+    start = (date.fromisoformat(latest) - timedelta(days=int(round(months * 30.44)))).isoformat()
+    pool = [r for r in rows if start <= r["d"] <= latest]
+    models = {}
+    for h in s3_multi.HORIZONS:
+        tr = [r for r in pool if r["lab"].get(f"ret_{h}d") is not None]
+        if len(tr) >= 60:
+            models[f"ret_{h}d"] = s3_multi._fit_reg(
+                np.array([r["x"] for r in tr], dtype=float),
+                np.array([r["lab"][f"ret_{h}d"] for r in tr], dtype=float))
+    vh = s3_multi.VOL_HORIZON
+    tv = [r for r in pool if r["lab"].get(f"vol_{vh}d") is not None]
+    if len(tv) >= 60:
+        models[f"vol_{vh}d"] = s3_multi._fit_reg(
+            np.array([r["x"] for r in tv], dtype=float),
+            np.array([r["lab"][f"vol_{vh}d"] for r in tv], dtype=float))
+    bundle = {"train_start": start, "train_end": latest, "features": list(PREDICTOR_FEATURES),
+              "models": models, "horizons": s3_multi.HORIZONS, "vol_horizon": vh,
+              "n_train_rows": len(pool), "mode": "deploy", "train_months": months}
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PROD_PKL, "wb") as f:
+        pickle.dump(bundle, f)
+    meta = {"mode": "deploy", "train_months": months, "train_start": start, "train_end": latest,
+            "n_train_rows": len(pool), "predictors": sorted(models),
+            "forecast_from": latest, "ci_pct": s3_multi.CI_PCT}
+    PROD_META.write_text(json.dumps(meta, indent=2))
+
+    # write the FUTURE prediction (predict.* at the latest date) + forecast json
+    store = store or FeatureStore()
+    s3_multi.register_all(store)
+    Z = s3_multi.CI_Z
+    for r in [r for r in rows if r["d"] == latest]:
+        t, close, doc = r["t"], r["close"], {}
+        X = np.array([r["x"]], dtype=float)
+        for h in s3_multi.HORIZONS:
+            rm = models.get(f"ret_{h}d")
+            if not rm:
+                continue
+            ret = float(s3_multi._pred_reg(rm, X)[0]); se = float(s3_multi._pi_se(rm, X)[0])
+            up = s3_multi._norm_cdf(ret / se) if se > 0 else 0.5; half = Z * se
+            store.write(f"predict.ret_{h}d", t, latest, round(ret, 6), trigger_id="deploy")
+            store.write(f"predict.ci_ret_{h}d", t, latest, round(half, 6), trigger_id="deploy")
+            store.write(f"predict.up_{h}d", t, latest, round(up, 4), trigger_id="deploy")
+            store.write(f"predict.down_{h}d", t, latest, round(1 - up, 4), trigger_id="deploy")
+            doc[f"{h}d"] = {"ahead": f"+{h} trading days", "pred_return": round(ret, 6),
+                            "ci_low": round(ret - half, 6), "ci_high": round(ret + half, 6),
+                            "pred_price": round(close * (1 + ret), 4),
+                            "price_low": round(close * (1 + ret - half), 4),
+                            "price_high": round(close * (1 + ret + half), 4),
+                            "p_up": round(up, 4), "p_down": round(1 - up, 4)}
+        vm = models.get(f"vol_{vh}d")
+        if vm is not None:
+            store.write(f"predict.vol_{vh}d", t, latest, round(float(s3_multi._pred_reg(vm, X)[0]), 6),
+                        trigger_id="deploy")
+        if doc:
+            store.write("predict.forecast", t, latest, doc, trigger_id="deploy")
     return meta
 
 
@@ -113,7 +179,7 @@ def predict(ticker: str, asof: str, store: FeatureStore | None = None,
             continue
         ret = float(s3_multi._pred_reg(rm, X)[0])
         se = float(s3_multi._pi_se(rm, X)[0])            # leverage-adjusted interval std
-        half = Z95 * se
+        half = CI_Z * se
         up = s3_multi._norm_cdf(ret / se) if se > 0 else 0.5   # direction from the forecast
         preds[f"{h}d"] = {"ahead": f"+{h} trading days", "pred_return": round(ret, 6),
                           "ci_low": round(ret - half, 6), "ci_high": round(ret + half, 6),

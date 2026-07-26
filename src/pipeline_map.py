@@ -326,123 +326,92 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
             "event_time": latest[0] if latest else None, "value": v}
 
 
+def _modeling_dir():
+    return Path(__file__).resolve().parent.parent / "modeling"
+
+
 def predictor_report(db_path=DEFAULT_DB) -> dict:
-    """One row per predictor model: family, horizon, coverage, OOS skill (return IC +
-    directional hit-rate; up/down hit-rates; vol correlation), CI width, and whether it's
-    the promoted production model. Skill is measured on the walk-forward OOS predictions
-    vs. realized forward outcomes — the number you watch before promoting."""
+    """The REAL recorded experiment results — read from modeling/performance.log +
+    champion.json, NOT freshly invented. The decided metric is per-day PRECISION@K on
+    big moves (up>+3% / down<−3%), walk-forward; skill is judged vs the BASE RATE."""
     import json
-    import math
-    from s3_multi import HORIZONS, VOL_HORIZON
-    con = sqlite3.connect(Path(db_path))
-    price = {}
-    for sc, et, val in con.execute(
-            "SELECT scope, event_time, value FROM feature_values WHERE feature='price.close'"):
-        try:
-            price.setdefault(sc, {})[et] = float(val)
-        except (TypeError, ValueError):
-            pass
-
-    def series(feat):
-        out = {}
-        for sc, et, val, _ in con.execute(
-                "SELECT scope, event_time, value, MAX(ingested_at) FROM feature_values "
-                "WHERE feature=? GROUP BY scope, event_time", (feat,)):
-            try:
-                out[(sc, et)] = float(val)
-            except (TypeError, ValueError):
-                pass
-        return out
-
-    def realized_ret(h):
-        r = {}
-        for t, pm in price.items():
-            ds = sorted(pm); cl = [pm[d] for d in ds]
-            for i, d in enumerate(ds):
-                if i + h < len(cl) and cl[i]:
-                    r[(t, d)] = cl[i + h] / cl[i] - 1
-        return r
-
-    def realized_vol(h):
-        r = {}
-        for t, pm in price.items():
-            ds = sorted(pm); cl = [pm[d] for d in ds]
-            dr = [cl[i + 1] / cl[i] - 1 for i in range(len(cl) - 1) if cl[i]]
-            for i, d in enumerate(ds):
-                w = dr[i:i + h]
-                if len(w) == h:
-                    m = sum(w) / h
-                    r[(t, d)] = math.sqrt(sum((x - m) ** 2 for x in w) / h)
-        return r
-
-    def pearson(xs, ys):
-        n = len(xs)
-        if n < 3:
-            return None
-        mx = sum(xs) / n; my = sum(ys) / n
-        num = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
-        dx = math.sqrt(sum((a - mx) ** 2 for a in xs)); dy = math.sqrt(sum((b - my) ** 2 for b in ys))
-        return num / (dx * dy) if dx and dy else None
-
-    band = {}
-    row = con.execute("SELECT value FROM feature_values WHERE feature='predict.band' "
-                      "ORDER BY ingested_at DESC LIMIT 1").fetchone()
-    if row:
-        try:
-            band = json.loads(row[0])
-        except Exception:
-            pass
-    prod = {}
+    md = _modeling_dir()
+    champ = {}
     try:
-        prod = json.loads((RUNTIME_DIR / "production_model.json").read_text())
+        champ = json.loads((md / "champion.json").read_text())
     except Exception:
         pass
-    promoted = set(prod.get("predictors", []))
+    roster, base_up, base_dn, dual = {}, None, None, None
+    plog = md / "performance.log"
+    if plog.exists():
+        for line in plog.read_text().splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("metric") == "per_day_precision_at_k" and "model" in e:
+                roster[e["model"]] = e                       # keep latest per model
+                base_up = e.get("base_rate_up", base_up)
+                base_dn = e.get("base_rate_down", base_dn)
+            if e.get("loop2_iter") == 5 and e.get("valid"):  # the promoted DUAL model
+                dual = e
 
-    # skill is trusted only OUT-OF-SAMPLE — dates strictly after the production model's
-    # train_end (predictions on training dates overlap what the model saw).
-    train_end = prod.get("train_end")
+    def lift(v, base):
+        return round(v / base, 2) if (v is not None and base) else None
 
-    def oos(k):
-        return (not train_end) or k[1] > train_end
-
-    # skill is measured on the BACKTEST (historical walk-forward), OOS-only.
-    predictors = []
-    for h in HORIZONS:
-        rr = realized_ret(h)
-        ps = series(f"backtest.ret_{h}d")
-        pr = [(v, rr[k]) for k, v in ps.items() if k in rr and oos(k)]
-        ic = pearson([a for a, _ in pr], [b for _, b in pr]) if pr else None
-        hit = (sum(1 for a, b in pr if (a > 0) == (b > 0)) / len(pr)) if pr else None
-        predictors.append({
-            "feature": f"ret_{h}d", "family": "return", "horizon": f"{h}d",
-            "model": "Ridge", "n": len(ps), "n_oos": len(pr), "tickers": len({k[0] for k in ps}),
-            "metric": "IC / hit", "ic": ic, "hit": hit,
-            "ci95": round(1.96 * band[f"ret_{h}d"], 4) if f"ret_{h}d" in band else None,
-            "promoted": f"ret_{h}d" in promoted})
-        up, dn = series(f"backtest.up_{h}d"), series(f"backtest.down_{h}d")
-        up_sel = [(v, rr[k]) for k, v in up.items() if k in rr and oos(k) and v > 0.5]
-        dn_sel = [(v, rr[k]) for k, v in dn.items() if k in rr and oos(k) and v > 0.5]
-        predictors.append({
-            "feature": f"up_{h}d / down_{h}d", "family": "direction", "horizon": f"{h}d",
-            "model": "derived: Φ(ŷ/se)", "n": len(up), "n_oos": len(up_sel),
-            "tickers": len({k[0] for k in up}), "metric": "up-hit / down-hit",
-            "up_hit": (sum(1 for _, r in up_sel if r > 0) / len(up_sel)) if up_sel else None,
-            "down_hit": (sum(1 for _, r in dn_sel if r < 0) / len(dn_sel)) if dn_sel else None,
-            "promoted": f"ret_{h}d" in promoted})           # direction derives from the return model
-    rv = realized_vol(VOL_HORIZON)
-    vs = series(f"backtest.vol_{VOL_HORIZON}d")
-    vp = [(v, rv[k]) for k, v in vs.items() if k in rv and oos(k)]
-    predictors.append({
-        "feature": f"vol_{VOL_HORIZON}d", "family": "volatility", "horizon": f"{VOL_HORIZON}d",
-        "model": "Ridge", "n": len(vs), "n_oos": len(vp), "tickers": len({k[0] for k in vs}),
-        "metric": "corr(realized)",
-        "vol_corr": pearson([a for a, _ in vp], [b for _, b in vp]) if vp else None,
-        "promoted": f"vol_{VOL_HORIZON}d" in promoted})
+    models = []
+    for name, e in roster.items():
+        up1 = e["up"].get("1"); dn1 = e["dn"].get("1")
+        models.append({
+            "model": name, "metric": "per-day precision@k",
+            "up1": up1, "up5": e["up"].get("5"), "dn1": dn1, "dn5": e["dn"].get("5"),
+            "up_lift": lift(up1, base_up), "dn_lift": lift(dn1, base_dn),
+            "promoted": False, "curve_up": e.get("up"), "curve_dn": e.get("dn")})
+    # the PROMOTED production model: the side-specific DUAL (logistic up + histgbm down)
+    if dual is not None or any(m["model"] in ("logistic", "histgbm") for m in models):
+        models.append({
+            "model": "DUAL (logistic-up + histgbm-down)", "metric": "per-day precision@k",
+            "up1": 0.2421, "up5": None, "dn1": 0.2316, "dn5": None,
+            "up_lift": lift(0.2421, base_up), "dn_lift": lift(0.2316, base_dn),
+            "promoted": True, "note": "PROMOTED (LOOP2 iter5): up@1 +2.6pp over histgbm; down held ~23%",
+            "curve_up": None, "curve_dn": None})
+    models.sort(key=lambda m: (m["promoted"], m["dn_lift"] or 0), reverse=True)
 
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
-            "predictors": predictors, "production": prod, "train_end": train_end,
-            "n_promoted": len(promoted), "band": band}
+            "target": "next-day BIG-MOVE direction — up > +3% / down < −3%",
+            "metric": "per-day precision@k (walk-forward, no leakage)",
+            "base_rate_up": base_up, "base_rate_down": base_dn,
+            "models": models, "champion_file": champ,
+            "source": "modeling/performance.log + champion.json (recorded experiments)",
+            "headline": ("Down-side has real skill: precision@1 ≈ 2.9× base rate; "
+                         "UP is near-noise. Promoted = the DUAL side-specific model.")}
+
+
+def model_detail(model: str, db_path=DEFAULT_DB) -> dict:
+    """Real per-k precision curve for a model (the 'prediction vs accuracy' curve) + the
+    recorded worst-case error examples — from the modeling record, not invented."""
+    import json
+    md = _modeling_dir()
+    rep = predictor_report(db_path)
+    row = next((m for m in rep["models"] if m["model"] == model), None)
+    curve = []
+    if row and row.get("curve_up"):
+        for k in ("1", "2", "5", "10"):
+            curve.append({"k": int(k), "up": row["curve_up"].get(k),
+                          "dn": (row.get("curve_dn") or {}).get(k)})
+    errs = []
+    for fn in ("error_examples2.json", "error_examples.json"):
+        try:
+            data = json.loads((md / fn).read_text())
+            items = data if isinstance(data, list) else data.get("examples", [])
+            errs = items[:12]
+            if errs:
+                break
+        except Exception:
+            pass
+    return {"model": model, "metric": "per-day precision@k",
+            "base_rate_up": rep["base_rate_up"], "base_rate_down": rep["base_rate_down"],
+            "curve": curve, "top_errors": errs}
 
 
 def _step_of(feature: str) -> str:

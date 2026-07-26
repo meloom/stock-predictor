@@ -32,7 +32,8 @@ HORIZONS = [1, 5, 21]
 VOL_HORIZON = 5
 WARMUP_FRAC = 0.4
 RETRAIN_EVERY = 21
-Z95 = 1.96
+CI_Z = 1.645        # 90% two-sided interval
+CI_PCT = 90
 RIDGE_LAMBDA = 10.0
 
 # TWO distinct namespaces (do NOT conflate them):
@@ -201,6 +202,78 @@ def _walk_reg(rows, label, with_se=False):
     return out
 
 
+# ── model roster: the models we TRY per target (building/evaluation) ──
+ROSTER = ["ridge", "gbm", "baseline"]
+
+
+def _fit_pred(name, Xtr, ytr, Xte):
+    import numpy as np
+    mean, std = _norm(Xtr)
+    Ztr, Zte = _stdz(Xtr, mean, std), _stdz(Xte, mean, std)
+    if name == "ridge":
+        from sklearn.linear_model import Ridge
+        return Ridge(alpha=RIDGE_LAMBDA).fit(Ztr, ytr).predict(Zte)
+    if name == "gbm":
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        return HistGradientBoostingRegressor(max_depth=3, max_iter=150,
+                                             learning_rate=0.05).fit(Ztr, ytr).predict(Zte)
+    return np.full(len(Xte), float(np.mean(ytr)))            # baseline: predict the mean
+
+
+def _pearson(xs, ys):
+    import numpy as np
+    if len(xs) < 3:
+        return None
+    xs, ys = np.array(xs), np.array(ys)
+    dx, dy = xs.std(), ys.std()
+    return float(((xs - xs.mean()) * (ys - ys.mean())).mean() / (dx * dy)) if dx and dy else None
+
+
+def _metrics(pred, real):
+    import numpy as np
+    pred, real = np.array(pred), np.array(real)
+    up = pred > 0; dn = pred < 0
+    return {"n": int(len(pred)), "ic": _pearson(pred, real),
+            "hit": float(((pred > 0) == (real > 0)).mean()),
+            "up_hit": float((real[up] > 0).mean()) if up.any() else None,
+            "down_hit": float((real[dn] < 0).mean()) if dn.any() else None}
+
+
+def score_models(rows, db_path=DEFAULT_DB) -> dict:
+    """Building-phase evaluation: for each prediction TARGET, try every model in the
+    roster on a held-out split and score its accuracy (IC/hit + up/down hit for returns,
+    corr for vol). up/down are METRICS OF A TARGET, not separate predictors."""
+    import numpy as np
+    dates = sorted({r["d"] for r in rows})
+    if len(dates) < 40:
+        return {}
+    split = dates[int(len(dates) * 0.6)]
+    scores = {}
+    targets = [(f"ret_{h}d", "return", h) for h in HORIZONS] + [(f"vol_{VOL_HORIZON}d", "volatility", VOL_HORIZON)]
+    for lab, fam, h in targets:
+        tr = [r for r in rows if r["d"] < split and r["lab"].get(lab) is not None]
+        te = [r for r in rows if r["d"] >= split and r["lab"].get(lab) is not None]
+        if len(tr) < 100 or not te:
+            continue
+        Xtr = np.array([r["x"] for r in tr], dtype=float); ytr = np.array([r["lab"][lab] for r in tr], dtype=float)
+        Xte = np.array([r["x"] for r in te], dtype=float); yte = np.array([r["lab"][lab] for r in te], dtype=float)
+        entry = {"family": fam, "horizon": f"{h}d", "test_from": split, "n_test": len(te), "models": {}}
+        for name in ROSTER:
+            try:
+                pred = _fit_pred(name, Xtr, ytr, Xte)
+                entry["models"][name] = ({"n": len(te), "corr": _pearson(pred, yte)}
+                                         if fam == "volatility" else _metrics(pred, yte))
+            except Exception:
+                pass
+        # champion = best directional hit (returns) / best corr (vol)
+        key = "corr" if fam == "volatility" else "hit"
+        best = max((m for m in entry["models"].items() if m[1].get(key) is not None),
+                   key=lambda kv: kv[1][key], default=(None, None))
+        entry["champion"] = best[0]
+        scores[lab] = entry
+    return scores
+
+
 def backfill(store: FeatureStore | None = None, db_path=DEFAULT_DB) -> dict:
     import numpy as np
     store = store or FeatureStore()
@@ -213,7 +286,7 @@ def backfill(store: FeatureStore | None = None, db_path=DEFAULT_DB) -> dict:
         for h in HORIZONS:
             for (t, d), (pt, se) in _walk_reg(rows, f"ret_{h}d", with_se=True).items():
                 store.write(f"backtest.ret_{h}d", t, d, round(pt, 6), trigger_id=tid)
-                store.write(f"backtest.ci_ret_{h}d", t, d, round(Z95 * se, 6), trigger_id=tid)
+                store.write(f"backtest.ci_ret_{h}d", t, d, round(CI_Z * se, 6), trigger_id=tid)
                 up = _norm_cdf(pt / se) if se > 0 else 0.5
                 store.write(f"backtest.up_{h}d", t, d, round(up, 4), trigger_id=tid)
                 store.write(f"backtest.down_{h}d", t, d, round(1.0 - up, 4), trigger_id=tid)
@@ -221,49 +294,28 @@ def backfill(store: FeatureStore | None = None, db_path=DEFAULT_DB) -> dict:
         for (t, d), v in _walk_reg(rows, f"vol_{VOL_HORIZON}d").items():
             store.write(f"backtest.vol_{VOL_HORIZON}d", t, d, round(v, 6), trigger_id=tid); written += 1
 
-        # ── 2) final models on all labeled history (the promoted-style production model) ──
-        finals, band = {}, {}
+        # ── 2) CI baseline σ per horizon (summary) ──
+        band = {}
         for h in HORIZONS:
             tr = [r for r in rows if r["lab"].get(f"ret_{h}d") is not None]
             if len(tr) >= 100:
-                finals[h] = _fit_reg(np.array([r["x"] for r in tr], dtype=float),
-                                     np.array([r["lab"][f"ret_{h}d"] for r in tr], dtype=float))
-                band[f"ret_{h}d"] = round(finals[h]["sigma"], 6)
-        volf = None
-        tv = [r for r in rows if r["lab"].get(f"vol_{VOL_HORIZON}d") is not None]
-        if len(tv) >= 100:
-            volf = _fit_reg(np.array([r["x"] for r in tv], dtype=float),
-                            np.array([r["lab"][f"vol_{VOL_HORIZON}d"] for r in tv], dtype=float))
+                band[f"ret_{h}d"] = round(_fit_reg(
+                    np.array([r["x"] for r in tr], dtype=float),
+                    np.array([r["lab"][f"ret_{h}d"] for r in tr], dtype=float))["sigma"], 6)
         if band:
             store.write("predict.band", MARKET_SCOPE, latest, band, trigger_id=tid)
 
-        # ── 3) PREDICTION: forecast the FUTURE from the latest date (no realized label) ──
-        fc_written = 0
-        for r in [r for r in rows if r["d"] == latest]:
-            t, close, doc = r["t"], r["close"], {}
-            X = np.array([r["x"]], dtype=float)
-            for h in HORIZONS:
-                if h not in finals:
-                    continue
-                ret = float(_pred_reg(finals[h], X)[0]); se = float(_pi_se(finals[h], X)[0])
-                up = _norm_cdf(ret / se) if se > 0 else 0.5; half = Z95 * se
-                store.write(f"predict.ret_{h}d", t, latest, round(ret, 6), trigger_id=tid)
-                store.write(f"predict.ci_ret_{h}d", t, latest, round(half, 6), trigger_id=tid)
-                store.write(f"predict.up_{h}d", t, latest, round(up, 4), trigger_id=tid)
-                store.write(f"predict.down_{h}d", t, latest, round(1 - up, 4), trigger_id=tid)
-                doc[f"{h}d"] = {"ahead": f"+{h} trading days", "pred_return": round(ret, 6),
-                                "ci_low": round(ret - half, 6), "ci_high": round(ret + half, 6),
-                                "pred_price": round(close * (1 + ret), 4),
-                                "price_low": round(close * (1 + ret - half), 4),
-                                "price_high": round(close * (1 + ret + half), 4),
-                                "p_up": round(up, 4), "p_down": round(1 - up, 4)}
-            if volf is not None:
-                store.write(f"predict.vol_{VOL_HORIZON}d", t, latest,
-                            round(float(_pred_reg(volf, X)[0]), 6), trigger_id=tid)
-            if doc:
-                store.write("predict.forecast", t, latest, doc, trigger_id=tid); fc_written += 1
+        # ── 3) MODEL SCORING: try every roster model per target (building/evaluation) ──
+        scores = score_models(rows, db_path)
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        (RUNTIME_DIR / "model_scores.json").write_text(json.dumps(
+            {"generated_from": latest, "test_split_frac": 0.6, "targets": scores}, indent=2))
+
+        # NOTE: the FUTURE prediction (predict.*) is produced by DEPLOYMENT, not here —
+        # see serving.deploy(): it trains on the last N months up to now and forecasts.
         trig.add_metrics(status="DONE", backtest_predictions=written, latest_date=latest,
-                         forecasts=fc_written, horizons=HORIZONS)
+                         models_scored=sum(len(v["models"]) for v in scores.values()),
+                         horizons=HORIZONS)
         return {"trigger_id": tid, **trig.metrics}
 
 

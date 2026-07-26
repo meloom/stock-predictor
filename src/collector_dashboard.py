@@ -752,71 +752,104 @@ def render_single_stock(graph: dict, tickers: list) -> str:
     return _CSS + "<style>" + _SS_CSS + "</style>" + body + data + "<script>" + _SS_JS + "</script>"
 
 
+def _flow_nav(current):
+    steps = [("S1", "/data-collection"), ("S2", "/signal-processing"),
+             ("S3 predictors", "/predictors"), ("S4 alpha", None)]
+    out = ['<a class="fstep home" href="/">☰ dashboards</a>']
+    for i, (name, href) in enumerate(steps):
+        cls = "fstep cur" if name.startswith(current) else "fstep"
+        out.append(f'<a class="{cls}" href="{href}">{name}</a>' if href
+                   else f'<span class="{cls} off">{name}</span>')
+        if i < len(steps) - 1:
+            out.append("→")
+    return '<div class="flow">' + "".join(out) + "</div>"
+
+
 def render_predictors(rep: dict) -> str:
-    prod = rep["production"]
-    FAM_CLS = {"return": "k-line", "direction": "k-json", "volatility": "k-raw"}
-    cards = [("Predictors", str(len(rep["predictors"])), "models × horizons"),
-             ("Promoted", str(rep["n_promoted"]), "in production"),
-             ("Production window", f'{(prod.get("train_start") or "—")[:10]} → {(prod.get("train_end") or "—")[:10]}',
-              "training range (serving rejects asof ≤ end)"),
-             ("Train rows", f'{prod.get("n_train_rows", 0):,}', "labeled (date×ticker)")]
-    ch = "".join(f'<div class="card"><div class="eyebrow">{t}</div><div class="metric">{v}</div>'
-                 f'<div class="sub">{s}</div></div>' for t, v, s in cards)
+    bu, bd = rep.get("base_rate_up"), rep.get("base_rate_down")
 
     def pct(x):
         return "—" if x is None else f"{x * 100:.1f}%"
 
-    def num(x, d=3):
-        return "—" if x is None else f"{x:.{d}f}"
+    cards = [("Target", "big-move dir", "up>+3% / down<−3%, next day"),
+             ("Metric", "precision@k", "per-day, walk-forward"),
+             ("Base rate", f"↑{pct(bu)} ↓{pct(bd)}", "random-pick precision"),
+             ("Models tried", str(len(rep["models"])), "recorded in performance.log")]
+    ch = "".join(f'<div class="card"><div class="eyebrow">{t}</div><div class="metric">{v}</div>'
+                 f'<div class="sub">{s}</div></div>' for t, v, s in cards)
 
     rows = ""
-    for p in rep["predictors"]:
-        if p["family"] == "return":
-            skill = (f'<span class="mono">IC {num(p["ic"])}</span> · dir-hit '
-                     f'<b>{pct(p["hit"])}</b> · CI ±{pct(p.get("ci95"))}')
-        elif p["family"] == "direction":
-            skill = f'up-hit <b>{pct(p.get("up_hit"))}</b> · down-hit <b>{pct(p.get("down_hit"))}</b>'
-        else:
-            skill = f'corr(realized) <b>{num(p.get("vol_corr"))}</b>'
-        star = ('<span class="chip done">production</span>' if p["promoted"]
-                else '<span class="chip">candidate</span>')
-        rows += (f'<tr><td class="mono feat"><span class="ndot {FAM_CLS.get(p["family"],"")}"></span>{p["feature"]}</td>'
-                 f'<td>{p["family"]}</td><td class="mono muted">{p["horizon"]}</td>'
-                 f'<td class="mono muted">{p["model"]}</td>'
-                 f'<td>{skill}</td><td class="mono num">{p["tickers"]}t · {p.get("n_oos",0):,} OOS</td><td>{star}</td></tr>')
+    for m in rep["models"]:
+        cls = "prodrow" if m["promoted"] else ""
+        badge = ('<span class="chip prod">PRODUCTION</span>' if m["promoted"]
+                 else '<span class="chip">tried</span>')
+        upl = f'{m["up_lift"]}×' if m["up_lift"] else "—"
+        dnl = f'{m["dn_lift"]}×' if m["dn_lift"] else "—"
+        rows += (f'<tr class="{cls}" onclick="modelDetail(this)" data-model="{m["model"]}">'
+                 f'<td class="mono feat">{m["model"]}</td>'
+                 f'<td class="mono">{pct(m["up1"])} <span class="muted">({upl})</span></td>'
+                 f'<td class="mono"><b>{pct(m["dn1"])}</b> <span class="lift">{dnl}</span></td>'
+                 f'<td>{badge}</td></tr>')
 
     return f"""{_CSS}
 <style>
-.ndot{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}}
-.ndot.k-line{{background:var(--accent)}}.ndot.k-json{{background:#3b82c4}}.ndot.k-raw{{background:#c9930b}}
-.note{{font-size:12.5px;color:var(--mut);line-height:1.6;margin-top:6px}}
-.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:10px 0;color:var(--mut)}}
-.fstep{{padding:3px 10px;border:1px solid var(--line);border-radius:16px}}
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:12px 0;flex-wrap:wrap}}
+.fstep{{padding:4px 11px;border:1px solid var(--line);border-radius:16px;text-decoration:none;color:var(--mut)}}
+.fstep:hover{{border-color:var(--accent);color:var(--fg)}}
 .fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
+.fstep.off{{opacity:.5}}.fstep.home{{color:var(--fg)}}
+.note{{font-size:12.5px;color:var(--mut);line-height:1.6;margin-top:8px}}
+tr.prodrow{{background:color-mix(in srgb,var(--fresh) 9%,transparent)}}
+tr[data-model]{{cursor:pointer}}tr[data-model]:hover{{background:color-mix(in srgb,var(--accent) 7%,transparent)}}
+.chip.prod{{background:color-mix(in srgb,var(--fresh) 20%,transparent);color:var(--fresh);font-weight:700}}
+.lift{{color:var(--fresh);font-weight:700;font-size:12px}}
+#mdetail{{margin-top:14px}}.mdcurve{{display:flex;gap:20px;align-items:flex-end;height:120px;margin:10px 0}}
+.mdbar{{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:11px;font-family:ui-monospace,monospace;color:var(--mut)}}
+.mdbar .bar2{{width:26px;background:var(--accent);border-radius:3px 3px 0 0}}
+.mdbar .base{{width:26px;background:var(--miss);border-radius:3px 3px 0 0}}
 </style>
 <main>
   <header><div class="brand"><span class="live"></span>Predictors</div>
-    <div class="gen mono">live · {rep["generated_at"][:19].replace("T", " ")} UTC</div></header>
-  <div class="flow"><span class="fstep">S1</span>→<span class="fstep">S2</span>→
-    <span class="fstep cur">S3 predictors</span>→<span class="fstep">S4 alpha</span></div>
+    <div class="gen mono">from the recorded experiments · {rep["generated_at"][:19].replace("T", " ")} UTC</div></header>
+  {_flow_nav("S3")}
   <section class="cards">{ch}</section>
-  <section class="panel"><h2>Predictor models
-    <span class="muted">— each family × horizon, its OOS skill (walk-forward predictions vs realized), and production status</span></h2>
-    <table class="queue"><thead><tr><th>Output</th><th>Family</th><th>Horizon</th><th>Model</th>
-    <th>OOS skill</th><th>coverage</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>
-    <div class="note">Skill is measured <b>OUT-OF-SAMPLE ONLY</b> — on predictions for dates strictly
-    after the production model's train_end ({(prod.get("train_end") or "—")}); predictions on training
-    dates overlap what the model saw and are NOT trusted. <b>IC</b> = Pearson corr(pred, realized);
-    <b>up-hit/down-hit</b> = fraction correct. Direction is DERIVED from the return forecast
-    (P(up)=Φ(ŷ/se), down=1−up) — one model, coherent, not a separate classifier. These are BUILT +
-    MEASURED, not yet validated for capital — the §5 gate governs real sizing. Predict via the trigger
-    on <a href="/single-stock">/single-stock</a>.</div>
+  <section class="panel"><h2>{rep["target"]}
+    <span class="muted">— metric: {rep["metric"]}. Click a model for its precision@k curve + error cases.</span></h2>
+    <table class="queue"><thead><tr><th>Model tried</th><th>UP precision@1 (lift)</th>
+    <th>DOWN precision@1 (lift)</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>
+    <div id="mdetail"></div>
+    <div class="note"><b>{rep["headline"]}</b><br>
+    Numbers are the recorded walk-forward experiments ({rep["source"]}) — precision = fraction of the
+    day's top-k highest-conviction picks that were correct; <b>lift</b> = precision ÷ base rate. The
+    <b class="lift">PRODUCTION</b> row is the promoted model. Not yet validated for capital (§5 gate).</div>
   </section>
-  <section class="panel"><h2>Confidence intervals <span class="muted">— per-point interval is leverage-adjusted (ŷ ± 1.96·σ·√(1+xᵀMx)); below is the baseline σ per horizon</span></h2>
-    <table class="queue"><thead><tr><th>Horizon</th><th>σ (residual)</th><th>baseline 95% ±</th></tr></thead><tbody>
-    {"".join(f'<tr><td class="mono">{k}</td><td class="mono">{v}</td><td class="mono">±{v*1.96*100:.1f}%</td></tr>' for k,v in rep["band"].items())}
-    </tbody></table></section>
-</main>"""
+</main>
+<script>
+function modelDetail(row){{
+  var model=row.getAttribute('data-model'), out=document.getElementById('mdetail');
+  document.querySelectorAll('tr[data-model]').forEach(function(r){{r.style.outline='';}});
+  row.style.outline='2px solid var(--accent)';
+  out.innerHTML='<div class="muted">loading '+model+'…</div>';
+  fetch('/api/model-detail?model='+encodeURIComponent(model)).then(function(r){{return r.json();}}).then(function(s){{
+    var h='<div class="panel" style="margin-top:0"><h2>'+model+' <span class="muted">— precision@k curve (prediction vs accuracy)</span></h2>';
+    if(s.curve&&s.curve.length){{
+      var bu=s.base_rate_up||0, bd=s.base_rate_down||0, mx=0;
+      s.curve.forEach(function(c){{mx=Math.max(mx,c.up||0,c.dn||0);}});
+      mx=Math.max(mx,bu,bd)||1;
+      function bars(side,base){{var b='<div class="mdcurve">';
+        s.curve.forEach(function(c){{var v=c[side]||0; b+='<div class="mdbar"><div>'+(v*100).toFixed(0)+'%</div><div class="bar2" style="height:'+(v/mx*90)+'px"></div><div>@'+c.k+'</div></div>';}});
+        b+='<div class="mdbar"><div>'+(base*100).toFixed(0)+'%</div><div class="base" style="height:'+(base/mx*90)+'px"></div><div>base</div></div></div>';
+        return b;}}
+      h+='<div class="muted mono">DOWN precision@k (green) vs base rate (grey)</div>'+bars('dn',bd);
+      h+='<div class="muted mono">UP precision@k</div>'+bars('up',bu);
+    }} else {{ h+='<div class="muted">no per-k curve recorded for this model (see the DUAL summary).</div>'; }}
+    if(s.top_errors&&s.top_errors.length){{
+      h+='<h2 style="margin-top:14px">Recorded confident-wrong cases <span class="muted">('+s.top_errors.length+')</span></h2><pre class="json">'+JSON.stringify(s.top_errors.slice(0,8),null,1)+'</pre>';
+    }}
+    out.innerHTML=h+'</div>';
+  }});
+}}
+</script>"""
 
 
 def _page_predictors(rep):
@@ -866,10 +899,16 @@ def serve(port=8787):
                 import pipeline_map
                 payload = _page_s2(pipeline_map.report()).encode()
                 ctype = "text/html; charset=utf-8"
-            elif path == "/predictors":               # S3 predictor models + OOS skill
+            elif path == "/predictors":               # S3 predictor models (recorded results)
                 import pipeline_map
                 payload = _page_predictors(pipeline_map.predictor_report()).encode()
                 ctype = "text/html; charset=utf-8"
+            elif path == "/api/model-detail":          # a model's precision@k curve + errors
+                import pipeline_map
+                q = parse_qs(parsed.query)
+                payload = _json.dumps(pipeline_map.model_detail(
+                    q.get("model", [""])[0]), default=str).encode()
+                ctype = "application/json"
             elif path == "/single-stock":             # per-ticker dataflow DAG
                 import pipeline_map
                 q = parse_qs(parsed.query)
