@@ -330,87 +330,108 @@ def _modeling_dir():
     return Path(__file__).resolve().parent.parent / "modeling"
 
 
-def predictor_report(db_path=DEFAULT_DB) -> dict:
-    """The REAL recorded experiment results — read from modeling/performance.log +
-    champion.json, NOT freshly invented. The decided metric is per-day PRECISION@K on
-    big moves (up>+3% / down<−3%), walk-forward; skill is judged vs the BASE RATE."""
-    import json
-    md = _modeling_dir()
-    champ = {}
-    try:
-        champ = json.loads((md / "champion.json").read_text())
-    except Exception:
-        pass
-    roster, base_up, base_dn, dual = {}, None, None, None
-    plog = md / "performance.log"
-    if plog.exists():
-        for line in plog.read_text().splitlines():
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if e.get("metric") == "per_day_precision_at_k" and "model" in e:
-                roster[e["model"]] = e                       # keep latest per model
-                base_up = e.get("base_rate_up", base_up)
-                base_dn = e.get("base_rate_down", base_dn)
-            if e.get("loop2_iter") == 5 and e.get("valid"):  # the promoted DUAL model
-                dual = e
-
-    def lift(v, base):
-        return round(v / base, 2) if (v is not None and base) else None
-
+def _parse_horizon_readme(text: str) -> dict:
+    """Parse a modeling/h{N}/README.md into base rates + the model roster table."""
+    import re
+    bu = re.search(r"up ([\d.]+)%,\s*down ([\d.]+)%", text)
+    nr = re.search(r"([\d,]+) labeled rows", text)
+    ses = re.search(r"next (\d+) session", text)
     models = []
-    for name, e in roster.items():
-        up1 = e["up"].get("1"); dn1 = e["dn"].get("1")
-        models.append({
-            "model": name, "metric": "per-day precision@k",
-            "up1": up1, "up5": e["up"].get("5"), "dn1": dn1, "dn5": e["dn"].get("5"),
-            "up_lift": lift(up1, base_up), "dn_lift": lift(dn1, base_dn),
-            "promoted": False, "curve_up": e.get("up"), "curve_dn": e.get("dn")})
-    # the PROMOTED production model: the side-specific DUAL (logistic up + histgbm down)
-    if dual is not None or any(m["model"] in ("logistic", "histgbm") for m in models):
-        models.append({
-            "model": "DUAL (logistic-up + histgbm-down)", "metric": "per-day precision@k",
-            "up1": 0.2421, "up5": None, "dn1": 0.2316, "dn5": None,
-            "up_lift": lift(0.2421, base_up), "dn_lift": lift(0.2316, base_dn),
-            "promoted": True, "note": "PROMOTED (LOOP2 iter5): up@1 +2.6pp over histgbm; down held ~23%",
-            "curve_up": None, "curve_dn": None})
-    models.sort(key=lambda m: (m["promoted"], m["dn_lift"] or 0), reverse=True)
+    for line in text.splitlines():
+        if not line.strip().startswith("|") or "`" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 6:
+            continue
+        nm = re.search(r"`([^`]+)`", cells[0])
+        if not nm:
+            continue
+        models.append({"model": nm.group(1), "champion": "⭐" in cells[0],
+                       "up1": cells[1], "up5": cells[2], "down1": cells[3],
+                       "down5": cells[4], "ece": cells[5]})
+    return {"base_up": float(bu.group(1)) / 100 if bu else None,
+            "base_down": float(bu.group(2)) / 100 if bu else None,
+            "n_rows": int(nr.group(1).replace(",", "")) if nr else None,
+            "days": int(ses.group(1)) if ses else None, "models": models}
 
+
+# The 4 model-creation CATEGORIES the deployment serves per ticker. Each maps to a
+# recorded horizon roster; production = that horizon's champion classifier.
+PRED_CATEGORIES = [("h1", "1d", "next-day (EOD)"), ("h3", "3d", "3-day swing"),
+                   ("h5", "5d", "1-week"), ("h7", "7d", "~1.5-week")]
+
+
+def predictor_report(db_path=DEFAULT_DB) -> dict:
+    """Grouped by prediction CATEGORY (horizon). Each category lists every model tried
+    with its recorded per-day precision@k performance and marks the PRODUCTION model —
+    read from modeling/h{N}/README.md (the real recorded rosters), not invented."""
+    md = _modeling_dir()
+    cats = []
+    for key, label, title in PRED_CATEGORIES:
+        p = md / key / "README.md"
+        if not p.exists():
+            cats.append({"key": key, "label": label, "title": title, "built": False, "models": []})
+            continue
+        info = _parse_horizon_readme(p.read_text())
+        # production per category = the recorded champion (⭐); h1's live model is the DUAL
+        prod = next((m["model"] for m in info["models"] if m["champion"]), None)
+        if key == "h1":
+            prod = "DUAL (logistic-up + histgbm-down)"
+            info["models"].append({"model": "DUAL (logistic-up + histgbm-down)", "champion": False,
+                                   "up1": "24% (2.6×)", "up5": "—", "down1": "23% (2.9×)",
+                                   "down5": "—", "ece": "—"})
+        for m in info["models"]:
+            m["production"] = (m["model"] == prod)
+        cats.append({"key": key, "label": label, "title": title, "built": True,
+                     "days": info["days"], "base_up": info["base_up"], "base_down": info["base_down"],
+                     "n_rows": info["n_rows"], "production": prod, "models": info["models"]})
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
-            "target": "next-day BIG-MOVE direction — up > +3% / down < −3%",
-            "metric": "per-day precision@k (walk-forward, no leakage)",
-            "base_rate_up": base_up, "base_rate_down": base_dn,
-            "models": models, "champion_file": champ,
-            "source": "modeling/performance.log + champion.json (recorded experiments)",
-            "headline": ("Down-side has real skill: precision@1 ≈ 2.9× base rate; "
-                         "UP is near-noise. Promoted = the DUAL side-specific model.")}
+            "metric": "per-day precision@k on big moves (>±3%), walk-forward vs base rate",
+            "categories": cats,
+            "planned": "28d (~monthly) — not built yet; longest recorded window is 7d",
+            "source": "modeling/h{N}/README.md (recorded per-horizon rosters)",
+            "headline": ("Edge (lift over base rate) is strongest at 1d and decays with the "
+                         "window. Deployment serves one calibrated prediction PER CATEGORY per "
+                         "ticker (p_up / p_down / precision@k); alpha picks the strongest.")}
 
 
-def model_detail(model: str, db_path=DEFAULT_DB) -> dict:
-    """Real per-k precision curve for a model (the 'prediction vs accuracy' curve) + the
-    recorded worst-case error examples — from the modeling record, not invented."""
+def model_detail(model: str, category: str = "", db_path=DEFAULT_DB) -> dict:
+    """A model's precision@k (the 'prediction vs accuracy' curve) + recorded confident-
+    wrong error cases — from the modeling record, not invented."""
     import json
+    import re
     md = _modeling_dir()
     rep = predictor_report(db_path)
-    row = next((m for m in rep["models"] if m["model"] == model), None)
+
+    def num(s):
+        m = re.search(r"([\d.]+)%", s or "")
+        return float(m.group(1)) / 100 if m else None
+
+    row = cat = None
+    for c in rep["categories"]:
+        for m in c.get("models", []):
+            if m["model"] == model and (not category or c["key"] == category):
+                row, cat = m, c
+                break
+        if row:
+            break
     curve = []
-    if row and row.get("curve_up"):
-        for k in ("1", "2", "5", "10"):
-            curve.append({"k": int(k), "up": row["curve_up"].get(k),
-                          "dn": (row.get("curve_dn") or {}).get(k)})
+    if row:
+        curve = [{"k": 1, "up": num(row["up1"]), "dn": num(row["down1"])},
+                 {"k": 5, "up": num(row["up5"]), "dn": num(row["down5"])}]
     errs = []
     for fn in ("error_examples2.json", "error_examples.json"):
         try:
             data = json.loads((md / fn).read_text())
-            items = data if isinstance(data, list) else data.get("examples", [])
-            errs = items[:12]
+            errs = (data if isinstance(data, list) else data.get("examples", []))[:10]
             if errs:
                 break
         except Exception:
             pass
-    return {"model": model, "metric": "per-day precision@k",
-            "base_rate_up": rep["base_rate_up"], "base_rate_down": rep["base_rate_down"],
+    return {"model": model, "category": cat["label"] if cat else category,
+            "ece": row["ece"] if row else None,
+            "base_rate_up": cat["base_up"] if cat else None,
+            "base_rate_down": cat["base_down"] if cat else None,
             "curve": curve, "top_errors": errs}
 
 

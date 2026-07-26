@@ -766,30 +766,43 @@ def _flow_nav(current):
 
 
 def render_predictors(rep: dict) -> str:
-    bu, bd = rep.get("base_rate_up"), rep.get("base_rate_down")
-
     def pct(x):
-        return "—" if x is None else f"{x * 100:.1f}%"
+        return "—" if x is None else f"{x * 100:.0f}%"
 
-    cards = [("Target", "big-move dir", "up>+3% / down<−3%, next day"),
-             ("Metric", "precision@k", "per-day, walk-forward"),
-             ("Base rate", f"↑{pct(bu)} ↓{pct(bd)}", "random-pick precision"),
-             ("Models tried", str(len(rep["models"])), "recorded in performance.log")]
+    built = [c for c in rep["categories"] if c["built"]]
+    cards = [("Prediction categories", str(len(rep["categories"])), "one calibrated prediction / ticker each"),
+             ("Metric", "precision@k", "per-day, walk-forward vs base rate"),
+             ("Built", str(len(built)), "have recorded model rosters"),
+             ("Consumed by", "S4 alpha", "picks the strongest per stock")]
     ch = "".join(f'<div class="card"><div class="eyebrow">{t}</div><div class="metric">{v}</div>'
                  f'<div class="sub">{s}</div></div>' for t, v, s in cards)
 
-    rows = ""
-    for m in rep["models"]:
-        cls = "prodrow" if m["promoted"] else ""
-        badge = ('<span class="chip prod">PRODUCTION</span>' if m["promoted"]
-                 else '<span class="chip">tried</span>')
-        upl = f'{m["up_lift"]}×' if m["up_lift"] else "—"
-        dnl = f'{m["dn_lift"]}×' if m["dn_lift"] else "—"
-        rows += (f'<tr class="{cls}" onclick="modelDetail(this)" data-model="{m["model"]}">'
-                 f'<td class="mono feat">{m["model"]}</td>'
-                 f'<td class="mono">{pct(m["up1"])} <span class="muted">({upl})</span></td>'
-                 f'<td class="mono"><b>{pct(m["dn1"])}</b> <span class="lift">{dnl}</span></td>'
-                 f'<td>{badge}</td></tr>')
+    cats_html = ""
+    for c in rep["categories"]:
+        if not c["built"]:
+            cats_html += (f'<details class="catbox"><summary><span class="cattag">{c["label"]}</span> '
+                          f'{c["title"]} <span class="chip">not built yet</span></summary>'
+                          f'<div class="note">No recorded model roster for this horizon.</div></details>')
+            continue
+        base = f'base ↑{pct(c["base_up"])} ↓{pct(c["base_down"])}'
+        rows = ""
+        for m in c["models"]:
+            prod, champ = m["production"], m["champion"]
+            cls = "prodrow" if prod else ""
+            badge = ('<span class="chip prod">PRODUCTION</span>' if prod
+                     else ('<span class="chip champ">champion ⭐</span>' if champ
+                           else '<span class="chip">tried</span>'))
+            rows += (f'<tr class="{cls}" onclick="modelDetail(this)" data-model="{m["model"]}" data-cat="{c["key"]}">'
+                     f'<td class="mono feat">{m["model"]}</td>'
+                     f'<td class="mono">{m["up1"]}</td><td class="mono">{m["up5"]}</td>'
+                     f'<td class="mono"><b>{m["down1"]}</b></td><td class="mono">{m["down5"]}</td>'
+                     f'<td class="mono muted">{m["ece"]}</td><td>{badge}</td></tr>')
+        cats_html += (
+            f'<details class="catbox" open><summary><span class="cattag">{c["label"]}</span> {c["title"]} '
+            f'<span class="muted">· {base} · {c.get("n_rows",0):,} rows · <b>prod: {c["production"]}</b></span></summary>'
+            f'<table class="queue"><thead><tr><th>Model</th><th>up@1</th><th>up@5</th>'
+            f'<th>down@1</th><th>down@5</th><th>ECE</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>'
+            f'<div id="md-{c["key"]}" class="mdslot"></div></details>')
 
     return f"""{_CSS}
 <style>
@@ -799,52 +812,52 @@ def render_predictors(rep: dict) -> str:
 .fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
 .fstep.off{{opacity:.5}}.fstep.home{{color:var(--fg)}}
 .note{{font-size:12.5px;color:var(--mut);line-height:1.6;margin-top:8px}}
-tr.prodrow{{background:color-mix(in srgb,var(--fresh) 9%,transparent)}}
+.catbox{{border:1px solid var(--line);border-radius:12px;padding:6px 16px 14px;margin-bottom:12px}}
+.catbox summary{{cursor:pointer;font-size:14px;padding:8px 0;font-weight:600}}
+.cattag{{display:inline-block;background:var(--accent);color:#fff;font-family:ui-monospace,monospace;
+  font-size:12px;font-weight:700;padding:2px 9px;border-radius:6px;margin-right:8px}}
+tr.prodrow{{background:color-mix(in srgb,var(--fresh) 10%,transparent)}}
 tr[data-model]{{cursor:pointer}}tr[data-model]:hover{{background:color-mix(in srgb,var(--accent) 7%,transparent)}}
-.chip.prod{{background:color-mix(in srgb,var(--fresh) 20%,transparent);color:var(--fresh);font-weight:700}}
-.lift{{color:var(--fresh);font-weight:700;font-size:12px}}
-#mdetail{{margin-top:14px}}.mdcurve{{display:flex;gap:20px;align-items:flex-end;height:120px;margin:10px 0}}
+.chip.prod{{background:color-mix(in srgb,var(--fresh) 22%,transparent);color:var(--fresh);font-weight:700}}
+.chip.champ{{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}}
+.mdslot{{margin-top:10px}}.mdcurve{{display:flex;gap:16px;align-items:flex-end;height:110px;margin:8px 0}}
 .mdbar{{display:flex;flex-direction:column;align-items:center;gap:4px;font-size:11px;font-family:ui-monospace,monospace;color:var(--mut)}}
-.mdbar .bar2{{width:26px;background:var(--accent);border-radius:3px 3px 0 0}}
-.mdbar .base{{width:26px;background:var(--miss);border-radius:3px 3px 0 0}}
+.mdbar .bar2{{width:24px;background:var(--fresh);border-radius:3px 3px 0 0}}
+.mdbar .base{{width:24px;background:var(--miss);border-radius:3px 3px 0 0}}
+.json{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:11.5px;max-height:320px}}
 </style>
 <main>
   <header><div class="brand"><span class="live"></span>Predictors</div>
-    <div class="gen mono">from the recorded experiments · {rep["generated_at"][:19].replace("T", " ")} UTC</div></header>
+    <div class="gen mono">recorded rosters · {rep["generated_at"][:19].replace("T", " ")} UTC</div></header>
   {_flow_nav("S3")}
   <section class="cards">{ch}</section>
-  <section class="panel"><h2>{rep["target"]}
-    <span class="muted">— metric: {rep["metric"]}. Click a model for its precision@k curve + error cases.</span></h2>
-    <table class="queue"><thead><tr><th>Model tried</th><th>UP precision@1 (lift)</th>
-    <th>DOWN precision@1 (lift)</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table>
-    <div id="mdetail"></div>
+  <section class="panel"><h2>Prediction categories <span class="muted">— {rep["metric"]}. One category = one model-creation target; each serves a calibrated prediction per ticker. Expand a category, click a model for its precision@k curve + error cases.</span></h2>
+    {cats_html}
     <div class="note"><b>{rep["headline"]}</b><br>
-    Numbers are the recorded walk-forward experiments ({rep["source"]}) — precision = fraction of the
-    day's top-k highest-conviction picks that were correct; <b>lift</b> = precision ÷ base rate. The
-    <b class="lift">PRODUCTION</b> row is the promoted model. Not yet validated for capital (§5 gate).</div>
+    Numbers are the recorded per-horizon rosters ({rep["source"]}). up@k/down@k = precision of the
+    day's top-k conviction picks (× = lift over base rate); <b>ECE</b> = calibration error (lower =
+    probabilities more trustworthy). <span class="lift">PRODUCTION</span> = deployed model for that
+    category; ⭐ = recorded champion. Planned: {rep["planned"]}.</div>
   </section>
 </main>
 <script>
 function modelDetail(row){{
-  var model=row.getAttribute('data-model'), out=document.getElementById('mdetail');
-  document.querySelectorAll('tr[data-model]').forEach(function(r){{r.style.outline='';}});
-  row.style.outline='2px solid var(--accent)';
+  var model=row.getAttribute('data-model'), cat=row.getAttribute('data-cat');
+  var out=document.getElementById('md-'+cat);
   out.innerHTML='<div class="muted">loading '+model+'…</div>';
-  fetch('/api/model-detail?model='+encodeURIComponent(model)).then(function(r){{return r.json();}}).then(function(s){{
-    var h='<div class="panel" style="margin-top:0"><h2>'+model+' <span class="muted">— precision@k curve (prediction vs accuracy)</span></h2>';
+  fetch('/api/model-detail?model='+encodeURIComponent(model)+'&category='+encodeURIComponent(cat))
+    .then(function(r){{return r.json();}}).then(function(s){{
+    var h='<div class="panel" style="margin:0"><h2>'+model+' · '+s.category+' <span class="muted">— precision@k curve (prediction vs accuracy) · ECE '+(s.ece||'—')+'</span></h2>';
     if(s.curve&&s.curve.length){{
-      var bu=s.base_rate_up||0, bd=s.base_rate_down||0, mx=0;
+      var bd=s.base_rate_down||0, bu=s.base_rate_up||0, mx=Math.max(bd,bu,0.01);
       s.curve.forEach(function(c){{mx=Math.max(mx,c.up||0,c.dn||0);}});
-      mx=Math.max(mx,bu,bd)||1;
-      function bars(side,base){{var b='<div class="mdcurve">';
-        s.curve.forEach(function(c){{var v=c[side]||0; b+='<div class="mdbar"><div>'+(v*100).toFixed(0)+'%</div><div class="bar2" style="height:'+(v/mx*90)+'px"></div><div>@'+c.k+'</div></div>';}});
-        b+='<div class="mdbar"><div>'+(base*100).toFixed(0)+'%</div><div class="base" style="height:'+(base/mx*90)+'px"></div><div>base</div></div></div>';
-        return b;}}
-      h+='<div class="muted mono">DOWN precision@k (green) vs base rate (grey)</div>'+bars('dn',bd);
-      h+='<div class="muted mono">UP precision@k</div>'+bars('up',bu);
-    }} else {{ h+='<div class="muted">no per-k curve recorded for this model (see the DUAL summary).</div>'; }}
+      function bars(side,base,lbl){{var b='<div class="muted mono">'+lbl+'</div><div class="mdcurve">';
+        s.curve.forEach(function(c){{var v=c[side]||0; b+='<div class="mdbar"><div>'+(v*100).toFixed(0)+'%</div><div class="bar2" style="height:'+(v/mx*88)+'px"></div><div>@'+c.k+'</div></div>';}});
+        b+='<div class="mdbar"><div>'+(base*100).toFixed(0)+'%</div><div class="base" style="height:'+(base/mx*88)+'px"></div><div>base</div></div></div>';return b;}}
+      h+=bars('dn',bd,'DOWN precision@k (vs base rate)')+bars('up',bu,'UP precision@k');
+    }}
     if(s.top_errors&&s.top_errors.length){{
-      h+='<h2 style="margin-top:14px">Recorded confident-wrong cases <span class="muted">('+s.top_errors.length+')</span></h2><pre class="json">'+JSON.stringify(s.top_errors.slice(0,8),null,1)+'</pre>';
+      h+='<h2 style="margin-top:12px">Recorded confident-wrong cases <span class="muted">('+s.top_errors.length+')</span></h2><pre class="json">'+JSON.stringify(s.top_errors,null,1)+'</pre>';
     }}
     out.innerHTML=h+'</div>';
   }});
@@ -907,7 +920,7 @@ def serve(port=8787):
                 import pipeline_map
                 q = parse_qs(parsed.query)
                 payload = _json.dumps(pipeline_map.model_detail(
-                    q.get("model", [""])[0]), default=str).encode()
+                    q.get("model", [""])[0], q.get("category", [""])[0]), default=str).encode()
                 ctype = "application/json"
             elif path == "/single-stock":             # per-ticker dataflow DAG
                 import pipeline_map
