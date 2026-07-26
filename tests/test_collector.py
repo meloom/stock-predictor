@@ -157,6 +157,18 @@ def test_backfill_priority_restores_to_base_after_success(col):
     assert p == 30                                      # restored to routine refresh
 
 
+def test_every_kind_can_actually_run_within_its_source_limit():
+    """Guard: a kind whose est_calls exceeds its source's per-window limit would have
+    available(source) < est forever and NEVER run (silent starvation — this bit the
+    sec_filings signal). Every registered kind must fit its source budget."""
+    from collector import default_collector
+    col = default_collector()
+    for kind, k in col.kinds.items():
+        limit, _ = col.limits[k["source"]]
+        assert k["est_calls"] <= limit, (
+            f"{kind}: est_calls={k['est_calls']} > {k['source']} limit={limit} — never runs")
+
+
 def test_status_reports_quota_and_counts(col):
     col.seed(["AAPL", "MSFT"])
     col.tick()

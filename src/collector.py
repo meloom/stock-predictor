@@ -1082,7 +1082,9 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_source("yfinance", limit=30, window_sec=60)    # gentle — yfinance throttles bursts
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
     col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
-    col.register_source("sec", limit=8, window_sec=1)           # SEC EDGAR: under 10 req/s
+    # SEC EDGAR: 60 calls / 10s window = 6/s sustained budget (a multi-call filings task
+    # fits); the handler paces ~0.12s/call so bursts stay under SEC's 10 req/s cap.
+    col.register_source("sec", limit=60, window_sec=10)
     col.register_source("transcript", limit=5, window_sec=60)   # paid transcript API
     # kind, source, interval, priority, handler, scope, est_calls
     # kind, source, priority, handler, frequency=…  (poll interval defaults to cadence)
