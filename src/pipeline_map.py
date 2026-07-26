@@ -162,8 +162,10 @@ RAW_TABLE = {
     "price.current": "quotes", "sec_filings": "sec_filings",
     "xbrl_financials": "xbrl_financials", "transcripts": "transcripts",
 }
-_S3_LINE = ["predict.eod_return", "predict.eod_price", "predict.p_up", "predict.p_down",
-            "predict.confidence", "predict.direction"]
+# the multi-horizon predictors actually produced by s3_multi.backfill()
+_S3_LINE = ["predict.eod_return",
+            "predict.ret_h1", "predict.ret_h5", "predict.ret_h21",
+            "predict.up_h1", "predict.up_h5", "predict.up_h21", "predict.vol_h5"]
 
 
 def _depends():
@@ -190,7 +192,11 @@ def _depends():
     d["regime.breadth5"] = ["tech.mom5"]
     d["calendar.days_to_earnings"] = ["earnings.next_date"]
     d["earnings.analysis"] = ["earnings.report_raw"]
-    d["predict.eod_return"] = list(s3_predictors.PREDICTOR_FEATURES)
+    pf = list(s3_predictors.PREDICTOR_FEATURES)
+    for p in ["predict.eod_return", "predict.ret_h1", "predict.ret_h5", "predict.ret_h21",
+              "predict.up_h1", "predict.up_h5", "predict.up_h21", "predict.vol_h5"]:
+        d[p] = pf                                   # every predictor consumes the S2 vector
+    d["predict.forecast"] = ["predict.ret_h1", "predict.ret_h5", "predict.ret_h21"]  # future rollup
     d["alpha.regime"] = ["regime.breadth5", "macro.vix", "macro.spy_close"]
     d["alpha.event_risk"] = ["calendar.days_to_earnings"]
     d["alpha.signal"] = ["predict.eod_return", "alpha.regime", "alpha.event_risk"]
@@ -226,7 +232,7 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
     for group, feats, _, _ in LINEAGE:
         for f in feats:
             defs.append((f, "S2", "json" if f == "earnings.analysis" else "line"))
-    defs += [(f, "S3", "line") for f in _S3_LINE] + [("predict.eod_meta", "S3", "json")]
+    defs += [(f, "S3", "line") for f in _S3_LINE] + [("predict.forecast", "S3", "json")]
     defs += [("alpha.regime", "S4", "json"), ("alpha.event_risk", "S4", "json"),
              ("alpha.signal", "S4", "json")]
 

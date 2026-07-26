@@ -546,7 +546,7 @@ svg#edges{position:absolute;top:0;left:0;z-index:0;pointer-events:none;overflow:
 .k-line .ndot,i.k-line{background:var(--accent)}.k-raw .ndot,i.k-raw{background:#c9930b}
 .k-json .ndot,i.k-json{background:#3b82c4}
 .nmeta{margin-left:auto;color:var(--mut);font-size:10px}
-.edge{fill:none;stroke:var(--line);stroke-width:1;opacity:.55}
+.edge{fill:none;stroke:var(--line);stroke-width:1;opacity:.14}
 .edge.hot{stroke:var(--accent);stroke-width:2;opacity:1}
 .dhead{display:flex;gap:10px;align-items:center;margin-bottom:12px;font-size:14px}
 .chart{width:100%;height:auto;background:var(--card);border:1px solid var(--line);border-radius:12px}
