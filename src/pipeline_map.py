@@ -252,8 +252,9 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
                       "label": fid.split(".", 1)[-1] if "." in fid else fid})
     nodeset = {n["id"] for n in nodes}
     edges = [[u, v] for v, us in deps.items() for u in us if u in nodeset and v in nodeset]
+    latest = fv.get("price.close", (0, None))[1]
     return {"ticker": ticker, "nodes": nodes, "edges": edges,
-            "stages": ["S1", "S2", "S3", "S4"]}
+            "stages": ["S1", "S2", "S3", "S4"], "latest": latest}
 
 
 def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
