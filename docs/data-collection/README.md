@@ -201,7 +201,8 @@ input, that is a collection gap.** One schema file per signal family under `sign
 | 3 | [macro](signals/macro.md) | `macro.vix`, `macro.spy_close`, `macro.yield10y` | `macro` | history | `alpha.regime`, `alpha.event_risk`, market context in S3/S4 |
 | 4 | [short_interest](signals/short_interest.md) | `short.shares`, `short.pct_float`, `short.days_to_cover`, `short.change_pct` | `short_interest` | snapshot | near-earnings crowding module (squeeze fuel) |
 | 5 | [options_implied](signals/options_implied.md) | `opt.implied_move`, `opt.straddle_pct`, `opt.expiry` | `options_implied` | snapshot | event-risk sizing, `alpha.event_risk` |
-| 6 | [earnings_reports](signals/earnings_reports.md) | `earnings.report_raw` | `earnings_reports` | rolling | `earnings.analysis` (S2), beat/miss & surprise features |
+| 6 | [earnings_reports](signals/earnings_reports.md) | `earnings.report_raw` | `earnings_reports` | event | `earnings.analysis` (S2), beat/miss & surprise features |
+| 6b | [sec_filings / xbrl / transcript](signals/sec_filings.md) | filing text, XBRL facts | `sec_filings`, `xbrl_financials`, `transcripts` | event | S2 NLP layer (guidance, tone, surprise-vs-narrative); authoritative value factors |
 | 7 | [earnings_calendar](signals/earnings_calendar.md) | `earnings.next_date` | `earnings_calendar` | snapshot | `calendar.days_to_earnings` (S2) → `alpha.event_risk` |
 | 8 | [analyst_snapshot](signals/analyst_snapshot.md) | `fundamental.analyst_snapshot` | *(feature_values)* | snapshot | consensus level; revision series accrues forward |
 | 9 | [analyst_revisions](signals/analyst_revisions.md) | `analyst.revisions_raw` | `analyst_revisions` | rolling | up/downgrade drift, sentiment features |

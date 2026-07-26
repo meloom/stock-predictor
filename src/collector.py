@@ -62,6 +62,7 @@ KIND_TABLE = {
     "implied_move": "options_implied", "earn_report": "earnings_reports",
     "earn_date": "earnings_calendar", "insider": "insider_transactions",
     "analyst_revisions": "analyst_revisions", "statements": "fundamentals",
+    "sec_filings": "sec_filings", "xbrl": "xbrl_financials", "transcript": "transcripts",
 }
 
 _QUEUE_SCHEMA = """
@@ -520,7 +521,7 @@ class Collector:
         MATRIX = [("Bars", "bars", "bars"), ("Quote", "quotes", "quote"),
                   ("Short%", "short_interest", "short"), ("ImplMove", "options_implied", "implied_move"),
                   ("Fundmls", "fundamentals", "statements"), ("NextEarn", "earnings_calendar", "earn_date"),
-                  ("Analyst", None, "analyst")]
+                  ("Filings", "sec_filings", "sec_filings"), ("Analyst", None, "analyst")]
         def _sla(kd):                                     # freshness thresholds for a column's kind
             return self.kinds.get(kd, {}).get("sla", DEFAULT_SLA["snapshot"])
         cols = [{"label": label, "sla": _sla(kd)} for label, _, kd in MATRIX]
@@ -955,6 +956,40 @@ def _h_earn_report(scope, store, tid):
     return len(reports), 1
 
 
+def _h_sec_filings(scope, store, tid):
+    """The ACTUAL earnings report as document text (SEC EDGAR): 8-K earnings releases +
+    10-Q/10-K (financials tables + MD&A narrative). Event-frequency: collect all filings
+    since COLLECTION_START, dedup by accession. Feeds the S2 NLP layer."""
+    import s1_edgar
+    rows, n_calls = s1_edgar.collect_filings(scope, COLLECTION_START.isoformat())
+    if not rows:
+        return 0, max(1, n_calls)
+    _typed().put_many("sec_filings", rows)                    # raw_text = full filing text
+    return len(rows), n_calls
+
+
+def _h_xbrl(scope, store, tid):
+    """Full financial-statement line items from EDGAR XBRL company-facts — every standard
+    concept × period since COLLECTION_START (authoritative, complete)."""
+    import s1_edgar
+    rows, n_calls = s1_edgar.collect_xbrl(scope, COLLECTION_START.isoformat())
+    if not rows:
+        return 0, max(1, n_calls)
+    _typed().put_many("xbrl_financials", rows)
+    return len(rows), n_calls
+
+
+def _h_transcript(scope, store, tid):
+    """Earnings-call transcript (richest forward-looking narrative). PAID source — needs
+    a provider + API key (Seeking Alpha / FMP / API Ninjas). Until one is configured this
+    raises so the signal shows as BLOCKED (honest coverage), not a false success."""
+    key = load_secret("TRANSCRIPT_API_KEY")
+    if not key:
+        raise RuntimeError("no transcript source configured — set TRANSCRIPT_API_KEY "
+                           "and pick a provider (see docs/data-collection)")
+    raise RuntimeError("transcript provider not yet implemented")   # provider TBD
+
+
 def _h_earn_analysis(scope, store, tid):
     """PROCESSING task: read the downloaded raw report, analyze, store the outcome.
     Depends on earn_report — if the raw isn't collected yet, no-op and retry."""
@@ -1047,6 +1082,8 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_source("yfinance", limit=30, window_sec=60)    # gentle — yfinance throttles bursts
     col.register_source("polygon", limit=5, window_sec=60)      # basic plan hard cap
     col.register_source("process", limit=10000, window_sec=60)  # local CPU (derived signals)
+    col.register_source("sec", limit=8, window_sec=1)           # SEC EDGAR: under 10 req/s
+    col.register_source("transcript", limit=5, window_sec=60)   # paid transcript API
     # kind, source, interval, priority, handler, scope, est_calls
     # kind, source, priority, handler, frequency=…  (poll interval defaults to cadence)
     col.register_kind("macro", "yfinance", 10, _h_macro, frequency="daily", scope="market", est_calls=3)
@@ -1062,6 +1099,10 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_kind("earn_date", "yfinance", 45, _h_earn_date, frequency="snapshot")   # next-earnings date/time
     col.register_kind("earn_report", "yfinance", 46, _h_earn_report, frequency="event")
     col.register_kind("statements", "yfinance", 50, _h_statements, frequency="event")
+    # the REAL earnings report as document text + full financials (SEC EDGAR, free)
+    col.register_kind("sec_filings", "sec", 47, _h_sec_filings, frequency="event", est_calls=12)
+    col.register_kind("xbrl", "sec", 48, _h_xbrl, frequency="event", est_calls=1)
+    col.register_kind("transcript", "transcript", 49, _h_transcript, frequency="event")  # PAID, blocked until key set
     # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
     # they don't show on the data-collection dashboard. Each reads raw S1 data.
     col.register_kind("earn_analysis", "process", 55, _h_earn_analysis, frequency="daily", stage="S2")

@@ -41,13 +41,25 @@ SCHEMA = {
                                       "total_equity", "gross_profit", "total_assets",
                                       "free_cash_flow", "trailing_eps",
                                       "shares_outstanding"]),
+    # the ACTUAL earnings report as document text (SEC EDGAR): 8-K earnings releases +
+    # 10-Q/10-K (financials tables + MD&A narrative). raw_text = the full filing text.
+    "sec_filings": ("filing_date", ["ticker", "cik", "form", "period_of_report",
+                                    "accession", "url", "raw_text"]),
+    # full financial-statement line items from EDGAR XBRL — one row per concept×period.
+    "xbrl_financials": ("period_end", ["ticker", "concept", "fy", "fp", "form", "unit",
+                                       "value", "filed"]),
+    # earnings-call transcripts (paid source) — richest forward-looking narrative.
+    "transcripts": ("call_date", ["ticker", "quarter", "source", "raw_text"]),
 }
 
 # text vs real typing (everything else defaults REAL if it looks numeric, else TEXT)
 _TEXT = {"ticker", "name", "session", "expiry", "position", "insider", "firm",
          "action", "from_grade", "to_grade", "next_earnings_ts", "period_end",
          "date", "bar_ts", "quote_ts", "settlement_date", "snap_date", "report_date",
-         "txn_date", "revision_date", "publish_date", "raw_json"}
+         "txn_date", "revision_date", "publish_date", "raw_json",
+         "cik", "form", "period_of_report", "accession", "url", "raw_text",
+         "filing_date", "concept", "fp", "unit", "filed", "call_date", "quarter",
+         "source"}
 # per-table PRIMARY KEY (entity + timestamp, plus disambiguators for lists)
 _PK = {
     "bars": ["ticker", "bar_ts"], "quotes": ["ticker", "quote_ts"],
@@ -58,6 +70,9 @@ _PK = {
     "insider_transactions": ["ticker", "txn_date", "insider", "value"],
     "analyst_revisions": ["ticker", "revision_date", "firm", "action"],
     "fundamentals": ["ticker", "publish_date"],
+    "sec_filings": ["ticker", "accession"],
+    "xbrl_financials": ["ticker", "concept", "period_end", "form"],
+    "transcripts": ["ticker", "call_date"],
 }
 
 
