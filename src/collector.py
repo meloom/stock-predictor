@@ -419,22 +419,30 @@ class Collector:
             e = {"kind": kind, "source": k.get("source", "?"), "mode": mode,
                  "total": a["total"], "collected": a["collected"], "due_now": a["due"],
                  "errors": a["errors"], "last_run_h": hours_since(a["last"])}
+            # coverage is measured from the REAL typed store (schema.py), never the
+            # queue's presence count — a task marked "collected" via the legacy
+            # projection but with no typed row is NOT coverage.
+            exp_ents = 1 if k["scope"] == "market" else max(a["total"], 1)
             if mode == "history" and table:
                 d = ts.depth(table, cap=want)
-                ents = d["entities"] if k["scope"] == "market" else max(a["total"], d["entities"])
-                denom = (ents or 1) * want
+                denom = exp_ents * want
                 e.update(pct=min(100, round(100 * d["capped_sum"] / denom)) if denom else 0,
-                         detail=f'{d["median"]}/{want} trading days deep · {d["entities"]} entities',
+                         detail=f'{d["entities"]}/{exp_ents} tickers · {d["median"]}/{want} trading days deep',
                          expect=f'~{want} trading days of daily history (backfillable)')
             elif mode == "rolling" and table:
                 cov = ts.coverage(table)
                 span = f'{(cov["first"] or "?")[:10]}→{(cov["last"] or "?")[:10]}'
-                e.update(pct=breadth,
-                         detail=f'{a["collected"]}/{a["total"]} tickers · {cov["rows"]} records · {span}',
+                e.update(pct=round(100 * cov["entities"] / exp_ents) if exp_ents else 0,
+                         detail=f'{cov["entities"]}/{exp_ents} tickers · {cov["rows"]} records · {span}',
                          expect='rolling event history (as far back as the source returns)')
-            else:                                          # snapshot — accrues forward only
+            elif table:                                    # snapshot WITH a typed table
+                cov = ts.coverage(table)
+                e.update(pct=round(100 * cov["entities"] / exp_ents) if exp_ents else 0,
+                         detail=f'{cov["entities"]}/{exp_ents} tickers · snapshot, history accrues forward',
+                         expect='current snapshot only — no back-history from this source')
+            else:                                          # snapshot, no typed table (analyst)
                 e.update(pct=breadth,
-                         detail=f'{a["collected"]}/{a["total"]} tickers · snapshot, history accrues forward',
+                         detail=f'{a["collected"]}/{a["total"]} tickers · snapshot (feature_values)',
                          expect='current snapshot only — no back-history from this source')
             kinds.append(e)
         # STABLE order (by collection priority, then name) — never reorder by progress.
@@ -976,6 +984,7 @@ def _cli():
     p_dr = sub.add_parser("drain"); p_dr.add_argument("--seconds", type=float, default=55)
     sub.add_parser("run")
     sub.add_parser("status")
+    sub.add_parser("coverage")
     args = ap.parse_args()
     col = default_collector()
     if args.cmd in ("seed", "reconcile"):
@@ -996,6 +1005,13 @@ def _cli():
         print("collector daemon starting (Ctrl-C to stop)"); col.run_forever()
     elif args.cmd == "status":
         print(json.dumps(col.status(), indent=2, default=str))
+    elif args.cmd == "coverage":
+        r = col.coverage_report(); o = r["overall"]
+        print(f'COVERAGE vs expectation: {o["pct"]}%  ·  {o.get("kinds_full",0)}/'
+              f'{o.get("kinds_total",0)} signals full  ·  by mode {o.get("by_mode",{})}')
+        print(f'{"KIND":19}{"MODE":9}{"COV":>5}   WHAT WE HOLD vs EXPECTED')
+        for k in r["kinds"]:
+            print(f'{k["kind"]:19}{k["mode"]:9}{k["pct"]:>4}%   {k.get("detail","")}')
 
 
 if __name__ == "__main__":
