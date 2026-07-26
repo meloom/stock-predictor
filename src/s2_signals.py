@@ -44,6 +44,14 @@ S2_FEATURES = [
     ("tech.ret_lag5", "float", "ticker", "daily", "daily return on day t-4."),
     ("tech.ret_lag6", "float", "ticker", "daily", "daily return on day t-5."),
     ("tech.ret_lag7", "float", "ticker", "daily", "daily return on day t-6."),
+    # -- INTRADAY granularity (from the HOURLY bars, not the daily EOD projection).
+    #    The daily close throws away within-session structure; these keep it. --
+    ("tech.intraday_ret", "float", "ticker", "daily",
+     "(last hourly close / first hourly open) - 1 on the session — intraday drift."),
+    ("tech.overnight_gap", "float", "ticker", "daily",
+     "(today's first hourly open / prior session's last hourly close) - 1 — the gap."),
+    ("tech.intraday_vol5", "float", "ticker", "daily",
+     "5-session mean of within-session hourly close-to-close return stdev — intraday vol."),
     # -- fundamentals (from S1's statements/shares/analyst; the enrichment that
     #    covers value/quality/size — categories the technicals above miss) --
     ("fund.market_cap", "float", "ticker", "daily",
@@ -245,6 +253,61 @@ def pct_ranks(values: dict[str, float]) -> dict[str, float]:
     return out
 
 
+def _stdev(xs: list[float]) -> float | None:
+    if len(xs) < 2:
+        return None
+    m = sum(xs) / len(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def intraday_features(bars_by_day: dict[str, list[tuple]]) -> dict[str, float | None]:
+    """Intraday features from HOURLY bars grouped by session date. bars_by_day:
+    {YYYY-MM-DD: [(open, close), ...] in time order}. Uses only the sessions present
+    (all <= event_date by construction), so it is PIT-safe."""
+    days = sorted(bars_by_day)
+    if not days:
+        return {"tech.intraday_ret": None, "tech.overnight_gap": None, "tech.intraday_vol5": None}
+    today = bars_by_day[days[-1]]
+    t_open, t_close = today[0][0], today[-1][1]
+    intraday_ret = (t_close / t_open - 1) if (t_open and t_close and t_open > 0) else None
+    overnight = None
+    if len(days) >= 2:
+        prev_close = bars_by_day[days[-2]][-1][1]
+        if prev_close and t_open and prev_close > 0:
+            overnight = t_open / prev_close - 1
+    vols = []
+    for day in days[-5:]:
+        closes = [c for _, c in bars_by_day[day] if c]
+        rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes)) if closes[i - 1]]
+        v = _stdev(rets)
+        if v is not None:
+            vols.append(v)
+    ivol = (sum(vols) / len(vols)) if vols else None
+    return {"tech.intraday_ret": intraday_ret, "tech.overnight_gap": overnight,
+            "tech.intraday_vol5": ivol}
+
+
+_TS = None
+
+
+def _hourly_by_day(ticker: str, event_date: str, sessions: int = 6) -> dict:
+    """Read the HOURLY bars for `ticker` up to and including event_date (PIT), grouped
+    by session date. Reads the typed S1 `bars` table (the hourly granularity that the
+    daily EOD projection discards)."""
+    global _TS
+    if _TS is None:
+        import schema
+        _TS = schema.TypedStore()
+    end = event_date + "T99"                                  # include all of event_date
+    rows = _TS.c.execute(
+        "SELECT bar_ts, open, close FROM bars WHERE ticker=? AND bar_ts<=? "
+        "ORDER BY bar_ts DESC LIMIT ?", (ticker, end, sessions * 24)).fetchall()
+    by_day: dict[str, list[tuple]] = {}
+    for ts, o, c in reversed(rows):                           # back to ascending
+        by_day.setdefault(ts[:10], []).append((o, c))
+    return by_day
+
+
 # ═══════════════ Orchestrator ═══════════════
 
 HISTORY_N = 260  # trading days of closes per ticker: covers rsi14/mom20/hvol20
@@ -296,6 +359,8 @@ def run_signal_generation(universe: list[str], event_date: str,
                 computed[f"tech.ret_lag{k}"] = r
             # long-horizon extension (champion block: modeling/ERROR_ANALYSIS.md)
             computed.update(xhorizon_features(closes))
+            # INTRADAY granularity from the hourly bars (not the daily EOD projection)
+            computed.update(intraday_features(_hourly_by_day(t, event_date)))
 
             # fundamentals — read S1's raw data as-of event_date (read_asof is
             # publication-date aware, so a statement filed after event_date is
@@ -347,3 +412,23 @@ def run_signal_generation(universe: list[str], event_date: str,
             skipped=skipped,
         )
         return {"trigger_id": trig.trigger_id, **trig.metrics}
+
+
+def backfill(universe: list[str], store: FeatureStore | None = None,
+             start: str | None = None) -> dict:
+    """Produce the FULL S2 feature time series — one pass per trading day we have
+    bars for, from `start` (default COLLECTION_START) to the latest. S2 must cover the
+    whole range and granularity, not a single date-slice: modeling's panel and the
+    dashboards read the complete history. Returns coverage summary."""
+    import sqlite3
+    from core import DEFAULT_DB
+    store = store or FeatureStore()
+    start = start or "2025-07-01"
+    con = sqlite3.connect(DEFAULT_DB)
+    dates = sorted(r[0] for r in con.execute(
+        "SELECT DISTINCT event_time FROM feature_values WHERE feature='price.close' "
+        "AND event_time >= ?", (start,)))
+    for d in dates:
+        run_signal_generation(universe, d, store=store)
+    return {"dates": len(dates), "first": dates[0] if dates else None,
+            "last": dates[-1] if dates else None}

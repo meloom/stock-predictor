@@ -22,6 +22,8 @@ LINEAGE = [
                    "tech.ret_lag1", "tech.ret_lag2", "tech.ret_lag3", "tech.ret_lag4",
                    "tech.ret_lag5", "tech.ret_lag6", "tech.ret_lag7"],
      "bars → price.close / price.volume (daily EOD)", "S3 model (PREDICTOR_FEATURES)"),
+    ("intraday (hourly)", ["tech.intraday_ret", "tech.overnight_gap", "tech.intraday_vol5"],
+     "bars → HOURLY OHLCV (within-session granularity)", "available to S3 (validate before adding)"),
     ("long-horizon", ["xh.ret_21d", "xh.ret_63d", "xh.ret_126d", "xh.dist_hi252",
                       "xh.new_high_flag", "xh.above_hi_streak"],
      "bars → price.close (trailing 252d)", "S3 model (champion block)"),
@@ -102,12 +104,13 @@ def report(db_path=DEFAULT_DB) -> dict:
     now = datetime.now(timezone.utc)
 
     def cov(feature):
-        r = c.execute("SELECT COUNT(*), COUNT(DISTINCT scope), MAX(event_time), "
-                      "MAX(ingested_at) FROM feature_values WHERE feature=?",
-                      (feature,)).fetchone()
-        rows, scopes, latest, ing = r
+        r = c.execute("SELECT COUNT(*), COUNT(DISTINCT scope), COUNT(DISTINCT event_time), "
+                      "MIN(event_time), MAX(event_time), MAX(ingested_at) "
+                      "FROM feature_values WHERE feature=?", (feature,)).fetchone()
+        rows, scopes, ndates, first, latest, ing = r
         return {"feature": feature, "rows": rows or 0, "scopes": scopes or 0,
-                "latest": latest, "fresh_h": _hours_since(ing, now)}
+                "n_dates": ndates or 0, "first": first, "latest": latest,
+                "fresh_h": _hours_since(ing, now)}
 
     groups = []
     for group, feats, derived, consumer in LINEAGE:
@@ -115,6 +118,8 @@ def report(db_path=DEFAULT_DB) -> dict:
         groups.append({"group": group, "derived_from": derived, "consumer": consumer,
                        "features": items,
                        "scopes_max": max((i["scopes"] for i in items), default=0),
+                       "dates_max": max((i["n_dates"] for i in items), default=0),
+                       "first": min((i["first"] or "9999" for i in items), default=""),
                        "latest": max((i["latest"] or "" for i in items), default="")})
 
     # downstream contract: is each required input actually produced?

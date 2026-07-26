@@ -8,7 +8,23 @@ import pytest
 import core as core_mod
 from core import FeatureStore, MARKET_SCOPE
 from s2_signals import (rsi14, momentum, hvol20, volume_ratio20, pct_ranks,
-                        fundamental_ratios, xhorizon_features, run_signal_generation)
+                        fundamental_ratios, xhorizon_features, run_signal_generation,
+                        intraday_features)
+
+
+def test_intraday_features_use_hourly_granularity():
+    """Intraday features come from the HOURLY bars, not the daily EOD close."""
+    bd = {"2026-07-23": [(98, 99), (99, 100), (100, 100)],       # prev session, closes 100
+          "2026-07-24": [(102, 103), (103, 104), (104, 105)]}    # gap +2%, drifts to 105
+    r = intraday_features(bd)
+    assert r["tech.overnight_gap"] == pytest.approx(102 / 100 - 1)   # 102 open vs 100 close
+    assert r["tech.intraday_ret"] == pytest.approx(105 / 102 - 1)    # open->close of session
+    assert r["tech.intraday_vol5"] is not None                      # within-session vol exists
+
+
+def test_intraday_features_empty_is_none_not_zero():
+    r = intraday_features({})
+    assert r["tech.intraday_ret"] is None and r["tech.overnight_gap"] is None
 
 
 @pytest.fixture(autouse=True)

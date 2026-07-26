@@ -437,18 +437,20 @@ def render_s2(rep: dict) -> str:
     grp = ""
     for g in groups:
         warn = "⚠" in g["consumer"]
-        head = (f'<tr class="grphead"><td colspan="4"><span class="gname">{g["group"]}</span>'
+        head = (f'<tr class="grphead"><td colspan="5"><span class="gname">{g["group"]}</span>'
                 f'<span class="gflow"><b>from</b> {g["derived_from"]} &nbsp;<b>→</b> '
                 f'<span class="{"gwarn" if warn else "gto"}">{g["consumer"]}</span></span></td></tr>')
         rows = ""
         for f in g["features"]:
             pct = round(100 * f["scopes"] / UNIV)
             cls = "ok" if pct >= 90 else ("run" if pct > 0 else "warn")
-            fresh = f'{f["fresh_h"]}h' if f["fresh_h"] is not None else "—"
+            span = (f'{(f["first"] or "?")[:10]}→{(f["latest"] or "?")[:10]}'
+                    if f["n_dates"] else "—")
             rows += (f'<tr><td class="mono feat">{f["feature"]}</td>'
                      f'<td class="barcell">{_bar(pct, cls)}</td>'
                      f'<td class="mono num">{f["scopes"]}/{UNIV}</td>'
-                     f'<td class="mono muted">{(f["latest"] or "—")[:10]} · {fresh}</td></tr>')
+                     f'<td class="mono num">{f["n_dates"]}</td>'
+                     f'<td class="mono muted">{span}</td></tr>')
         grp += head + rows
 
     # downstream contract
@@ -502,7 +504,7 @@ def render_s2(rep: dict) -> str:
 
   <section class="panel"><h2>Feature lineage &amp; coverage
     <span class="muted">— what each S2 feature is derived from, who consumes it, and how much of the universe is produced</span></h2>
-    <table class="queue"><thead><tr><th>Feature</th><th>Coverage</th><th>Tickers</th><th>Latest · fresh</th></tr></thead>
+    <table class="queue"><thead><tr><th>Feature</th><th>Coverage</th><th>Tickers</th><th>Dates</th><th>Date span</th></tr></thead>
     <tbody>{grp}</tbody></table>
   </section>
 
