@@ -285,6 +285,19 @@ class Collector:
                 "first_event": span[0], "last_event": span[1],
                 "daily": list(reversed(daily)), "by_5min": by_5min, "stamps": stamps}
 
+    def typed_tables(self) -> list:
+        """The typed raw-data tables + their coverage (for the inspector dropdown)."""
+        import schema
+        ts = _typed()
+        return [ts.coverage(t) for t in schema.SCHEMA]
+
+    def typed_rows(self, table: str, ticker: str | None = None, limit: int = 100) -> dict:
+        """Typed rows for one table (real columns incl. the source-timestamp column)."""
+        import schema
+        if table not in schema.SCHEMA:
+            return {"table": table, "columns": [], "rows": [], "error": "unknown table"}
+        return _typed().rows(table, ticker or None, limit)
+
     def raw_values(self, scope: str, feature: str, limit: int = 60) -> dict:
         """The EXACT stored values for one scope × feature (most recent first),
         with event_time (when generated) and ingested_at (when collected). JSON
@@ -395,6 +408,20 @@ def _reg_s1(store):
     s1_data.register_all(store)
 
 
+_TS = None
+
+
+def _typed():
+    """Module-singleton TypedStore — the proper typed tables (schema.py). Handlers
+    write typed rows here; the scalar feature_values projection is kept only for
+    the S2 features that read it."""
+    global _TS
+    if _TS is None:
+        import schema
+        _TS = schema.TypedStore()
+    return _TS
+
+
 def _h_bars(scope, store, tid):
     import s1_data
     _reg_s1(store)
@@ -427,24 +454,30 @@ def _h_bars_polygon(scope, store, tid):
     res = d.get("results") or []
     if not res:
         raise RuntimeError(f"no Polygon bars for {scope} — will retry")
-    rows = []
+    typed, proj = [], []
     for b in res:
         dt = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date().isoformat()
-        rows.append(("price.close", scope, dt, b["c"]))
-        rows.append(("price.volume", scope, dt, b["v"]))
-    store.write_many(rows, trigger_id=tid)
-    return len(rows), 1
+        typed.append({"ticker": scope, "date": dt, "open": b.get("o"), "high": b.get("h"),
+                      "low": b.get("l"), "close": b.get("c"), "volume": b.get("v")})
+        proj.append(("price.close", scope, dt, b["c"]))       # scalar projection for S2
+        proj.append(("price.volume", scope, dt, b["v"]))
+    _typed().put_many("bars", typed)                          # TYPED: full OHLCV, one row/day
+    store.write_many(proj, trigger_id=tid)
+    return len(typed), 1
 
 
 def _h_macro(scope, store, tid):
     import s1_data
     _reg_s1(store)
     macro = s1_data.fetch_macro("1y")
-    rows = [(f"macro.{k}", MARKET_SCOPE, pt["date"], pt["value"])
+    typed = [{"name": k, "date": pt["date"], "value": pt["value"]}
+             for k, series in macro.items() for pt in series]
+    proj = [(f"macro.{k}", MARKET_SCOPE, pt["date"], pt["value"])
             for k, series in macro.items() for pt in series]
-    if rows:
-        store.write_many(rows, trigger_id=tid)
-    return len(rows), 3     # fetch_macro hits 3 symbols
+    _typed().put_many("macro", typed)                         # TYPED: name,date,value
+    if proj:
+        store.write_many(proj, trigger_id=tid)
+    return len(typed), 3     # fetch_macro hits 3 symbols
 
 
 def _h_quote(scope, store, tid):
@@ -453,11 +486,11 @@ def _h_quote(scope, store, tid):
     q = s1_data.fetch_current_quote(scope)
     if q is None:
         return 0, 1
-    # event_time = when the quote was GENERATED (market timestamp), not today's
-    # date — so intraday snapshots are distinct and PIT-correct for training.
-    # (ingested_at, set by the store, records when we COLLECTED it.)
-    event_time = q.get("as_of") or datetime.now(timezone.utc).isoformat()
-    store.write("price.current", scope, event_time, q, trigger_id=tid)
+    # quote_ts = when the quote was GENERATED (market timestamp), not today's date.
+    ts = q.get("as_of") or datetime.now(timezone.utc).isoformat()
+    _typed().put("quotes", {"ticker": scope, "quote_ts": ts,
+                            "price": q["price"], "session": q["session"]})
+    store.write("price.current", scope, ts, q, trigger_id=tid)   # projection for consumers
     return 1, 1
 
 
@@ -468,12 +501,14 @@ def _h_short(scope, store, tid):
     if si is None:
         return 0, 1
     et = si["event_time"] or _today()
-    n = 0
+    _typed().put("short_interest", {"ticker": scope, "settlement_date": et,
+                 "shares_short": si["shares_short"], "pct_float": si["pct_float"],
+                 "days_to_cover": si["days_to_cover"], "change_pct": si["change_pct"]})
     for feat, key in (("short.shares", "shares_short"), ("short.pct_float", "pct_float"),
                       ("short.days_to_cover", "days_to_cover"), ("short.change_pct", "change_pct")):
         if si[key] is not None:
-            store.write(feat, scope, et, si[key], trigger_id=tid); n += 1
-    return n, 1
+            store.write(feat, scope, et, si[key], trigger_id=tid)
+    return 1, 1
 
 
 def _h_analyst(scope, store, tid):
@@ -495,16 +530,19 @@ def _h_statements(scope, store, tid):
     if sh is not None:
         store.write("fundamental.shares_outstanding", scope, _today(), sh, trigger_id=tid); n += 1
     if st is not None:
+        _typed().put("fundamentals", {                       # TYPED: line items as columns
+            "ticker": scope, "publish_date": st["event_time"], "period_end": st.get("period_end"),
+            "revenue": st.get("revenue"), "net_income": st.get("net_income"),
+            "total_equity": st.get("total_equity"), "gross_profit": st.get("gross_profit"),
+            "total_assets": st.get("total_assets"), "free_cash_flow": st.get("free_cash_flow"),
+            "trailing_eps": st.get("trailing_eps"), "shares_outstanding": sh})
         store.write("fundamental.statements", scope, st["event_time"], st, trigger_id=tid); n += 1
     return n, 1
 
 
 def _h_insider(scope, store, tid):
-    """RAW insider (SEC Form 4) transactions — the external data the S2 insider
-    block needs. Snapshot of the dated transaction list; S2 derives net-sell ratios."""
-    store.register("insider.transactions_raw", "json", "ticker", "S1", "daily",
-                   "RAW insider Form-4 transactions (dated list snapshot from yfinance). "
-                   "event_time = snapshot day; S2 derives trailing net-sell metrics.")
+    """RAW insider (SEC Form 4) transactions — ONE TYPED ROW PER TRANSACTION, each
+    with its own transaction date. S2 derives net-sell metrics from these rows."""
     import yfinance as yf
     try:
         df = yf.Ticker(scope).insider_transactions
@@ -512,23 +550,21 @@ def _h_insider(scope, store, tid):
         return 0, 1
     if df is None or len(df) == 0:
         return 0, 1
-    recs = []
+    rows = []
     for _, r in df.iterrows():
         d = r.get("Start Date")
         d = d.date().isoformat() if hasattr(d, "date") else (str(d)[:10] if d is not None else None)
         txt = str(r.get("Text", "")); val = _num(r.get("Value")) or 0.0
-        recs.append({"date": d, "value": val, "position": str(r.get("Position", "")),
-                     "is_sale": ("sale" in txt.lower()) and val > 0})
-    store.write("insider.transactions_raw", scope, _today(), recs, trigger_id=tid)
-    return 1, 1
+        rows.append({"ticker": scope, "txn_date": d, "value": val,
+                     "shares": _num(r.get("Shares")), "position": str(r.get("Position", "")),
+                     "insider": str(r.get("Insider", "")),
+                     "is_sale": 1 if (("sale" in txt.lower()) and val > 0) else 0})
+    return _typed().put_many("insider_transactions", rows), 1
 
 
 def _h_analyst_revisions(scope, store, tid):
-    """RAW analyst upgrades/downgrades — dated grade changes (the external data the
-    S2 revision-momentum block needs). Distinct from analyst_snapshot (consensus)."""
-    store.register("analyst.revisions_raw", "json", "ticker", "S1", "daily",
-                   "RAW dated analyst grade changes (upgrades/downgrades from yfinance). "
-                   "event_time = snapshot day; S2 derives net-revision momentum.")
+    """RAW analyst upgrades/downgrades — ONE TYPED ROW PER REVISION, each with its
+    grade-change date. S2 derives net-revision momentum from these rows."""
     import yfinance as yf
     try:
         df = yf.Ticker(scope).upgrades_downgrades
@@ -536,14 +572,13 @@ def _h_analyst_revisions(scope, store, tid):
         return 0, 1
     if df is None or len(df) == 0:
         return 0, 1
-    recs = []
+    rows = []
     for idx, r in df.iterrows():
         d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
-        recs.append({"date": d, "action": str(r.get("Action", "")).lower(),
-                     "firm": str(r.get("Firm", "")), "to": str(r.get("ToGrade", "")),
-                     "from": str(r.get("FromGrade", ""))})
-    store.write("analyst.revisions_raw", scope, _today(), recs, trigger_id=tid)
-    return 1, 1
+        rows.append({"ticker": scope, "revision_date": d,
+                     "firm": str(r.get("Firm", "")), "action": str(r.get("Action", "")).lower(),
+                     "from_grade": str(r.get("FromGrade", "")), "to_grade": str(r.get("ToGrade", ""))})
+    return _typed().put_many("analyst_revisions", rows), 1
 
 
 def _h_dte(scope, store, tid):
@@ -612,6 +647,10 @@ def _h_implied_move(scope, store, tid):
         return 0, calls
     straddle = cp + ptp
     today = _today()
+    _typed().put("options_implied", {"ticker": scope, "snap_date": today,
+                 "underlying": px, "expiry": expiry, "atm_call": cp, "atm_put": ptp,
+                 "straddle_pct": round(straddle / px, 4),
+                 "implied_move": round(0.85 * straddle / px, 4)})
     store.write("opt.straddle_pct", scope, today, round(straddle / px, 4), trigger_id=tid)
     store.write("opt.implied_move", scope, today, round(0.85 * straddle / px, 4), trigger_id=tid)
     store.write("opt.expiry", scope, today, expiry, trigger_id=tid)
@@ -703,6 +742,11 @@ def _h_earn_report(scope, store, tid):
     raw = fetch_earnings_report(scope)
     if not raw or not raw.get("event_time"):
         return 0, 1
+    _typed().put("earnings_reports", {                        # TYPED: EPS/revenue columns
+        "ticker": scope, "report_date": raw["event_time"],
+        "eps_estimate": raw.get("eps_estimate"), "eps_reported": raw.get("eps_reported"),
+        "surprise_pct": raw.get("surprise_pct"), "revenue": raw.get("revenue"),
+        "net_income": raw.get("net_income"), "revenue_year_ago": raw.get("revenue_year_ago")})
     store.write("earnings.report_raw", scope, raw["event_time"], raw, trigger_id=tid)
     return 1, 1
 
@@ -755,6 +799,8 @@ def _h_earn_date(scope, store, tid):
     v = fetch_next_earnings_date(scope)
     if not v:
         return 0, 1
+    _typed().put("earnings_calendar", {"ticker": scope, "snap_date": _today(),
+                 "next_earnings_ts": v["next_earnings"]})     # TYPED: exact next-earnings ts
     store.write("earnings.next_date", scope, _today(), v, trigger_id=tid)
     return 1, 1
 

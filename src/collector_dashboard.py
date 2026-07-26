@@ -17,8 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     from core import MARKET_SCOPE
+    from schema import SCHEMA as TYPED_SCHEMA
 except Exception:
-    MARKET_SCOPE = "_market"
+    MARKET_SCOPE = "_market"; TYPED_SCHEMA = {}
 
 SIGNAL_LABELS = {
     "price.close": "Bars", "price.current": "Quote", "short.pct_float": "Short%",
@@ -130,8 +131,7 @@ def render(report: dict, tickers: list[str]) -> str:
 
     drill_opts = "".join(f"<option>{t}</option>" for t in shown)
     drill_json = _json.dumps(DRILL_FEATURES)
-    rsig_opts = "".join(f"<option>{s['feature']}</option>" for s in report["signals"])
-    mkt_json = _json.dumps(MARKET_SCOPE)
+    tbl_opts = "".join(f"<option>{t}</option>" for t in TYPED_SCHEMA)
 
     return f"""{_CSS}
 <main>
@@ -161,11 +161,11 @@ def render(report: dict, tickers: list[str]) -> str:
     <tbody id="qbody">{grows}</tbody></table></div>
   </section>
 
-  <section class="panel"><h2>Raw data inspector <span class="muted">— view the exact stored value for any ticker × signal (use __MARKET__ for macro)</span></h2>
+  <section class="panel"><h2>Raw data inspector <span class="muted">— exact typed rows per table: real columns + the source timestamp each value was logged at</span></h2>
     <div class="rawctrl">
-      <select id="rsig" onchange="rscopeHint()">{rsig_opts}</select>
-      <input id="rscope" value="AAPL" placeholder="ticker (macro auto-uses market)" spellcheck="false">
-      <button id="rgo" onclick="showRaw()">Show raw values</button>
+      <select id="rtbl">{tbl_opts}</select>
+      <input id="rticker" value="AAPL" placeholder="ticker (blank = all; macro ignores)" spellcheck="false">
+      <button id="rgo" onclick="showTyped()">Show rows</button>
     </div>
     <div id="rawout"></div>
   </section>
@@ -215,29 +215,21 @@ async function toggleSig(btn,body,feat,label){{
     (d.stamps.length?'<details><summary>exact timestamps to the second ('+d.stamps.length+')</summary>'+
     '<div class="tswrap"><table class="ts"><thead><tr><th>event time</th><th>collected at (ingested_at)</th></tr></thead><tbody>'+ts+'</tbody></table></div></details>':'');
 }}
-const MARKET={mkt_json};
-function rscopeHint(){{
-  var f=document.getElementById('rsig').value, s=document.getElementById('rscope');
-  if(f.indexOf('macro.')===0||f.indexOf('regime.')===0){{s.value=MARKET;}}
-  else if(s.value===MARKET){{s.value='AAPL';}}
-}}
-async function showRaw(){{
-  var feat=document.getElementById('rsig').value;
-  var scope=document.getElementById('rscope').value.trim();
-  if(feat.indexOf('macro.')===0||feat.indexOf('regime.')===0){{scope=MARKET;}} else {{scope=scope.toUpperCase();}}
+async function showTyped(){{
+  var table=document.getElementById('rtbl').value;
+  var ticker=document.getElementById('rticker').value.trim().toUpperCase();
   var out=document.getElementById('rawout'); out.innerHTML='<div class="dmeta muted">loading…</div>';
-  var r=await fetch('/api/raw?scope='+encodeURIComponent(scope)+'&feature='+encodeURIComponent(feat));
+  var r=await fetch('/api/typed?table='+encodeURIComponent(table)+'&ticker='+encodeURIComponent(ticker));
   var d=await r.json();
-  if(!d.rows.length){{out.innerHTML='<div class="dmeta muted">no data for '+scope+' · '+feat+'</div>';return;}}
-  function esc(x){{return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}}
-  var rows=d.rows.map(function(x){{
-    var v=(x.value!==null&&typeof x.value==='object')?JSON.stringify(x.value):String(x.value);
-    return '<tr><td class="mono">'+esc(x.event_time)+'</td><td class="mono muted">'+esc(String(x.ingested_at).replace('T',' ').slice(0,19))+'</td><td class="mono rawval">'+esc(v)+'</td></tr>';
-  }}).join('');
-  out.innerHTML='<div class="dmeta mono">'+esc(scope)+' \\u00b7 '+esc(feat)+' \\u2014 '+d.count+' most-recent values (newest first)</div>'+
-    '<div class="tswrap"><table class="ts"><thead><tr><th>event time (generated)</th><th>collected at</th><th>raw value</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+  if(!d.rows||!d.rows.length){{out.innerHTML='<div class="dmeta muted">no rows in '+table+(ticker?' for '+ticker:'')+'</div>';return;}}
+  function esc(x){{return (x===null||x===undefined)?'':String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}}
+  var th=d.columns.map(function(c){{return '<th'+(c===d.ts_col?' class="tscol"':'')+'>'+esc(c)+'</th>';}}).join('');
+  var tr=d.rows.map(function(row){{return '<tr>'+d.columns.map(function(c){{
+    return '<td class="mono'+(c===d.ts_col?' tscol':'')+'">'+esc(row[c])+'</td>';}}).join('')+'</tr>';}}).join('');
+  out.innerHTML='<div class="dmeta mono">'+esc(table)+(ticker?' \\u00b7 '+esc(ticker):'')+' \\u2014 '+d.rows.length+' rows \\u00b7 source-timestamp column: <b>'+esc(d.ts_col)+'</b></div>'+
+    '<div class="tswrap"><table class="ts"><thead><tr>'+th+'</tr></thead><tbody>'+tr+'</tbody></table></div>';
 }}
-document.addEventListener('DOMContentLoaded',function(){{loadTicker();rscopeHint();}});
+document.addEventListener('DOMContentLoaded',function(){{loadTicker();showTyped();}});
 </script>"""
 
 
@@ -303,6 +295,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 .rawctrl button{padding:8px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-size:13px;font-weight:600;cursor:pointer}
 .rawctrl button:hover{filter:brightness(1.08)}
 .rawval{max-width:640px;white-space:pre-wrap;word-break:break-word;color:var(--ink)}
+.ts th.tscol,.ts td.tscol{color:var(--accent);font-weight:600}
 .qwrap{max-height:460px;overflow:auto;border:1px solid var(--line);border-radius:10px}
 .qsched{font-size:12.5px}
 .qsched thead th{position:sticky;top:0;background:var(--panel);z-index:1;padding:10px}
@@ -398,10 +391,10 @@ def serve(port=8787):
                 payload = _json.dumps(col.signal_detail(
                     q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
                 ctype = "application/json"
-            elif path == "/api/raw":                   # exact stored values
+            elif path == "/api/typed":                 # typed table rows (real columns)
                 q = parse_qs(parsed.query)
-                payload = _json.dumps(col.raw_values(
-                    q.get("scope", [""])[0], q.get("feature", [""])[0])).encode()
+                payload = _json.dumps(col.typed_rows(
+                    q.get("table", [""])[0], q.get("ticker", [""])[0] or None)).encode()
                 ctype = "application/json"
             elif path == "/data-collection":          # THIS pipeline step's dashboard
                 payload = _page(col.coverage_report(), UNIVERSE, auto_refresh=0).encode()
