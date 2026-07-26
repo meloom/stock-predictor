@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `short` |
 | **Source** | yfinance `Ticker.info` (`sharesShort`, `shortPercentOfFloat`, `shortRatio`, `sharesShortPriorMonth`, `dateShortInterest`) |
-| **Mode / cadence** | `snapshot` · every 3 days (priority 42) |
+| **Frequency** | `snapshot` · 3-day poll (priority 42) · yfinance gives current print only |
 | **Typed table** | `short_interest` |
 | **S1 raw features** | `short.shares`, `short.pct_float`, `short.days_to_cover`, `short.change_pct` |
 | **Source timestamp column** | `settlement_date` (the FINRA settlement date the print refers to) |

@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `implied_move` |
 | **Source** | Polygon `/v3/reference/options/contracts` + `/v2/aggs/.../prev` (ATM call+put) |
-| **Mode / cadence** | `snapshot` · daily (priority 25, est 4 calls) |
+| **Frequency** | `snapshot` · daily poll (priority 25) |
 | **Typed table** | `options_implied` |
 | **S1 raw features** | `opt.implied_move`, `opt.straddle_pct`, `opt.expiry` |
 | **Source timestamp column** | `snap_date` |

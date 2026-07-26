@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `statements` (also writes `fundamental.shares_outstanding`) |
 | **Source** | yfinance quarterly income / balance / cashflow + `sharesOutstanding` |
-| **Mode / cadence** | `rolling` · daily (priority 50) |
+| **Frequency** | `event` · daily poll (priority 50) · collects all reported quarters |
 | **Typed table** | `fundamentals` |
 | **S1 raw features** | `fundamental.statements`, `fundamental.shares_outstanding` |
 | **Source timestamp column** | `publish_date` (announcement date, NOT fiscal period end) |

@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `analyst_revisions` |
 | **Source** | yfinance `upgrades_downgrades` (rolling history of firm actions) |
-| **Mode / cadence** | `rolling` · daily (priority 41) |
+| **Frequency** | `event` · daily poll (priority 41) · collects all revisions the source returns |
 | **Typed table** | `analyst_revisions` |
 | **S1 raw feature** | `analyst.revisions_raw` |
 | **Source timestamp column** | `revision_date` |

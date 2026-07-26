@@ -4,7 +4,8 @@
 |---|---|
 | **Collector kind** | `quote` |
 | **Source** | yfinance `Ticker.info` (pre / regular / post market aware) |
-| **Mode / cadence** | `snapshot` · every 6h (interval 21600s, priority 30) |
+| **Frequency** | `snapshot` · polled **every 5 min** (priority 30) |
+| **Freshness SLA** | ≤5 min → green · ≤30 min → amber · >30 min → red (delay since last collect) |
 | **Typed table** | `quotes` |
 | **S1 raw feature (projection)** | `price.current` |
 | **Source timestamp column** | `quote_ts` (the market timestamp the price was logged at source) |

@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `macro` (scope = `_market`, not per-ticker) |
 | **Source** | yfinance history for `^VIX`, `^TNX`, `SPY` (90d) |
-| **Mode / cadence** | `history` · daily (interval 1d, priority 10) · `backfill_days=90` |
+| **Frequency** | `daily` · daily poll (priority 10) · backfilled from 2025-07-01 |
 | **Typed table** | `macro` |
 | **S1 raw features** | `macro.vix`, `macro.yield10y`, `macro.spy_close` |
 | **Source timestamp column** | `date` |

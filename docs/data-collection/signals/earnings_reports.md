@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `earn_report` |
 | **Source** | yfinance earnings history (EPS estimate vs reported, revenue, net income) |
-| **Mode / cadence** | `rolling` · daily (priority 46) |
+| **Frequency** | `event` · daily poll (priority 46) · collects **every reported quarter** (~4–8/stock, back years), not just the latest |
 | **Typed table** | `earnings_reports` |
 | **S1 raw feature (projection)** | `earnings.report_raw` |
 | **Source timestamp column** | `report_date` (actual announcement date) |
@@ -46,6 +46,6 @@ FROM earnings_reports WHERE ticker=:T ORDER BY report_date DESC LIMIT 1;
 ```
 
 ## Coverage expectation & missing-data check
-Rolling mode: yfinance returns the last several quarters. Coverage = tickers with ≥1
-report + span. **Live gap:** typed table holds 1 row (AAPL only) — universe backfill
-pending kickstart.
+Event mode: collect every quarter yfinance returns (verified ~7.3 rows/ticker live;
+AAPL back to 2020). Coverage = tickers covered + records/ticker + span — a ticker showing
+only 1 quarter is a gap (surfaced in the dashboard's `recs (~N/ticker)` detail).

@@ -3,11 +3,11 @@
 | | |
 |---|---|
 | **Collector kind** | `bars` |
-| **Source** | Polygon `/v2/aggs/ticker/{T}/range/1/day/{from}/{to}` (reliable; yfinance throttled) |
-| **Mode / cadence** | `history` · daily (interval 1d, priority 20) · `backfill_days=90` |
-| **Typed table** | `bars` |
-| **S1 raw features (projection)** | `price.close`, `price.volume` |
-| **Source timestamp column** | `date` (the trading session the bar closed) |
+| **Source** | Polygon `/v2/aggs/ticker/{T}/range/1/hour/{from}/{to}` (reliable; yfinance throttled) |
+| **Frequency** | `hourly` · full backfill from `COLLECTION_START` (2025-07-01) → now, priority 20 |
+| **Typed table** | `bars` (one row per hourly bar, keyed by `bar_ts`) |
+| **S1 raw features (projection)** | `price.close`, `price.volume` — **daily EOD** projected to feature_values (last hourly close + summed volume per session) so the daily model still works |
+| **Source timestamp column** | `bar_ts` (the hour the bar covers, full timestamp) |
 
 ## Downstream consumers (must not break)
 - `tech.rsi14`, `tech.mom5`, `tech.mom20`, `tech.hvol20`, `tech.vr20`, `tech.ret_lag1..7` (S2)
@@ -19,17 +19,20 @@
 ```sql
 CREATE TABLE bars (
   ticker TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL,
-  date   TEXT,                         -- SOURCE timestamp: session date (YYYY-MM-DD)
+  bar_ts TEXT,                         -- SOURCE timestamp: the hour (full ISO datetime)
   ingested_at TEXT NOT NULL,           -- when WE collected it
-  PRIMARY KEY (ticker, date)
+  PRIMARY KEY (ticker, bar_ts)
 );
 ```
 
 ## Example collected raw data (real row)
 ```json
-{"ticker":"AAPL","open":321.79,"high":334.37,"low":321.62,"close":333.02,
- "volume":47489415.9,"date":"2026-07-24","ingested_at":"2026-07-26T00:07:04.82Z"}
+{"ticker":"AAPL","open":257.7,"high":258.1,"low":257.5,"close":257.74,
+ "volume":812334.0,"bar_ts":"2025-10-06T09:00:00+00:00","ingested_at":"2026-07-26T…Z"}
 ```
+Daily consumers read the **EOD projection** (`price.close`/`price.volume` per session =
+last hourly close + summed volume), so intraday granularity is stored without breaking
+the daily EOD model.
 
 ## After processing (S2 features derived from this raw)
 ```sql
@@ -51,7 +54,11 @@ FROM bars WHERE ticker=:T AND date >= date('now','-60 day');
 `lagged_returns`, `xhorizon_features`. SQL above is the equivalent logic.)
 
 ## Coverage expectation & missing-data check
-Expected depth ≈ trading days in `backfill_days` (~64 for 90d). Missing = trading-day
-calendar over `[start, today]` minus distinct `date` per ticker (see README §2.2).
+Expected depth ≈ trading hours since `COLLECTION_START` (~7 × trading days). Missing =
+expected hourly points over `[2025-07-01, now]` minus distinct `bar_ts` per ticker
+(see README §2.2). Backfill sweeps the universe via Polygon (5/min).
+**Note:** the daily EOD projection (`price.close`) is what the S2 tech features read; the
+SQL examples above operate on that daily view — replace `date` with the projected daily
+series or aggregate `bar_ts` to the session for equivalent logic.
 **Live gap:** typed `bars` currently holds only AAPL — universe backfill pending
 daemon kickstart.

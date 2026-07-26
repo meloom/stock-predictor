@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `analyst` |
 | **Source** | yfinance `Ticker.info` (`forwardEps`, `numberOfAnalystOpinions`, `recommendationMean`, `targetMeanPrice`) |
-| **Mode / cadence** | `snapshot` · daily (priority 40) |
+| **Frequency** | `snapshot` · daily poll (priority 40) |
 | **Typed table** | *(none yet — stored as JSON in `feature_values`)* |
 | **S1 raw feature** | `fundamental.analyst_snapshot` |
 | **Source timestamp column** | ingestion day (current-state snapshot) |

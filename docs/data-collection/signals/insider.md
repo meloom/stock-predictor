@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `insider` |
 | **Source** | yfinance `insider_transactions` (rolling history) |
-| **Mode / cadence** | `rolling` · every 3 days (priority 44) |
+| **Frequency** | `event` · 3-day poll (priority 44) · collects all transactions the source returns |
 | **Typed table** | `insider_transactions` |
 | **S1 raw feature** | `insider.transactions_raw` |
 | **Source timestamp column** | `txn_date` |

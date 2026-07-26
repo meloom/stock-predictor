@@ -47,21 +47,42 @@ pushed out) and records `last_error` — an errored task **does not** count as c
 
 Lower number = runs first. Routine refresh priorities:
 
-| Kind                | Source   | Interval | Priority | Mode      |
-|---------------------|----------|----------|----------|-----------|
-| `macro`             | yfinance | 1 day    | 10       | history   |
-| `bars`              | polygon  | 1 day    | 20       | history   |
-| `implied_move`      | polygon  | 1 day    | 25       | snapshot  |
-| `quote`             | yfinance | 6 h      | 30       | snapshot  |
-| `analyst`           | yfinance | 1 day    | 40       | snapshot  |
-| `analyst_revisions` | yfinance | 1 day    | 41       | rolling   |
-| `short`             | yfinance | 3 days   | 42       | snapshot  |
-| `insider`           | yfinance | 3 days   | 44       | rolling   |
-| `earn_date`         | yfinance | 1 day    | 45       | snapshot  |
-| `earn_report`       | yfinance | 1 day    | 46       | rolling   |
-| `statements`        | yfinance | 1 day    | 50       | rolling   |
-| `earn_analysis` (S2)| process  | 1 day    | 55       | —         |
-| `days_to_earn` (S2) | process  | 1 day    | 56       | —         |
+| Kind                | Source   | Poll interval | Priority | Frequency |
+|---------------------|----------|---------------|----------|-----------|
+| `macro`             | yfinance | 1 day         | 10       | daily     |
+| `bars`              | polygon  | 1 day sweep   | 20       | hourly    |
+| `implied_move`      | polygon  | 1 day         | 25       | snapshot  |
+| `quote`             | yfinance | **5 min**     | 30       | snapshot  |
+| `analyst`           | yfinance | 1 day         | 40       | snapshot  |
+| `analyst_revisions` | yfinance | 1 day         | 41       | event     |
+| `short`             | yfinance | 3 days        | 42       | snapshot  |
+| `insider`           | yfinance | 3 days        | 44       | event     |
+| `earn_date`         | yfinance | 1 day         | 45       | snapshot  |
+| `earn_report`       | yfinance | 1 day         | 46       | event     |
+| `statements`        | yfinance | 1 day         | 50       | event     |
+| `earn_analysis` (S2)| process  | 1 day         | 55       | —         |
+| `days_to_earn` (S2) | process  | 1 day         | 56       | —         |
+
+### Native frequency per signal
+
+Every signal declares a **native frequency** (`register_kind(..., frequency=...)`); the
+poll interval, coverage mode, and freshness SLA all derive from it:
+
+| Signal | Frequency | Poll cadence | Coverage measured as |
+|--------|-----------|--------------|----------------------|
+| `bars` | **hourly** | daily backfill sweep | fraction of expected hourly points since Jul 1 2025 (~7/trading-day) |
+| `macro` | **daily** | daily | fraction of expected trading-day points |
+| `quote` | **snapshot** | **every 5 min** | tickers with a current value; freshness ≤5m green / ≤30m amber / >30m red |
+| `implied_move`, `analyst`, `earn_date` | **snapshot** | daily | tickers with a current value (accrues forward) |
+| `short` | **snapshot** | 3-day | tickers with the latest print (yfinance gives current only) |
+| `earn_report`, `statements`, `analyst_revisions`, `insider` | **event** | daily / 3-day | tickers covered + **all** records from source + span |
+
+- **Fixed cadences** (`5min/hourly/daily/weekly`) are regular time series; coverage is a
+  true depth % against the expected point count.
+- **`event`** is irregular/undefined — collect **all new records from the last-collected
+  watermark to now** (e.g. earnings = every reported quarter, ~4–8 per stock, not just
+  the latest). Coverage is "covered + record count + span", never a fake fixed depth.
+- **`snapshot`** is point-in-time state re-sampled each poll; history accrues forward.
 
 **Backfill is a priority band, not a separate queue.** A backfill task is the same row
 with its priority boosted by `BACKFILL_PRIORITY_BOOST = 1000` (i.e. `priority - 1000`),

@@ -4,7 +4,7 @@
 |---|---|
 | **Collector kind** | `earn_date` |
 | **Source** | yfinance earnings calendar (next report datetime) |
-| **Mode / cadence** | `snapshot` · daily (priority 45) |
+| **Frequency** | `snapshot` · daily poll (priority 45) |
 | **Typed table** | `earnings_calendar` |
 | **S1 raw feature (projection)** | `earnings.next_date` |
 | **Source timestamp column** | `snap_date` (the day we observed this next-date) |
