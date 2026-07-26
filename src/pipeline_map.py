@@ -145,6 +145,7 @@ def report(db_path=DEFAULT_DB) -> dict:
 # ── the dataflow DAG: nodes (signals) + dependency edges, per stage ──
 # S1 collected signals (id, kind). kind drives the click-view: line|raw|json.
 S1_SIGNALS = [
+    ("bars", "line"),                                   # HOURLY OHLCV (the raw intraday price)
     ("price.close", "line"), ("price.volume", "line"), ("price.current", "raw"),
     ("macro.vix", "line"), ("macro.spy_close", "line"), ("macro.yield10y", "line"),
     ("short.pct_float", "line"), ("opt.implied_move", "line"),
@@ -173,7 +174,8 @@ def _depends():
               "ret_lag3", "ret_lag4", "ret_lag5", "ret_lag6", "ret_lag7"]:
         d[f"tech.{x}"] = ["price.close", "price.volume"]
     for x in ["intraday_ret", "overnight_gap", "intraday_vol5"]:
-        d[f"tech.{x}"] = ["price.close"]
+        d[f"tech.{x}"] = ["bars"]                        # intraday features use the HOURLY bars
+    d["price.close"] = ["bars"]; d["price.volume"] = ["bars"]   # daily EOD projection of hourly
     for x in ["ret_21d", "ret_63d", "ret_126d", "dist_hi252", "new_high_flag", "above_hi_streak"]:
         d[f"xh.{x}"] = ["price.close"]
     for x in ["market_cap", "book_to_price", "earnings_yield", "fcf_yield"]:
@@ -233,7 +235,9 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
         if fid in seen:
             continue
         seen.add(fid)
-        if fid in RAW_TABLE and fid not in fv:                # typed-only S1 (sec_filings…)
+        if fid == "bars":                                     # hourly bars (typed-only, line)
+            nd, latest = typed_count("bars"), None
+        elif fid in RAW_TABLE and fid not in fv:              # typed-only S1 (sec_filings…)
             n = typed_count(RAW_TABLE[fid]); nd, latest = n, None
         else:
             nd, latest = fv.get(fid, (0, None))
@@ -252,6 +256,13 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
     import json
     ticker = (ticker or "").upper()
     c = sqlite3.connect(Path(db_path))
+    if feature == "bars":                                     # HOURLY price — line at 1h granularity
+        import schema
+        rows = schema.TypedStore(db_path).c.execute(
+            "SELECT bar_ts, close FROM bars WHERE ticker=? ORDER BY bar_ts", (ticker,)).fetchall()
+        pts = [[ts[:16].replace("T", " "), cl] for ts, cl in rows if cl is not None]
+        return {"kind": "line", "feature": "bars · hourly close", "points": pts,
+                "latest": pts[-1][1] if pts else None, "n": len(pts)}
     if feature in RAW_TABLE:                                   # raw document / event list
         import schema
         r = schema.TypedStore(db_path).rows(RAW_TABLE[feature], ticker, limit=40)
