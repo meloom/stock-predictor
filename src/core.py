@@ -157,7 +157,11 @@ class FeatureStore:
     def __init__(self, db_path: Path | str = DEFAULT_DB):
         db_path = Path(db_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, timeout=60)
+        # WAL + long busy-timeout so concurrent processes (collector daemon, dashboard,
+        # S2/S3 jobs, manual scripts) don't hit "database is locked" — writers wait.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=60000")
         self._conn.executescript(_SCHEMA)
         self._registry_cache: set[str] = {
             r[0] for r in self._conn.execute("SELECT name FROM registry")

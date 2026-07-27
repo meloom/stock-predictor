@@ -92,7 +92,7 @@ def _ddl(table):
 class TypedStore:
     def __init__(self, db_path=DEFAULT_DB):
         self.c = sqlite3.connect(Path(db_path))
-        self.c.execute("PRAGMA busy_timeout=5000")
+        self.c.execute("PRAGMA busy_timeout=60000")
         self._migrate()
         for t in SCHEMA:
             self.c.execute(_ddl(t))

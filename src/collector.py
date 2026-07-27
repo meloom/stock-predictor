@@ -107,8 +107,12 @@ class Collector:
         import sqlite3
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.c = sqlite3.connect(self.db_path)
-        self.c.execute("PRAGMA busy_timeout=5000")
+        self.c = sqlite3.connect(self.db_path, timeout=60)
+        # WAL + long busy-timeout: many processes (dashboard, S2/S3, manual scripts) share
+        # this DB. WAL lets readers and the single writer coexist; the timeout makes a
+        # writer WAIT for a transient lock instead of raising "database is locked".
+        self.c.execute("PRAGMA journal_mode=WAL")
+        self.c.execute("PRAGMA busy_timeout=60000")
         self.c.executescript(_QUEUE_SCHEMA)
         self.store = store or FeatureStore(db_path)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
@@ -322,7 +326,16 @@ class Collector:
                 except Exception:                            # noqa: BLE001
                     pass
                 last = self._now()
-            if self.tick() is None:
+            # NOTHING inside the loop may crash the daemon — a transient DB lock, a
+            # network hiccup, or a bad handler must be swallowed so it self-recovers and
+            # keeps draining. (Handlers already back off per-task; this is the last line.)
+            try:
+                idle = self.tick() is None
+            except Exception as e:                           # noqa: BLE001
+                sys.stderr.write(f"[collector] tick error (recovering): {e!r}\n")
+                sys.stderr.flush()
+                idle = True
+            if idle:
                 time.sleep(sleep)
 
     # ── task state transitions ────────────────────────────────────────────────
