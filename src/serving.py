@@ -131,6 +131,64 @@ def deploy(months: int = 3, db_path=DEFAULT_DB, store=None) -> dict:
     return meta
 
 
+def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store=None) -> dict:
+    """Deploy the REAL working model: the big-move DUAL classifier (logistic-up +
+    HistGBM-down), calibrated (isotonic), per ticker, for each horizon category. Unlike
+    the Ridge Φ(ŷ/se) — which squishes P(up) to ~0.5 for every stock — this predicts
+    P(|move|>thr) which genuinely DISCRIMINATES and ranks (the recorded precision@k edge).
+    Writes predict.pbig_up_<N>d / predict.pbig_down_<N>d per ticker."""
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.calibration import CalibratedClassifierCV
+    feats, price, cols = s3_multi._load(db_path)
+    latest = max((d for pm in price.values() for d in pm), default=None)
+    store = store or FeatureStore()
+    for h in horizons:
+        for side in ("up", "down"):
+            store.register(f"predict.pbig_{side}_{h}d", "float", "ticker", "S3", "daily",
+                           f"Calibrated P({side}-move > {thr:.0%} over {h}d) — big-move "
+                           f"classifier (dual: logistic-up + histgbm-down).")
+    # forward-return labels per horizon, built straight from the price series
+    lab = {h: [] for h in horizons}                          # h -> [(x, fwd_ret)]
+    for t, pm in price.items():
+        ds = sorted(pm); cl = [pm[d] for d in ds]
+        for i, d in enumerate(ds):
+            x = feats.get((t, d))
+            if x is None:
+                continue
+            for h in horizons:
+                if i + h < len(cl) and cl[i]:
+                    lab[h].append((x, cl[i + h] / cl[i] - 1))
+    live = [(t, feats[(t, latest)]) for t in price if (t, latest) in feats]
+    Xl = np.array([x for _, x in live], dtype=float)
+    meta = {"model": "dual: logistic-up + histgbm-down (isotonic-calibrated)",
+            "thr": thr, "latest": latest, "horizons": list(horizons),
+            "n_tickers": len(live), "spread": {}}
+    for h in horizons:
+        data = lab[h]
+        X = np.array([x for x, _ in data], dtype=float)
+        mean, std = s3_multi._norm(X); Xz = s3_multi._stdz(X, mean, std)
+        yu = np.array([1 if r > thr else 0 for _, r in data])
+        yd = np.array([1 if r < -thr else 0 for _, r in data])
+        Xlz = s3_multi._stdz(Xl, mean, std)
+
+        def cal(est, y):
+            if y.sum() < 25:
+                return np.zeros(len(live))
+            m = CalibratedClassifierCV(est, method="isotonic", cv=3).fit(Xz, y)
+            return m.predict_proba(Xlz)[:, 1]
+        pu = cal(LogisticRegression(max_iter=500, C=0.5), yu)
+        pd = cal(HistGradientBoostingClassifier(max_depth=3, max_iter=150, learning_rate=0.05), yd)
+        for i, (t, _) in enumerate(live):
+            store.write(f"predict.pbig_up_{h}d", t, latest, round(float(pu[i]), 4), trigger_id="deploy_clf")
+            store.write(f"predict.pbig_down_{h}d", t, latest, round(float(pd[i]), 4), trigger_id="deploy_clf")
+        meta["spread"][f"{h}d"] = {"up": [round(float(pu.min()), 3), round(float(pu.max()), 3)],
+                                   "down": [round(float(pd.min()), 3), round(float(pd.max()), 3)]}
+    (RUNTIME_DIR / "deployed_classifier.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+
 def load_production():
     if not PROD_PKL.exists():
         return None

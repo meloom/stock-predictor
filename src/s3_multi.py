@@ -136,8 +136,9 @@ def _stdz(X, mean, std):
 def _norm(X):
     import numpy as np
     with np.errstate(all="ignore"):
-        mean = np.nan_to_num(np.nanmean(X, axis=0), nan=0.0)
-        std = np.nan_to_num(np.nanstd(X, axis=0), nan=1.0); std[std == 0] = 1.0
+        mean = np.atleast_1d(np.nan_to_num(np.nanmean(X, axis=0), nan=0.0))
+        std = np.atleast_1d(np.nan_to_num(np.nanstd(X, axis=0), nan=1.0))
+        std[std == 0] = 1.0
     return mean, std
 
 

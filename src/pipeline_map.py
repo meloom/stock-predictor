@@ -545,48 +545,73 @@ def alpha_report(ticker: str, db_path=DEFAULT_DB) -> dict:
     _, surp = latest("earnings.report_raw")
     surprise = (surp or {}).get("surprise_pct") if isinstance(surp, dict) else None
 
-    # ── recorded predictor efficacy for the driving 1d horizon ──
-    try:
-        cats = predictor_report(db_path)["categories"]
-        h1 = next((x for x in cats if x["key"] == "h1" and x["built"]), None)
-        eff = ({"production": h1["production"],
-                "down@1": next((m["down1"] for m in h1["models"] if m["production"]), None),
-                "up@1": next((m["up1"] for m in h1["models"] if m["production"]), None)}
-               if h1 else None)
-    except Exception:
-        eff = None
+    # ── PER-TICKER PREDICTIONS: the deployed big-move classifier, ranked across universe ──
+    def conv(feat):
+        md = c.execute("SELECT MAX(event_time) FROM feature_values WHERE feature=?", (feat,)).fetchone()
+        if not md or not md[0]:
+            return None, None, 0
+        rk = sorted(((sc, float(v)) for sc, v, _ in c.execute(
+            "SELECT scope, value, MAX(ingested_at) FROM feature_values WHERE feature=? "
+            "AND event_time=? GROUP BY scope", (feat, md[0]))), key=lambda x: -x[1])
+        pos = {sc: (v, i + 1) for i, (sc, v) in enumerate(rk)}
+        v, r = pos.get(ticker, (None, None))
+        return v, r, len(rk)
 
-    # ── composite action (transparent heuristic + hard gates) ──
+    HZ = [1, 3, 5, 7]
+    preds, best = [], None
+    for h in HZ:
+        pu, ru, n = conv(f"predict.pbig_up_{h}d")
+        pd, rd, _ = conv(f"predict.pbig_down_{h}d")
+        preds.append({"h": f"{h}d", "p_up": pu, "rank_up": ru, "p_down": pd, "rank_down": rd, "n": n})
+        for side, p, rk in (("up", pu, ru), ("down", pd, rd)):
+            if p is not None and rk is not None and (best is None or rk < best["rank"] or
+                                                     (rk == best["rank"] and p > best["p"])):
+                best = {"side": side, "h": h, "p": p, "rank": rk, "n": n}
+
+    # ── SUMMARIZED SUGGESTION: strongest ranked prediction, then hard gates ──
     er_level = (er or {}).get("level")
     reg_decision = (reg or {}).get("decision")
-    near_high = None
     _, dh = latest("xh.dist_hi252")
-    if dh is not None:
-        near_high = dh >= -0.02
-    if reg_decision == "CASH":
-        action, why = "STAND DOWN", "market regime is risk-off (CASH gate)"
-    elif er_level == "HIGH":
-        action, why = "AVOID", "earnings/event imminent — high event risk"
-    elif factor_score is not None and factor_score >= 0.7:
-        action, why = "LONG CANDIDATE", "strong factor tilt (value/quality/momentum)"
-    elif near_high and (hvol or 0) > 0.03:
-        action, why = "CRASH-WATCH", "extended near 52w high + elevated vol (error-analysis pattern)"
-    elif factor_score is not None and factor_score <= 0.3:
-        action, why = "AVOID / SHORT-LEAN", "weak factor tilt"
+    near_high = dh >= -0.02 if dh is not None else None
+    top = best and best["rank"] and best["rank"] <= max(5, (best["n"] or 109) // 20)  # ~top 5%
+    if best:
+        conviction = (f'{best["h"]}d {best["side"].upper()}-move P={best["p"]*100:.0f}% '
+                      f'(rank #{best["rank"]}/{best["n"]}, {"top pick" if top else "mid-pack"})')
     else:
-        action, why = "NEUTRAL", "no strong edge in the signals"
+        conviction = "no per-ticker prediction available"
+    if reg_decision == "CASH":
+        action, why = "STAND DOWN", f"regime risk-off (CASH gate) — but signal: {conviction}"
+    elif er_level == "HIGH":
+        action, why = "AVOID", f"event imminent — {conviction}"
+    elif top and best["side"] == "down":
+        action, why = "SHORT CANDIDATE", f"strong ranked down-conviction: {conviction}"
+    elif top and best["side"] == "up":
+        action, why = "LONG CANDIDATE", f"strong ranked up-conviction: {conviction}"
+    else:
+        action, why = "NEUTRAL", f"no top-ranked conviction — best is {conviction}"
+
+    eff = None
+    try:
+        h1 = next((x for x in predictor_report(db_path)["categories"] if x["key"] == "h1" and x["built"]), None)
+        eff = {"production": h1["production"],
+               "down@1": next((m["down1"] for m in h1["models"] if m["production"]), None),
+               "up@1": next((m["up1"] for m in h1["models"] if m["production"]), None)} if h1 else None
+    except Exception:
+        pass
 
     gaps = ["sector/industry classification (for sector-neutral factors & peers)",
             "predicted beta & factor betas (computable from bars — not yet in S2)",
-            "per-ticker calibrated prediction (deploy the 1d/3d/5d/7d champions)",
             "institutional ownership / 13F", "bid/ask spread for a cost model",
-            "NLP over sec_filings/transcripts (guidance tone, surprise-vs-narrative)"]
+            "NLP over sec_filings/transcripts (guidance tone, surprise-vs-narrative)",
+            "predictor recalibration cadence (ECE is high — probabilities rank well but "
+            "aren't perfectly calibrated; retrain/calibrate on a schedule)"]
 
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "ticker": ticker,
             "as_of": asof, "price": price, "sector": None,
             "regime": {"vix": vix, "breadth": breadth, "decision": reg_decision,
                        "score": (reg or {}).get("score")},
             "action": action, "why": why, "factor_score": factor_score,
+            "predictions": preds, "best_signal": best, "suggestion": conviction,
             "factors": [{"name": n, "pct": p, "note": d} for n, p, d in factors],
             "catalysts": {"days_to_earnings": dte, "next_earnings": (nx or {}).get("next_earnings"),
                           "analyst_rev_net_90d": rev_net, "insider_net_90d_usd": round(ins_net),

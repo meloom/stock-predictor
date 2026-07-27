@@ -886,6 +886,17 @@ def render_alpha(rep: dict, tickers: list) -> str:
 
     fac = "".join(f'<tr><td class="mono">{f["name"]}</td><td class="barcell">{bar(f["pct"])}</td>'
                   f'<td class="mono muted">{f["note"]}</td></tr>' for f in rep["factors"])
+
+    def rkcell(p, r, side):
+        if p is None:
+            return '<td class="mono muted">—</td><td class="mono muted">—</td>'
+        hot = "hotrank" if (r and r <= 5) else ""
+        col = "var(--stale)" if side == "down" else "var(--fresh)"
+        return (f'<td class="mono"><b style="color:{col}">{p*100:.0f}%</b></td>'
+                f'<td class="mono {hot}">#{r}</td>')
+    predrows = "".join(
+        f'<tr><td class="mono">{p["h"]}</td>{rkcell(p["p_up"], p["rank_up"], "up")}'
+        f'{rkcell(p["p_down"], p["rank_down"], "down")}</tr>' for p in rep["predictions"])
     cat = rep["catalysts"]; risk = rep["risk"]; pos = rep["positioning"]; val = rep["valuation"]
     vr = rep["valuation_ranks"]; reg = rep["regime"]; eff = rep["efficacy"]
 
@@ -943,6 +954,7 @@ def render_alpha(rep: dict, tickers: list) -> str:
 td.lbl{{color:var(--mut)}}td.val{{min-width:90px}}
 .gaps{{font-size:12.5px;color:var(--mut);line-height:1.7}}.gaps li{{margin-left:4px}}
 .eff{{font-size:12.5px;color:var(--mut)}}.eff b{{color:var(--fresh)}}
+td.hotrank{{color:var(--accent);font-weight:700}}
 </style>
 <main>
   <header><div class="brand"><span class="live"></span>Alpha Report</div>
@@ -962,10 +974,11 @@ td.lbl{{color:var(--mut)}}td.val{{min-width:90px}}
     <section class="panel"><h2>Valuation <span class="muted">— vs peers</span></h2><table class="queue"><tbody>{tbl(valrows)}</tbody></table></section>
     <section class="panel"><h2>Risk &amp; exposures</h2><table class="queue"><tbody>{tbl(riskrows)}</tbody></table></section>
     <section class="panel"><h2>Positioning</h2><table class="queue"><tbody>{tbl(posrows)}</tbody></table></section>
-    <section class="panel"><h2>Predictor efficacy <span class="muted">— recorded 1d skill</span></h2>
-      <div class="eff">Production model: <b>{(eff or {}).get("production","—")}</b><br>
-      DOWN precision@1: <b>{(eff or {}).get("down@1","—")}</b> · UP precision@1: {(eff or {}).get("up@1","—")}<br>
-      <span class="muted">Per-ticker calibrated P(up)/P(down) is pending predictor deployment (see gaps).</span></div></section>
+    <section class="panel"><h2>Predictions <span class="muted">— deployed big-move classifier: calibrated P(move&gt;±3%) &amp; rank vs universe</span></h2>
+      <table class="queue"><thead><tr><th>Horizon</th><th>P(up)</th><th>rank</th><th>P(down)</th><th>rank</th></tr></thead><tbody>{predrows}</tbody></table>
+      <div class="eff">→ <b>Strongest: {rep["suggestion"]}</b><br>
+      Production model: <b>{(eff or {}).get("production","—")}</b> · recorded down@1 {(eff or {}).get("down@1","—")}.
+      <span class="muted">Lower rank # = higher conviction; the top picks per day carry the precision@k edge. Calibrated (isotonic).</span></div></section>
   </div>
   <section class="panel"><h2>Missing inputs <span class="muted">— to make this report complete (see docs/alpha-report)</span></h2>
     <ul class="gaps">{gaps}</ul></section>
