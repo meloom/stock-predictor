@@ -86,6 +86,17 @@ CREATE TABLE IF NOT EXISTS source_calls (   -- rolling rate-limit ledger
     ts     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_calls ON source_calls (source, ts);
+CREATE TABLE IF NOT EXISTS collection_events (  -- persistent per-attempt outcome log
+    ts     TEXT NOT NULL,                        -- when the attempt ran (ISO)
+    source TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    scope  TEXT NOT NULL,
+    ok     INTEGER NOT NULL,                     -- 1 success, 0 failure
+    rows   INTEGER NOT NULL DEFAULT 0,           -- rows written on success
+    error  TEXT                                  -- error string on failure
+);
+CREATE INDEX IF NOT EXISTS idx_events ON collection_events (ts);
+CREATE INDEX IF NOT EXISTS idx_events_src ON collection_events (source, ts);
 """
 
 
@@ -165,6 +176,17 @@ class Collector:
         self.c.execute("DELETE FROM source_calls WHERE ts<?", (oldest,))
         self.c.commit()
 
+    def _log_event(self, now, source, kind, scope, ok, rows, error):
+        """Persist one attempt outcome so failures have a durable, hour-bucketable
+        history (the chart's red bars + the honest 'how often are we failing' answer).
+        Self-prunes to 14 days so it can't grow unbounded."""
+        self.c.execute("INSERT INTO collection_events VALUES (?,?,?,?,?,?,?)",
+                       (now.isoformat(), source, kind, scope, int(ok), int(rows), error))
+        if now.minute == 0 and now.second < 3:                # cheap hourly prune
+            cutoff = (now - timedelta(days=14)).isoformat()
+            self.c.execute("DELETE FROM collection_events WHERE ts<?", (cutoff,))
+        self.c.commit()
+
     # ── enqueue ───────────────────────────────────────────────────────────────
     def _upsert(self, source, kind, scope, priority, interval, next_due, force_due=False):
         tid = f"{source}:{kind}:{scope}"
@@ -238,19 +260,41 @@ class Collector:
                 except Exception:
                     present[kd] = set()
         for kind, k in self.kinds.items():
+            # prune source-migration orphans: when a kind is re-homed to a new source
+            # (e.g. bars yfinance->polygon), the old task rows keep their stale task_id
+            # prefix, dodge the canonical-id lookup below, yet still double-collect and
+            # bloat the queue. The canonical id is {source}:{kind}:{scope}; delete the rest.
+            self.c.execute("DELETE FROM collection_tasks WHERE kind=? AND task_id NOT LIKE ?",
+                           (kind, f"{k['source']}:{kind}:%"))
             scopes = [MARKET_SCOPE] if k["scope"] == "market" else tickers
             bf_prio = k["priority"] - BACKFILL_PRIORITY_BOOST     # runs before all refreshes
             pres = present.get(kind)                              # None if no typed table
             for sc in scopes:
                 tid = f"{k['source']}:{kind}:{sc}"
-                row = self.c.execute("SELECT last_ok, status, next_due FROM collection_tasks "
-                                     "WHERE task_id=?", (tid,)).fetchone()
+                row = self.c.execute("SELECT last_ok, status, next_due, interval_sec FROM "
+                                     "collection_tasks WHERE task_id=?", (tid,)).fetchone()
                 # missing from the typed store (ticker scope only; market handled by depth)
                 missing_typed = (pres is not None and k["scope"] != "market" and sc not in pres)
                 due_now = row is not None and row[2] is not None and row[2] <= now
                 if row is None:                                  # brand-new signal/scope
                     self._upsert(k["source"], kind, sc, bf_prio, k["interval"], now); armed += 1
-                elif row[0] is None or missing_typed:
+                    continue
+                # SELF-HEAL config drift: the stored interval_sec is the scheduler's source
+                # of cadence (reschedule reuses it), so a config cadence change never takes
+                # effect on existing rows without this. Re-sync it; if the cadence SHRANK,
+                # pull next_due forward (last_ok + new interval, floored at now) so the
+                # faster poll starts immediately instead of waiting out the old long gap.
+                if row[3] != k["interval"]:
+                    nd = row[2]
+                    if k["interval"] and row[0]:
+                        cand = (datetime.fromisoformat(row[0])
+                                + timedelta(seconds=k["interval"])).isoformat()
+                        if row[2] is None or cand < row[2]:
+                            nd = cand if cand > now else now
+                    self.c.execute("UPDATE collection_tasks SET interval_sec=?, next_due=?, "
+                                   "updated_at=? WHERE task_id=?",
+                                   (k["interval"], nd, now, tid)); armed += 1
+                if row[0] is None or missing_typed:
                     # never collected, OR marked 'collected' by the legacy projection
                     # but with no typed row -> (re)arm as prioritized backfill and pull
                     # it DUE NOW, even if it is 'pending' but scheduled in the future
@@ -290,10 +334,13 @@ class Collector:
                 # drops back to routine-refresh priority once it has data).
                 base_prio = self.kinds.get(kind, {}).get("priority")
                 self._reschedule(task_id, interval, now, n_rows, base_prio)
+                self._log_event(now, source, kind, scope, 1, n_rows, None)
                 return {"task": task_id, "rows": n_rows, "calls": n_calls}
             except Exception as e:               # noqa: BLE001 — a failed call still cost quota
                 self._record_calls(source, 1)
-                self._backoff(task_id, attempts, now, f"{type(e).__name__}: {e}")
+                err = f"{type(e).__name__}: {e}"
+                self._backoff(task_id, attempts, now, err)
+                self._log_event(now, source, kind, scope, 0, 0, err)
                 return {"task": task_id, "error": str(e)}
         return None
 
@@ -590,7 +637,55 @@ class Collector:
                             "by_mode": {m: round(sum(v) / len(v)) for m, v in by_mode.items()},
                             "data_points": total_rows, "due_now": self.status()["due_now"]},
                 "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix,
-                "queue": queue}
+                "queue": queue, "hourly": self.hourly_sources()}
+
+    def hourly_sources(self, hours: int = 72) -> dict:
+        """Per-SOURCE collection activity, bucketed by hour (from each source's typed-table
+        `ingested_at` — the real record, since source_calls is a rolling rate window). Rows
+        collected per hour per source, for the last `hours`."""
+        now = self._now()
+        labels = [(now - timedelta(hours=h)).strftime("%m-%d %Hh") for h in range(hours - 1, -1, -1)]
+        keys = [(now - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours - 1, -1, -1)]
+        cutoff = (now - timedelta(hours=hours)).isoformat()
+        SRC = {"polygon": ["bars", "options_implied"],
+               "yfinance": ["quotes", "macro", "short_interest", "earnings_reports",
+                            "earnings_calendar", "insider_transactions", "analyst_revisions",
+                            "fundamentals"],
+               "sec": ["sec_filings", "xbrl_financials"]}
+        ts = _typed()
+        out = {}
+        for src, tables in SRC.items():
+            counts = {k: 0 for k in keys}
+            for tb in tables:
+                try:
+                    for hk, n in ts.c.execute(
+                            f"SELECT substr(ingested_at,1,13), COUNT(*) FROM {tb} "
+                            f"WHERE ingested_at > ? GROUP BY substr(ingested_at,1,13)", (cutoff,)):
+                        if hk in counts:
+                            counts[hk] += n
+                except Exception:
+                    pass
+            out[src] = [counts[k] for k in keys]
+
+        # per-hour FAILURE + attempt counts from the persistent event log — this is what
+        # colors the chart red. (Rows-written above stays typed-derived so history before
+        # the event log existed still renders.) A source with no events table yet -> zeros.
+        fails = {s: {k: 0 for k in keys} for s in SRC}
+        attempts = {s: {k: 0 for k in keys} for s in SRC}
+        try:
+            for src, hk, nfail, natt in self.c.execute(
+                    "SELECT source, substr(ts,1,13), SUM(ok=0), COUNT(*) FROM collection_events "
+                    "WHERE ts > ? GROUP BY source, substr(ts,1,13)", (cutoff,)):
+                if src in fails and hk in fails[src]:
+                    fails[src][hk] = nfail or 0
+                    attempts[src][hk] = natt or 0
+        except Exception:
+            pass
+        fails_l = {s: [fails[s][k] for k in keys] for s in SRC}
+        attempts_l = {s: [attempts[s][k] for k in keys] for s in SRC}
+        return {"labels": labels, "sources": out, "fails": fails_l, "attempts": attempts_l,
+                "totals": {s: sum(v) for s, v in out.items()},
+                "fail_totals": {s: sum(v) for s, v in fails_l.items()}}
 
 
 # ═══════════════ handlers — one unit of work each -> (n_rows, n_calls) ═════════

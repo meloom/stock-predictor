@@ -134,6 +134,68 @@ def render(report: dict, tickers: list[str]) -> str:
         body += f'<tr><th class="tick mono">{t}</th>{cells}</tr>'
 
     # full queue schedule — per signal × ticker × time
+    # hourly collection activity per source (last 72h)
+    hy = report.get("hourly", {"labels": [], "sources": {}, "totals": {}})
+    SRC_CLS = {"polygon": "#3b82c4", "yfinance": "#3fb27f", "sec": "#c9930b"}
+    RED, OKC, IDLE = "#e5484d", "#3fb27f", "var(--line)"
+    hlabels = hy["labels"]
+    srcs = list(hy["sources"].keys())
+    n_h = len(hlabels)
+    fails = hy.get("fails", {s: [0] * n_h for s in srcs})
+    attempts = hy.get("attempts", {s: [0] * n_h for s in srcs})
+    totals_h = [sum(hy["sources"][s][i] for s in srcs) for i in range(n_h)]
+    fail_h = [sum(fails.get(s, [0] * n_h)[i] for s in srcs) for i in range(n_h)]
+    att_h = [sum(attempts.get(s, [0] * n_h)[i] for s in srcs) for i in range(n_h)]
+    hmax = max(totals_h + [1])
+    BW, GAP, PLOT_H, PAD_L, PAD_T = 12, 3, 190, 52, 12
+    STRIP_Y, STRIP_H, PAD_B = PLOT_H + 8, 9, 62          # status strip sits below the bars
+    plot_w = n_h * (BW + GAP)
+    svg_w = PAD_L + plot_w + 12
+    svg_h = PAD_T + PLOT_H + PAD_B
+
+    def _fmt(n):
+        return f"{n/1000:.0f}k" if n >= 1000 else str(n)
+    grid = ""
+    for f in (0, .25, .5, .75, 1):
+        y = PAD_T + PLOT_H - f * PLOT_H
+        grid += (f'<line x1="{PAD_L}" y1="{y:.1f}" x2="{PAD_L+plot_w}" y2="{y:.1f}" '
+                 f'class="hgrid"/><text x="{PAD_L-8}" y="{y+3:.1f}" class="hyl">{_fmt(int(f*hmax))}</text>')
+    grid += f'<text x="{PAD_L-8}" y="{PAD_T+STRIP_Y+STRIP_H}" class="hyl">ok?</text>'
+    bars = ""
+    for i in range(n_h):
+        x = PAD_L + i * (BW + GAP)
+        y0 = PAD_T + PLOT_H
+        # green volume bars (rows written), stacked per source
+        vol = " · ".join(f'{s} {hy["sources"][s][i]:,}' for s in srcs if hy["sources"][s][i])
+        state = "FAILING" if fail_h[i] else ("ok" if (att_h[i] or totals_h[i]) else "idle (nothing due)")
+        tip = (f'{hlabels[i]} — {state}'
+               f'{" · rows: " + vol if vol else ""}'
+               f'{f" · {fail_h[i]}/{att_h[i]} attempts FAILED" if fail_h[i] else ""}')
+        seg = f'<title>{tip}</title>'
+        for s in srcs:
+            v = hy["sources"][s][i]
+            if v <= 0:
+                continue
+            h = v / hmax * PLOT_H
+            y0 -= h
+            seg += f'<rect x="{x}" y="{y0:.1f}" width="{BW}" height="{h:.1f}" fill="{SRC_CLS[s]}"/>'
+        # status strip: red = a failure this hour, green = attempts all ok, grey = idle
+        sc = RED if fail_h[i] else (OKC if (att_h[i] or totals_h[i]) else IDLE)
+        seg += (f'<rect x="{x}" y="{PAD_T+STRIP_Y}" width="{BW}" height="{STRIP_H}" rx="1.5" '
+                f'fill="{sc}"/>')
+        bars += f'<g class="hbar">{seg}</g>'
+        if (n_h - 1 - i) % 6 == 0:
+            bars += (f'<text x="{x+BW/2:.1f}" y="{PAD_T+STRIP_Y+STRIP_H+14}" class="hxl">{hlabels[i]}</text>')
+    fail_total = sum(fail_h)
+    legend = "".join(f'<span class="hleg"><i style="background:{SRC_CLS[s]}"></i>{s} '
+                     f'<b>{hy["totals"].get(s,0):,}</b></span>' for s in srcs)
+    legend += (f'<span class="hleg"><i style="background:{OKC}"></i>ok hr</span>'
+               f'<span class="hleg"><i style="background:{RED}"></i>failing hr '
+               f'<b>{fail_total}</b></span>'
+               f'<span class="hleg"><i style="background:{IDLE}"></i>idle hr</span>')
+    hchart_svg = (f'<svg viewBox="0 0 {svg_w} {svg_h}" width="{svg_w}" height="{svg_h}" '
+                  f'class="hchart" role="img">{grid}{bars}</svg>')
+
     def _ts(iso):   # ISO -> 'YYYY-MM-DD HH:MM' (minute level)
         return iso[:16].replace("T", " ") if iso else "—"
     grows = ""
@@ -172,6 +234,9 @@ def render(report: dict, tickers: list[str]) -> str:
   </header>
   <section class="cards">{card_html}</section>
   <section class="quota"><span class="lbl">Rate-limit quota</span>{quota}</section>
+  <section class="panel"><h2>Download rate &amp; failures per source <span class="muted">— bars = rows collected per hour (last 72h). Strip below each bar: green = attempts ok, <b style="color:#e5484d">red = a collection FAILED that hour</b>, grey = idle (nothing due). Hover for detail.</span></h2>
+    <div class="hlegend">{legend}</div>
+    <div class="hwrap">{hchart_svg}</div></section>
 
   <section class="panel"><h2>Coverage vs expectation
     <span class="muted">— <b class="hist">history</b> = % of the expected daily window backfilled ·
@@ -327,6 +392,17 @@ td.detail{font-size:12px;color:var(--mut);max-width:340px}
 .cell.fresh{background:var(--fresh)}.cell.aging{background:var(--aging)}.cell.stale{background:var(--stale)}
 .cell.miss{background:var(--miss);border:1px solid var(--line)}
 .filter{width:100%;max-width:340px;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
+.hwrap{overflow-x:auto;padding-bottom:4px}
+.hchart{display:block}
+.hgrid{stroke:var(--line);stroke-width:1;stroke-dasharray:2 3}
+.hyl{fill:var(--mut);font-size:10px;text-anchor:end;font-variant-numeric:tabular-nums}
+.hxl{fill:var(--mut);font-size:10px;text-anchor:middle}
+.hbar rect{transition:opacity .1s}
+.hbar:hover rect{opacity:.75}
+.hlegend{display:flex;gap:16px;margin-bottom:10px;font-size:12px;color:var(--mut);flex-wrap:wrap}
+.hleg{display:inline-flex;align-items:center;gap:6px}
+.hleg i{width:11px;height:11px;border-radius:2px;display:inline-block}
+.hleg b{color:var(--ink);font-variant-numeric:tabular-nums}
 .filter:focus{outline:2px solid var(--accent);outline-offset:1px}
 .rawctrl{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .rawctrl select,.rawctrl input{padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
