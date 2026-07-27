@@ -131,7 +131,8 @@ def deploy(months: int = 3, db_path=DEFAULT_DB, store=None) -> dict:
     return meta
 
 
-def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store=None) -> dict:
+def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store=None,
+                      as_of=None) -> dict:
     """Deploy the REAL working model: the big-move DUAL classifier (logistic-up +
     HistGBM-down), calibrated (isotonic), per ticker, for each horizon category. Unlike
     the Ridge Φ(ŷ/se) — which squishes P(up) to ~0.5 for every stock — this predicts
@@ -143,6 +144,7 @@ def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store
     from sklearn.calibration import CalibratedClassifierCV
     feats, price, cols = s3_multi._load(db_path)
     latest = max((d for pm in price.values() for d in pm), default=None)
+    as_of = as_of or latest                                  # the anchor: predict FROM here
     store = store or FeatureStore()
     for h in horizons:
         for side in ("up", "down"):
@@ -151,18 +153,24 @@ def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store
                            f"classifier (dual: logistic-up + histgbm-down).")
     store.register("predict.dir_1d", "float", "ticker", "S3", "daily",
                    "Directional score = P(up-big) − P(down-big) at 1d — S4's input.")
-    # forward-return labels per horizon, built straight from the price series
+    # LEAKAGE-FREE labels: only rows STRICTLY BEFORE as_of whose forward outcome is also
+    # realized BY as_of (outcome date <= as_of). The anchor row itself is never trained on.
     lab = {h: [] for h in horizons}                          # h -> [(x, fwd_ret)]
+    max_train = None
     for t, pm in price.items():
         ds = sorted(pm); cl = [pm[d] for d in ds]
         for i, d in enumerate(ds):
+            if d >= as_of:                                   # never train on the anchor or later
+                continue
             x = feats.get((t, d))
             if x is None:
                 continue
             for h in horizons:
-                if i + h < len(cl) and cl[i]:
-                    lab[h].append((x, cl[i + h] / cl[i] - 1))
-    live = [(t, feats[(t, latest)]) for t in price if (t, latest) in feats]
+                j = i + h
+                if j < len(ds) and ds[j] <= as_of and cl[i]:  # outcome known BY as_of
+                    lab[h].append((x, cl[j] / cl[i] - 1))
+                    max_train = d if (max_train is None or d > max_train) else max_train
+    live = [(t, feats[(t, as_of)]) for t in price if (t, as_of) in feats]
     Xl = np.array([x for _, x in live], dtype=float)
     meta = {"model": "dual: logistic-up + histgbm-down (isotonic-calibrated)",
             "thr": thr, "latest": latest, "horizons": list(horizons),

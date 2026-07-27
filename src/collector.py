@@ -633,37 +633,29 @@ def _h_bars(scope, store, tid):
 
 
 def _h_bars_polygon(scope, store, tid):
-    """HOURLY bars from Polygon (reliable — yfinance throttles rapid download bursts).
-    One call per ticker for the full [COLLECTION_START, today] range. Stores every
-    hourly bar in the typed `bars` table (bar_ts), and projects the DAILY EOD close /
-    summed volume to feature_values so the daily S2/model consumers keep working."""
+    """DAILY bars from Polygon. NOTE: the Polygon BASIC plan serves current end-of-day
+    (daily) bars reliably, but only a DELAYED, limited window of HOURLY intraday bars
+    (verified: an hourly request through today returned ~1069 bars ending months ago).
+    So the primary price series is DAILY — it stays current (what the model needs);
+    intraday features are best-effort and blocked on the plan (see docs)."""
     key = load_secret("POLYGON_API_KEY")
     if not key:
         raise RuntimeError("no POLYGON_API_KEY")
-    import s1_data
-    _reg_s1(store)
     to = date.today().isoformat()
     frm = COLLECTION_START.isoformat()                        # fixed history horizon
-    d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/hour/{frm}/{to}"
+    d = _poly_get(f"/v2/aggs/ticker/{scope}/range/1/day/{frm}/{to}"
                   f"?adjusted=true&sort=asc&limit=50000", key)
     res = d.get("results") or []
     if not res:
         raise RuntimeError(f"no Polygon bars for {scope} — will retry")
-    typed = []
-    eod = {}                                                  # session date -> (last close, summed volume)
+    typed, proj = [], []
     for b in res:
-        dtm = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc)
-        typed.append({"ticker": scope, "bar_ts": dtm.isoformat(),
-                      "open": b.get("o"), "high": b.get("h"), "low": b.get("l"),
-                      "close": b.get("c"), "volume": b.get("v")})
-        day = dtm.date().isoformat()
-        c, v = eod.get(day, (None, 0.0))
-        eod[day] = (b.get("c"), v + (b.get("v") or 0))        # bars are sorted asc -> last close wins
-    _typed().put_many("bars", typed)                          # TYPED: full hourly OHLCV
-    proj = []
-    for day, (c, v) in eod.items():                           # DAILY EOD projection for S2
-        proj.append(("price.close", scope, day, c))
-        proj.append(("price.volume", scope, day, v))
+        day = datetime.fromtimestamp(b["t"] / 1000, tz=timezone.utc).date().isoformat()
+        typed.append({"ticker": scope, "bar_ts": day, "open": b.get("o"), "high": b.get("h"),
+                      "low": b.get("l"), "close": b.get("c"), "volume": b.get("v")})
+        proj.append(("price.close", scope, day, b.get("c")))
+        proj.append(("price.volume", scope, day, b.get("v")))
+    _typed().put_many("bars", typed)                          # TYPED: daily OHLCV
     store.write_many(proj, trigger_id=tid)
     return len(typed), 1
 

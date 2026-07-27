@@ -368,6 +368,8 @@ details{margin:0 0 12px}summary{cursor:pointer;font-size:12px;color:var(--accent
 
 
 _STEPS = [
+    ("♥", "Collector Health", "/health", True,
+     "Live heartbeat, per-signal freshness, stall detection + alert history — is collection actually running?"),
     ("S1", "Data Collection", "/data-collection", True,
      "Queue-driven collector: backfill progress, freshness heatmap, per-ticker×signal drill-down."),
     ("S2", "Signal Processing", "/signal-processing", True,
@@ -869,6 +871,61 @@ function modelDetail(row){{
 </script>"""
 
 
+def render_health(h: dict, alerts: list) -> str:
+    V = {"OK": ("fresh", "✓ HEALTHY"), "DEGRADED": ("amber", "▲ DEGRADED"),
+         "STALLED": ("stale", "✕ STALLED")}
+    cls, label = V.get(h["verdict"], ("mut", h["verdict"]))
+    hb = h["heartbeat_age_s"]
+    krows = ""
+    for k in h["kinds"]:
+        st = ('<span class="chip crit">STALE</span>' if k["stale"] and k["critical"]
+              else ('<span class="chip warn">stale</span>' if k["stale"] else '<span class="chip ok2">fresh</span>'))
+        err = f'<span class="chip crit">{k["errors"]} err</span>' if k["errors"] else ""
+        star = "★" if k["critical"] else ""
+        krows += (f'<tr><td class="mono">{star} {k["kind"]}</td><td class="mono muted">{k["source"]}</td>'
+                  f'<td class="mono">{(k["last_ok"] or "NEVER")[:19]}</td>'
+                  f'<td class="mono num">{k["age_h"] if k["age_h"] is not None else "—"}h</td>'
+                  f'<td class="mono muted">{k["interval_h"]}h</td><td>{st}{err}</td></tr>')
+    al = "".join(f'<li class="mono">{a}</li>' for a in h["alerts"]) or '<li class="muted">none</li>'
+    log = "".join(f'<tr><td class="mono muted">{a["ts"][:19]}</td>'
+                  f'<td><span class="chip {"crit" if a["level"]=="critical" else ("warn" if a["level"]=="warn" else "ok2")}">{a["verdict"]}</span></td>'
+                  f'<td class="mono">{a["message"]}</td></tr>' for a in alerts) or \
+          '<tr><td colspan="3" class="muted">no state changes recorded</td></tr>'
+    return f"""{_CSS}
+<style>
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:12px 0;flex-wrap:wrap}}
+.fstep{{padding:4px 11px;border:1px solid var(--line);border-radius:16px;text-decoration:none;color:var(--mut)}}
+.fstep.home{{color:var(--fg)}}
+.hbanner{{padding:18px 22px;border-radius:14px;margin:12px 0;display:flex;align-items:center;gap:20px;border:1px solid var(--line)}}
+.hv{{font-size:26px;font-weight:760}}.hv.fresh{{color:var(--fresh)}}.hv.amber{{color:#c9930b}}.hv.stale{{color:var(--stale)}}
+.hsub{{color:var(--mut);font-size:13px}}
+.chip.ok2{{background:color-mix(in srgb,var(--fresh) 16%,transparent);color:var(--fresh)}}
+.chip.warn{{background:color-mix(in srgb,#c9930b 18%,transparent);color:#c9930b}}
+ul.al{{font-size:13px;line-height:1.7;color:var(--stale)}}ul.al li.muted{{color:var(--fresh)}}
+</style>
+<main>
+  <header><div class="brand"><span class="live"></span>Collector Health</div>
+    <div class="gen mono">auto-refresh 30s · {h["generated_at"][:19].replace("T"," ")}Z</div></header>
+  <meta http-equiv="refresh" content="30">
+  <div class="flow"><a class="fstep home" href="/">☰ dashboards</a><a class="fstep" href="/data-collection">S1 collection →</a></div>
+  <div class="hbanner"><div><div class="hv {cls}">{label}</div>
+    <div class="hsub">heartbeat: last API call {("%d s" % hb) if hb is not None else "—"} ago
+    {"(ALIVE)" if h["alive"] else "(NO HEARTBEAT)"} · latest close {h["latest_close"]} · bars {h["bars_latest"]}</div></div>
+    <div style="margin-left:auto"><ul class="al">{al}</ul></div></div>
+  <section class="panel"><h2>Per-signal freshness <span class="muted">★ = critical (must stay fresh)</span></h2>
+    <table class="queue"><thead><tr><th>Kind</th><th>Src</th><th>Last OK (UTC)</th><th>Age</th><th>Cadence</th><th>State</th></tr></thead>
+    <tbody>{krows}</tbody></table></section>
+  <section class="panel"><h2>Alert history <span class="muted">— recorded state changes (STALL → recover)</span></h2>
+    <table class="queue"><thead><tr><th>When (UTC)</th><th>Verdict</th><th>Message</th></tr></thead><tbody>{log}</tbody></table></section>
+</main>"""
+
+
+def _page_health(h, alerts):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Collector Health</title></head><body>' + render_health(h, alerts) + '</body></html>')
+
+
 def render_picks(s: dict) -> str:
     reg = s.get("regime") or {}
 
@@ -1108,6 +1165,10 @@ def serve(port=8787):
             elif path == "/picks":                     # universe screen: top & bottom picks
                 import pipeline_map
                 payload = _page_picks(pipeline_map.alpha_screen(n=15)).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/health":                    # collector heartbeat + freshness + alerts
+                import health
+                payload = _page_health(health.health(), health.recent_alerts()).encode()
                 ctype = "text/html; charset=utf-8"
             elif path == "/api/model-detail":          # a model's precision@k curve + errors
                 import pipeline_map
