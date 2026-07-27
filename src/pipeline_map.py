@@ -630,6 +630,66 @@ def alpha_report(ticker: str, db_path=DEFAULT_DB) -> dict:
             "efficacy": eff, "gaps": gaps}
 
 
+def alpha_screen(db_path=DEFAULT_DB, n=15) -> dict:
+    """Run the deployed big-move classifier across the WHOLE universe and rank it into
+    TOP picks (highest up-conviction = longs) and BOTTOM picks (highest down-conviction =
+    shorts). Conviction = the strongest calibrated P(move>±3%) across horizons; ranking is
+    where the precision@k edge lives."""
+    c = sqlite3.connect(Path(db_path))
+    HZ = [1, 3, 5, 7]
+
+    def load(feat):
+        md = c.execute("SELECT MAX(event_time) FROM feature_values WHERE feature=?", (feat,)).fetchone()
+        if not md or not md[0]:
+            return {}, None
+        return ({sc: float(v) for sc, v, _ in c.execute(
+            "SELECT scope, value, MAX(ingested_at) FROM feature_values WHERE feature=? "
+            "AND event_time=? GROUP BY scope", (feat, md[0]))}, md[0])
+
+    up = {h: load(f"predict.pbig_up_{h}d")[0] for h in HZ}
+    down = {h: load(f"predict.pbig_down_{h}d")[0] for h in HZ}
+    _, asof = load("predict.pbig_up_1d")
+    px = {sc: float(v) for sc, v, _ in c.execute(
+        "SELECT scope, value, MAX(ingested_at) FROM feature_values WHERE feature='price.close' "
+        "AND event_time=(SELECT MAX(event_time) FROM feature_values WHERE feature='price.close') "
+        "GROUP BY scope")}
+    dte = {sc: v for sc, v, _ in c.execute(
+        "SELECT scope, value, MAX(ingested_at) FROM feature_values WHERE feature='calendar.days_to_earnings' "
+        "AND event_time=(SELECT MAX(event_time) FROM feature_values WHERE feature='calendar.days_to_earnings') "
+        "GROUP BY scope")}
+    _, reg = None, None
+    r = c.execute("SELECT value FROM feature_values WHERE feature='alpha.regime' AND scope='_market' "
+                  "ORDER BY event_time DESC, ingested_at DESC LIMIT 1").fetchone()
+    if r:
+        try:
+            reg = json.loads(r[0])
+        except Exception:
+            pass
+
+    tickers = set().union(*[set(up[h]) for h in HZ]) if any(up.values()) else set()
+    rows = []
+    for t in tickers:
+        bu = max(((up[h].get(t, 0.0), h) for h in HZ), default=(0, None))
+        bd = max(((down[h].get(t, 0.0), h) for h in HZ), default=(0, None))
+        try:
+            de = int(float(dte.get(t))) if dte.get(t) is not None else None
+        except (TypeError, ValueError):
+            de = None
+        rows.append({"ticker": t, "price": px.get(t),
+                     "up_p": round(bu[0], 4), "up_h": f"{bu[1]}d" if bu[1] else "—",
+                     "down_p": round(bd[0], 4), "down_h": f"{bd[1]}d" if bd[1] else "—",
+                     "net": round(bu[0] - bd[0], 4), "days_to_earn": de})
+    longs = [{**x, "rank": i + 1} for i, x in
+             enumerate(sorted(rows, key=lambda x: -x["up_p"])[:n])]
+    shorts = [{**x, "rank": i + 1} for i, x in
+              enumerate(sorted(rows, key=lambda x: -x["down_p"])[:n])]
+    return {"generated_at": datetime.now(timezone.utc).isoformat(), "as_of": asof,
+            "universe_n": len(rows), "regime": reg, "longs": longs, "shorts": shorts,
+            "note": ("Ranked by the deployed big-move classifier's calibrated conviction. "
+                     "The DOWN side has stronger recorded skill (≈2.9× base), so the short "
+                     "list is the higher-confidence one. Regime/event gates still apply per name.")}
+
+
 def _step_of(feature: str) -> str:
     if feature.startswith("alpha."):
         return "S4 · Alpha"

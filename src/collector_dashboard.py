@@ -377,6 +377,8 @@ _STEPS = [
     ("S4", "Alpha Report", "/alpha", True,
      "Per-stock alpha report: factors, catalysts, valuation, risk, positioning, predictor efficacy."),
     ("§5", "Backtest & P&L", None, False, "Cost-aware walk-forward returns."),
+    ("★", "Top &amp; Bottom Picks", "/picks", True,
+     "Whole universe ranked by predictor conviction — the day's long and short candidates."),
     ("↳", "Single Stock", "/single-stock", True,
      "One ticker across every step: all S1→S4 signals + the full raw collected rows."),
 ]
@@ -866,6 +868,59 @@ function modelDetail(row){{
 </script>"""
 
 
+def render_picks(s: dict) -> str:
+    reg = s.get("regime") or {}
+
+    def side_tbl(rows, side):
+        pk = "up_p" if side == "long" else "down_p"
+        hk = "up_h" if side == "long" else "down_h"
+        col = "var(--fresh)" if side == "long" else "var(--stale)"
+        body = ""
+        for x in rows:
+            de = x["days_to_earn"]
+            ev = f'<span class="evchip">⚠ {de}d</span>' if (de is not None and de <= 3) else (f'{de}d' if de is not None else "—")
+            body += (f'<tr onclick="location.href=\'/alpha?ticker={x["ticker"]}\'">'
+                     f'<td class="mono">{x["rank"]}</td><td class="mono feat"><b>{x["ticker"]}</b></td>'
+                     f'<td class="mono">${x["price"]:.2f}</td>'
+                     f'<td class="mono"><b style="color:{col}">{x[pk]*100:.0f}%</b> <span class="muted">@{x[hk]}</span></td>'
+                     f'<td class="mono">{x["net"]:+.2f}</td><td class="mono muted">{ev}</td></tr>')
+        head = "P(up)" if side == "long" else "P(down)"
+        return (f'<table class="queue"><thead><tr><th>#</th><th>Ticker</th><th>Price</th>'
+                f'<th>{head} (horizon)</th><th>net</th><th>earnings</th></tr></thead><tbody>{body}</tbody></table>')
+
+    return f"""{_CSS}
+<style>
+.flow{{display:flex;gap:8px;align-items:center;font-size:13px;margin:12px 0;flex-wrap:wrap}}
+.fstep{{padding:4px 11px;border:1px solid var(--line);border-radius:16px;text-decoration:none;color:var(--mut)}}
+.fstep:hover{{border-color:var(--accent);color:var(--fg)}}.fstep.cur{{color:var(--accent);border-color:var(--accent);font-weight:640}}
+.fstep.home{{color:var(--fg)}}
+.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}@media(max-width:900px){{.grid2{{grid-template-columns:1fr}}}}
+tr[onclick]{{cursor:pointer}}tr[onclick]:hover{{background:color-mix(in srgb,var(--accent) 7%,transparent)}}
+.evchip{{color:var(--stale);font-weight:700;font-size:11px}}
+.note{{font-size:12.5px;color:var(--mut);line-height:1.6;margin-top:8px}}
+h2 .side{{font-weight:740}}h2 .lg{{color:var(--fresh)}}h2 .sh{{color:var(--stale)}}
+</style>
+<main>
+  <header><div class="brand"><span class="live"></span>Alpha Screen · Top &amp; Bottom Picks</div>
+    <div class="gen mono">as-of {s["as_of"]} · {s["universe_n"]} stocks · {s["generated_at"][:16].replace("T"," ")}Z</div></header>
+  {_flow_nav("S4")}
+  <div class="grid2">
+    <section class="panel"><h2><span class="side lg">▲ TOP PICKS</span> <span class="muted">— longs, highest up-conviction</span></h2>
+      {side_tbl(s["longs"], "long")}</section>
+    <section class="panel"><h2><span class="side sh">▼ BOTTOM PICKS</span> <span class="muted">— shorts, highest down-conviction</span></h2>
+      {side_tbl(s["shorts"], "short")}</section>
+  </div>
+  <div class="note">{s["note"]} Regime: {reg.get("decision","—")} (score {reg.get("score","—")}). Click a row for the full <a href="/alpha">alpha report</a>. ⚠ = earnings ≤3 days (event risk).</div>
+</main>"""
+
+
+def _page_picks(s):
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Alpha Screen — Top &amp; Bottom Picks</title></head><body>'
+            + render_picks(s) + '</body></html>')
+
+
 def render_alpha(rep: dict, tickers: list) -> str:
     tk = rep["ticker"]
     opts = "".join(f'<option{" selected" if t == tk else ""}>{t}</option>' for t in tickers)
@@ -1048,6 +1103,10 @@ def serve(port=8787):
                 q = parse_qs(parsed.query)
                 tk = (q.get("ticker", [""])[0] or UNIVERSE[0]).upper()
                 payload = _page_alpha(pipeline_map.alpha_report(tk), list(UNIVERSE)).encode()
+                ctype = "text/html; charset=utf-8"
+            elif path == "/picks":                     # universe screen: top & bottom picks
+                import pipeline_map
+                payload = _page_picks(pipeline_map.alpha_screen(n=15)).encode()
                 ctype = "text/html; charset=utf-8"
             elif path == "/api/model-detail":          # a model's precision@k curve + errors
                 import pipeline_map
