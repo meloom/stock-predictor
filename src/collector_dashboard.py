@@ -700,16 +700,18 @@ function rawTable(s){
   return h+'</tbody></table></div>';
 }
 function runPredict(){
-  var asof=document.getElementById('asof').value, out=document.getElementById('predout');
-  out.innerHTML='<div class="muted">predicting '+TK+' as of '+asof+'…</div>';
-  fetch('/api/predict?ticker='+encodeURIComponent(TK)+'&asof='+encodeURIComponent(asof))
+  var out=document.getElementById('predout');
+  out.innerHTML='<div class="muted">predicting '+TK+'…</div>';
+  fetch('/api/predict?ticker='+encodeURIComponent(TK))
     .then(function(r){return r.json();}).then(function(s){
-      if(s.status==='REJECTED'){out.innerHTML='<div class="prej">REJECTED · '+esc(s.reason)+'</div>';return;}
-      if(s.status!=='OK'){out.innerHTML='<div class="prej">'+s.status+' · '+esc(s.reason||'')+'</div>';return;}
-      var h='<table class="ptbl"><thead><tr><th>horizon</th><th>pred return</th><th>pred price</th><th>P(up)</th></tr></thead><tbody>';
-      Object.keys(s.predictions).forEach(function(k){var p=s.predictions[k];
-        h+='<tr><td>'+p.ahead+'</td><td class="mono">'+(p.pred_return*100).toFixed(2)+'%</td><td class="mono">'+p.pred_price+'</td><td class="mono">'+(p.p_up==null?'—':p.p_up)+'</td></tr>';});
-      h+='</tbody></table><div class="cmeta">price '+s.price+' · vol_h5 '+(s.pred_vol_h5||'—')+' · model trained '+s.model.train_start+'→'+s.model.train_end+(s.s2_composed_now?' · S2 composed on demand':'')+'</div>';
+      if(!s.predictions){out.innerHTML='<div class="prej">no prediction available</div>';return;}
+      function pc(p,r,side){if(p==null)return '<td class="mono muted">—</td>';
+        var col=side==='down'?'var(--stale)':'var(--fresh)', hot=(r&&r<=5)?' style="font-weight:700;color:var(--accent)"':'';
+        return '<td class="mono"><b style="color:'+col+'">'+(p*100).toFixed(0)+'%</b> <span'+hot+'>#'+r+'</span></td>';}
+      var h='<table class="ptbl"><thead><tr><th>horizon</th><th>P(up&gt;3%)</th><th>P(down&gt;3%)</th></tr></thead><tbody>';
+      s.predictions.forEach(function(p){
+        h+='<tr><td>'+p.h+'</td>'+pc(p.p_up,p.rank_up,'up')+pc(p.p_down,p.rank_down,'down')+'</tr>';});
+      h+='</tbody></table><div class="cmeta">→ <b>'+esc(s.suggestion||'')+'</b> · action '+esc(s.action||'')+' · calibrated big-move classifier (lower rank # = higher conviction)</div>';
       out.innerHTML=h;
     });
 }
@@ -744,10 +746,9 @@ def render_single_stock(graph: dict, tickers: list) -> str:
         f'<select name="ticker" onchange="this.form.submit()">{opts}</select>'
         f'<span class="legend2"><i class="k-line"></i>line <i class="k-raw"></i>raw '
         f'<i class="k-json"></i>json <span class="muted">· dim = not produced</span></span></form>'
-        f'<div class="predbox"><b>Predict trigger</b> <span class="muted">production model ·</span> '
-        f'<input id="asof" value="{graph.get("latest") or ""}" size="12" placeholder="YYYY-MM-DD">'
+        f'<div class="predbox"><b>Predict trigger</b> <span class="muted">deployed big-move classifier (calibrated) ·</span> '
         f'<button type="button" onclick="runPredict()">Predict {tk}</button>'
-        f'<span class="muted">rejects an asof inside the training window; triggers S2 to compose features</span>'
+        f'<span class="muted">calibrated P(up)/P(down) per horizon + rank vs universe</span>'
         f'<div id="predout"></div></div>'
         f'<div class="sgwrap"><svg id="edges"></svg><div class="cols" id="cols">{cols_html}</div></div>'
         f'<div id="detail" class="panel"><div class="muted">Click a node to inspect its signal '
@@ -1126,11 +1127,11 @@ def serve(port=8787):
                 payload = _json.dumps(pipeline_map.stock_signal(
                     q.get("ticker", [""])[0], q.get("feature", [""])[0]), default=str).encode()
                 ctype = "application/json"
-            elif path == "/api/predict":              # the prediction TRIGGER (production model)
-                import serving
+            elif path == "/api/predict":              # prediction TRIGGER — deployed classifier
+                import pipeline_map
                 q = parse_qs(parsed.query)
-                payload = _json.dumps(serving.predict(
-                    q.get("ticker", [""])[0], q.get("asof", [""])[0]), default=str).encode()
+                payload = _json.dumps(pipeline_map.ticker_prediction(
+                    q.get("ticker", [""])[0]), default=str).encode()
                 ctype = "application/json"
             else:                                     # "/" index of all step dashboards
                 payload = _index_page().encode()

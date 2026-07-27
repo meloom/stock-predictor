@@ -630,6 +630,16 @@ def alpha_report(ticker: str, db_path=DEFAULT_DB) -> dict:
             "efficacy": eff, "gaps": gaps}
 
 
+def ticker_prediction(ticker: str, db_path=DEFAULT_DB) -> dict:
+    """The DEPLOYED big-move classifier's prediction for one ticker — calibrated P(up)/
+    P(down) per horizon with rank vs universe, and the summarized strongest signal. This
+    is what the /single-stock Predict trigger shows (NOT the old squished Ridge P≈0.5)."""
+    r = alpha_report(ticker, db_path)
+    return {"ticker": r["ticker"], "as_of": r["as_of"], "price": r["price"],
+            "predictions": r["predictions"], "best_signal": r["best_signal"],
+            "suggestion": r["suggestion"], "action": r["action"], "why": r["why"]}
+
+
 def alpha_screen(db_path=DEFAULT_DB, n=15) -> dict:
     """Run the deployed big-move classifier across the WHOLE universe and rank it into
     TOP picks (highest up-conviction = longs) and BOTTOM picks (highest down-conviction =
