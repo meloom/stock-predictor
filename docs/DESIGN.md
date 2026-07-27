@@ -271,18 +271,19 @@ into decisions. S3 is a FRAMEWORK for multiple predictors; it starts with one.
 | | |
 |---|---|
 | **Input** | The S2 feature vector per (date, ticker) from the store |
-| **Output** | `predict.*` features. First predictor `end_of_day_price`: `predict.eod_return` (forecast forward return over horizon H) + `predict.eod_price` (implied close). Model is trained, versioned, and its held-out `test_metrics` recorded |
-| **Metrics** | Two views. **Price view** (what a price predictor is judged on): predicted-vs-actual PRICE RMSE/MAE/MAPE, always reported **against the naive persistence baseline** (tomorrow=today) — on a near-random-walk series a low MAPE means nothing unless it beats naive. **Cross-sectional view**: **IC** (rank corr) + MSE vs. predict-the-mean null. Plus factor loadings (Ridge coefs) + coverage. |
-| **Hard rules** | The model **exists, trains, and is MEASURED daily** — §5 governs whether its output sizes REAL CAPITAL, not whether it runs. "Don't deploy unvalidated" ≠ "don't build." Runs in **OBSERVATION mode**: predictions recorded + scored (S9 computes daily IC) so it accumulates the evidence to earn the gate. Training panel is POINT-IN-TIME correct: features `event_time <= d`, target from `event_time > d`; purge 15d / embargo 7d; non-overlapping-window significance before any §5 claim. Missing features mean-imputed, never sentineled. |
+| **Output** | Two separate namespaces (never conflated): `backtest.*` = historical walk-forward OOS = EVALUATION only; `predict.*` = the FUTURE prediction. The deployed model is the **big-move DUAL classifier** (logistic-up + HistGBM-down), isotonic-**calibrated**, emitting per-ticker `predict.pbig_up_<N>d` / `pbig_down_<N>d` for horizons **1/3/5/7 d** + `predict.dir_1d` (= P(up)−P(down), S4's input). |
+| **Metric (decided)** | **Per-day precision@k on big moves** (up>+3% / down<−3%), walk-forward, judged vs the **base rate** (up≈9% / down≈8% at 1d). Return-IC and price-RMSE are retired — on a near-random-walk series they don't reflect the tradeable edge; the recorded win is DOWN-side precision@1 ≈ **2.9× base rate**. |
+| **Hard rules** | **Building ≠ deployment.** Building uses a held-out backtest to pick/measure a model; deployment (`serving.deploy_classifier`) retrains on the freshest window and forecasts the FUTURE only. Predictions are BUILT + MEASURED, not validated for capital — §5 governs sizing. PIT-correct panel (features `event_time≤d`, label from `>d`). Trust the **rank** over the absolute probability (calibration ECE is high). Missing features mean-imputed, never sentineled. |
 
-**Implementation notes (landed 2026-07-24)**
-- `src/s3_predictors.py`: pluggable framework; first predictor `end_of_day_price`
-  (Ridge baseline — linear, regularized, coefficients ARE factor loadings).
-  `assemble_panel` (PIT-correct), `train`, `evaluate` (IC + MSE-vs-null),
-  `predict_eod`, `run_predictors` (observation mode).
-- First real measured result (38-ticker universe, 2y, 20-day horizon,
-  technical features — fundamentals ~flat until S1 statement-history backfill):
-  held-out **IC ≈ 0.065, beats the predict-the-mean null (R² vs null ≈ +3%)**.
+**Implementation notes (current)**
+- `src/s3_multi.py`: `backfill()` writes the walk-forward `backtest.*` evaluation series;
+  the leverage-adjusted prediction-interval math lives here (`_fit_reg`, `_pi_se`).
+- `src/serving.py`: `deploy_classifier()` — the LIVE model. Trains logistic-up + HistGBM-down
+  per horizon, isotonic-calibrated, ranks the universe, writes `predict.pbig_*` + `dir_1d`.
+  (The earlier Ridge `predict.eod_return`/`end_of_day_price` produced a useless ~0.5 P(up)
+  for every stock and has been **retired** — purged from the store and the DAG.)
+- Recorded rosters (`modeling/h{N}/README.md`) drive the `/predictors` page: model-creation
+  categories 1d/3d/5d/7d, each with its full roster + the production model.
   Small, single-split, pooled total-return — NOT a §5 pass.
 - **Price view, next-day (h=1), the honest reckoning**: model MAPE 1.96% vs
   naive-persistence MAPE 1.98% — model beats naive by only 0.38% on RMSE. The
@@ -513,3 +514,29 @@ valid, honest outcome. The registry holds measured winners, not attempts.
 | Execution/safety (S5–S7 core) | **Next to migrate** — proven in production, needs modularization + unit tests |
 | Ops/reporting (S8) | Migrate after execution, with cost fixes retained |
 | Automated trading cron | **Off** until cutover criteria: all above migrated + tested + §5 pass for any live signal |
+| Deployed classifier + alpha report + picks | **Built (current)** — `serving.deploy_classifier` (calibrated pbig per horizon), `pipeline_map.alpha_report`/`alpha_screen`; dashboards live; not §5-passed |
+| Report log (SQL) | **Built** — `reportlog.py` `report_snapshots` table; daily snapshot + realized-precision scorer |
+
+## 7. Serving, reports & robustness (current implementation)
+
+**Serving.** `serving.deploy_classifier()` is the live model path (the Ridge predictor is
+retired). The **Predict trigger** (`/api/predict` → `pipeline_map.ticker_prediction`) returns
+the classifier's calibrated P(up)/P(down) per horizon + rank. `deploy_classifier` retrains on
+the freshest window (deployment ≠ the held-out backtest used for building).
+
+**Reports.** `pipeline_map.alpha_report(ticker)` = the per-stock report (predictions + factors
++ catalysts + valuation + risk + positioning, summarized to an action, regime/event gated).
+`alpha_screen()` ranks the whole universe into **top (long) / bottom (short) picks**.
+
+**Report log (SQL).** `reportlog.snapshot()` freezes the day's picks + per-ticker predictions
+into the bitemporal `report_snapshots` table; `score()` computes realized precision per pick
+once forward bars arrive (run `python3 -m reportlog snapshot` daily).
+
+**Robustness.** All SQLite connections use **WAL + 60 s busy-timeout** so the collector
+daemon, dashboard, and jobs share the DB without "database is locked"; `collector.run_forever`
+is crash-proof (any tick error is logged and recovered). Both daemons are launchd agents —
+independent of any editor session and auto-restarted.
+
+**Dashboards** (localhost:8899): `/` index · `/data-collection` (S1) · `/signal-processing`
+(S2) · `/predictors` (S3, by category) · `/alpha` (S4 report) · `/picks` (universe screen) ·
+`/single-stock` (dataflow DAG). Per-domain deep dives: `docs/data-collection/`, `docs/alpha-report/`.

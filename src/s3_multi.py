@@ -25,7 +25,7 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from core import FeatureStore, DEFAULT_DB, MARKET_SCOPE, Trigger      # noqa: E402
+from core import FeatureStore, DEFAULT_DB, MARKET_SCOPE, Trigger, RUNTIME_DIR   # noqa: E402
 from s3_predictors import PREDICTOR_FEATURES                          # noqa: E402
 
 HORIZONS = [1, 5, 21]

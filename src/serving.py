@@ -149,6 +149,8 @@ def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store
             store.register(f"predict.pbig_{side}_{h}d", "float", "ticker", "S3", "daily",
                            f"Calibrated P({side}-move > {thr:.0%} over {h}d) — big-move "
                            f"classifier (dual: logistic-up + histgbm-down).")
+    store.register("predict.dir_1d", "float", "ticker", "S3", "daily",
+                   "Directional score = P(up-big) − P(down-big) at 1d — S4's input.")
     # forward-return labels per horizon, built straight from the price series
     lab = {h: [] for h in horizons}                          # h -> [(x, fwd_ret)]
     for t, pm in price.items():
@@ -183,6 +185,8 @@ def deploy_classifier(db_path=DEFAULT_DB, horizons=(1, 3, 5, 7), thr=0.03, store
         for i, (t, _) in enumerate(live):
             store.write(f"predict.pbig_up_{h}d", t, latest, round(float(pu[i]), 4), trigger_id="deploy_clf")
             store.write(f"predict.pbig_down_{h}d", t, latest, round(float(pd[i]), 4), trigger_id="deploy_clf")
+            if h == 1:                                        # directional score for S4 alpha
+                store.write("predict.dir_1d", t, latest, round(float(pu[i] - pd[i]), 4), trigger_id="deploy_clf")
         meta["spread"][f"{h}d"] = {"up": [round(float(pu.min()), 3), round(float(pu.max()), 3)],
                                    "down": [round(float(pd.min()), 3), round(float(pd.max()), 3)]}
     (RUNTIME_DIR / "deployed_classifier.json").write_text(json.dumps(meta, indent=2))

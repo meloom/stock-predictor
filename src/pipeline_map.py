@@ -84,7 +84,7 @@ DOWNSTREAM_INPUTS = {                                                # for the c
         "xh.ret_21d", "xh.ret_63d", "xh.ret_126d", "xh.dist_hi252",
         "xh.new_high_flag", "xh.above_hi_streak"],
     "S4 alpha": ["regime.breadth5", "macro.vix", "macro.spy_close",
-                 "calendar.days_to_earnings", "predict.ret_1d"],
+                 "calendar.days_to_earnings", "predict.dir_1d"],
 }
 
 
@@ -162,9 +162,10 @@ RAW_TABLE = {
     "price.current": "quotes", "sec_filings": "sec_filings",
     "xbrl_financials": "xbrl_financials", "transcripts": "transcripts",
 }
-# S3 nodes: the FUTURE prediction (predict.*, one point at the latest date) and the
-# BACKTEST evaluation series (backtest.*, historical walk-forward — for measuring skill).
-_S3_PRED = ["predict.ret_1d", "predict.ret_5d", "predict.ret_21d", "predict.vol_5d"]
+# S3 nodes: the deployed CLASSIFIER prediction (predict.pbig_* / dir — the live per-ticker
+# calibrated big-move probabilities) and the BACKTEST evaluation series (backtest.*).
+_S3_PRED = ["predict.dir_1d", "predict.pbig_up_1d", "predict.pbig_down_1d",
+            "predict.pbig_up_5d", "predict.pbig_down_5d"]
 _S3_BACKTEST = ["backtest.ret_1d", "backtest.ret_5d", "backtest.ret_21d", "backtest.vol_5d"]
 
 
@@ -195,10 +196,9 @@ def _depends():
     pf = list(s3_predictors.PREDICTOR_FEATURES)
     for p in _S3_PRED + _S3_BACKTEST:               # every predictor consumes the S2 vector
         d[p] = pf
-    d["predict.forecast"] = ["predict.ret_1d", "predict.ret_5d", "predict.ret_21d"]  # future rollup
     d["alpha.regime"] = ["regime.breadth5", "macro.vix", "macro.spy_close"]
     d["alpha.event_risk"] = ["calendar.days_to_earnings"]
-    d["alpha.signal"] = ["predict.ret_1d", "alpha.regime", "alpha.event_risk"]
+    d["alpha.signal"] = ["predict.dir_1d", "alpha.regime", "alpha.event_risk"]
     return d
 
 
@@ -231,8 +231,7 @@ def stock_graph(ticker: str, db_path=DEFAULT_DB) -> dict:
     for group, feats, _, _ in LINEAGE:
         for f in feats:
             defs.append((f, "S2", "json" if f == "earnings.analysis" else "line"))
-    defs += ([("predict.forecast", "S3", "json")]
-             + [(f, "S3", "line") for f in _S3_PRED]
+    defs += ([(f, "S3", "line") for f in _S3_PRED]
              + [(f, "S3", "line") for f in _S3_BACKTEST])
     defs += [("alpha.regime", "S4", "json"), ("alpha.event_risk", "S4", "json"),
              ("alpha.signal", "S4", "json")]
@@ -301,7 +300,7 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
                     (RUNTIME_DIR / "production_model.json").read_text()).get("train_end")
             except Exception:
                 pass
-        if feature.startswith(("predict.ret_", "backtest.ret_")):  # per-point 95% PI half-width
+        if feature.startswith("backtest.ret_"):        # per-point 95% PI half-width
             cif = feature.replace(".ret_", ".ci_ret_")
             ciby = {}
             for et, val, _ in c.execute(
