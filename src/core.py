@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -163,6 +164,12 @@ class FeatureStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=60000")
         self._conn.executescript(_SCHEMA)
+        # Lock the file to owner-only so no other user can bypass DataAPI by
+        # opening the SQLite file directly.
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
         self._registry_cache: set[str] = {
             r[0] for r in self._conn.execute("SELECT name FROM registry")
         }
@@ -308,3 +315,139 @@ class FeatureStore:
 
     def close(self) -> None:
         self._conn.close()
+
+
+# ═══════════════════════════ Gated data-retrieval API ════════════════════════
+
+class DataAPIError(Exception):
+    """Base for all gated-read rejections."""
+
+
+class UnknownSignalError(DataAPIError):
+    pass
+
+
+class UnknownScopeError(DataAPIError):
+    pass
+
+
+class InvalidTimeRangeError(DataAPIError):
+    pass
+
+
+_TICKER_RE = re.compile(r"^[A-Za-z0-9._\-]{1,24}$")
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def harden_db_permissions(db_path: Path | str = DEFAULT_DB) -> None:
+    """Lock the DB file to owner-only (chmod 600) so no other user can open it.
+    All same-user processes must go through DataAPI for reads. (SQLite is a file,
+    so this — plus the read-only API handle — is the enforceable boundary; there
+    is no engine-level ACL.)"""
+    for p in (Path(db_path), Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        try:
+            if p.exists():
+                os.chmod(p, 0o600)
+        except OSError:
+            pass
+
+
+class DataAPI:
+    """The ONE sanctioned way to read stored signal data.
+
+    Every consumer — the dashboard, S2/S3/S4, notebooks, ad-hoc scripts — must
+    retrieve data through `get(ticker, signal, time_start, time_end)`. The class
+    enforces that:
+
+      • the handle is opened READ-ONLY (`mode=ro`), so a caller physically
+        cannot mutate the store through it;
+      • the DB file is chmod 600 (owner-only) — no external user can open it;
+      • `signal` is validated against the registry whitelist (no reading an
+        unregistered/typo'd field, no fishing);
+      • `ticker` is format-checked and existence-checked;
+      • the time range is parsed/ordered and the SQL is fully parameterized, so
+        no caller can inject SQL or widen the query beyond one (ticker, signal).
+
+    Returns bitemporal point-in-time-correct rows: one latest-ingested version
+    per event_time, ascending. Pass `as_known_at` to read the store *as it was
+    known* at a past instant (lookahead-free backtests)."""
+
+    def __init__(self, db_path: Path | str = DEFAULT_DB, harden: bool = True):
+        self._path = Path(db_path)
+        if not self._path.exists():
+            raise DataAPIError(f"no database at {self._path}")
+        if harden:
+            harden_db_permissions(self._path)
+        # read-only URI handle: reads see committed WAL data; writes are impossible.
+        self._conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True, timeout=60)
+        self._conn.execute("PRAGMA busy_timeout=60000")
+        self._signals = {r[0] for r in self._conn.execute("SELECT name FROM registry")}
+
+    def signals(self) -> list[str]:
+        """The whitelist of retrievable signals (registered feature names)."""
+        return sorted(self._signals)
+
+    def scopes(self, signal: str) -> list[str]:
+        """Tickers that actually have data for a signal."""
+        if signal not in self._signals:
+            raise UnknownSignalError(f"{signal!r} is not a registered signal")
+        return [r[0] for r in self._conn.execute(
+            "SELECT DISTINCT scope FROM feature_values WHERE feature=? ORDER BY scope",
+            (signal,))]
+
+    @staticmethod
+    def _parse_time(t: Any, *, end: bool = False) -> str:
+        """Validate an ISO date/datetime string and return it for lexical compare.
+        A date-only *end* bound is widened to end-of-day so `get(...,'2026-07-27')`
+        includes that whole day's intraday rows."""
+        s = str(t)
+        try:
+            datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise InvalidTimeRangeError(f"unparseable time {t!r}: {e}") from None
+        if end and _DATE_ONLY_RE.match(s):
+            return s + "T23:59:59.999999"
+        return s
+
+    def get(self, ticker: str, signal: str, time_start: Any, time_end: Any,
+            as_known_at: Optional[str] = None) -> list[dict]:
+        """Retrieve [(event_time, value, ingested_at), ...] for one ticker×signal
+        within [time_start, time_end], ascending, PIT-deduped. Raises a
+        DataAPIError subclass on an unknown signal/ticker or a bad time range."""
+        if signal not in self._signals:
+            raise UnknownSignalError(
+                f"{signal!r} is not a registered signal; call signals() for the list")
+        if not isinstance(ticker, str) or not _TICKER_RE.match(ticker):
+            raise UnknownScopeError(f"invalid ticker {ticker!r}")
+        ts = self._parse_time(time_start)
+        te = self._parse_time(time_end, end=True)
+        if ts > te:
+            raise InvalidTimeRangeError(f"time_start {ts!r} is after time_end {te!r}")
+        if self._conn.execute(
+                "SELECT 1 FROM feature_values WHERE feature=? AND scope=? LIMIT 1",
+                (signal, ticker)).fetchone() is None:
+            raise UnknownScopeError(f"no data for ticker {ticker!r} under signal {signal!r}")
+        q = ("SELECT event_time, value, MAX(ingested_at) FROM feature_values "
+             "WHERE feature=? AND scope=? AND event_time>=? AND event_time<=?")
+        params: list = [signal, ticker, ts, te]
+        if as_known_at is not None:
+            q += " AND ingested_at<=?"
+            params.append(self._parse_time(as_known_at))
+        q += " GROUP BY event_time ORDER BY event_time ASC"
+        return [{"event_time": et, "value": json.loads(v), "ingested_at": ia}
+                for et, v, ia in self._conn.execute(q, params)]
+
+    def latest(self, ticker: str, signal: str, as_of: Optional[str] = None) -> Optional[dict]:
+        """Convenience: the single most-recent row at/*before* `as_of` (default now)."""
+        end = as_of or _utcnow()
+        rows = self.get(ticker, signal, "0001-01-01", end, as_known_at=as_of)
+        return rows[-1] if rows else None
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

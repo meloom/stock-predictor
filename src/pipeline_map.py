@@ -12,7 +12,8 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from core import DEFAULT_DB, RUNTIME_DIR                             # noqa: E402
+from core import (DEFAULT_DB, RUNTIME_DIR, DataAPI,                  # noqa: E402
+                  DataAPIError, UnknownScopeError)
 
 # ── S2 feature lineage: s2_feature -> (derived-from S1/S2 inputs, downstream consumer) ──
 # This is the design contract, hand-authored from the stage code (s2/s3/s4).
@@ -263,7 +264,6 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
     typed rows (raw), or the latest structured value (json)."""
     import json
     ticker = (ticker or "").upper()
-    c = sqlite3.connect(Path(db_path))
     if feature == "bars":                                     # HOURLY price — line at 1h granularity
         import schema
         rows = schema.TypedStore(db_path).c.execute(
@@ -280,17 +280,28 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
                     row[k] = v[:200] + f"… ({len(v)} chars)"
         return {"kind": "raw", "feature": feature, "table": r["table"],
                 "columns": r["columns"], "ts_col": r["ts_col"], "rows": r["rows"]}
-    # time series from feature_values (dedup to latest ingested_at per event_time)
-    rows = c.execute(
-        "SELECT event_time, value, MAX(ingested_at) FROM feature_values "
-        "WHERE feature=? AND scope IN (?, '_market') GROUP BY event_time ORDER BY event_time",
-        (feature, ticker)).fetchall()
-    pts, nonnum = [], None
-    for et, val, _ in rows:
+    # time series from feature_values — retrieved ONLY through the gated DataAPI
+    # (the dashboard is a data consumer, not a direct DB reader). Market-level
+    # signals live under the '_market' scope, so fall back to it for this ticker.
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _series(feat, scope):
         try:
-            pts.append([et[:10], float(val)])
+            return DataAPI(db_path).get(scope, feat, "0001-01-01", now)
+        except UnknownScopeError:
+            return None
+        except DataAPIError:
+            return []
+
+    recs = _series(feature, ticker)
+    if recs is None:
+        recs = _series(feature, "_market") or []
+    pts, nonnum = [], None
+    for r in recs:
+        try:
+            pts.append([r["event_time"][:10], float(r["value"])])
         except (TypeError, ValueError):
-            nonnum = val                                      # JSON/text -> not a line
+            nonnum = r["value"]                               # JSON/text -> not a line
     if pts and nonnum is None:
         out = {"kind": "line", "feature": feature, "points": pts,
                "latest": pts[-1][1], "n": len(pts)}
@@ -303,26 +314,24 @@ def stock_signal(ticker: str, feature: str, db_path=DEFAULT_DB) -> dict:
         if feature.startswith("backtest.ret_"):        # per-point 95% PI half-width
             cif = feature.replace(".ret_", ".ci_ret_")
             ciby = {}
-            for et, val, _ in c.execute(
-                    "SELECT event_time, value, MAX(ingested_at) FROM feature_values "
-                    "WHERE feature=? AND scope=? GROUP BY event_time", (cif, ticker)):
+            for r in (_series(cif, ticker) or []):
                 try:
-                    ciby[et[:10]] = float(val)
+                    ciby[r["event_time"][:10]] = float(r["value"])
                 except (TypeError, ValueError):
                     pass
             if ciby:
                 out["ciseries"] = [ciby.get(d) for d, _ in pts]
         return out
     # structured / json latest
-    latest = rows[-1] if rows else None
-    v = latest[1] if latest else None
+    latest = recs[-1] if recs else None
+    v = latest["value"] if latest else None
     if isinstance(v, str) and v[:1] in "{[":
         try:
             v = json.loads(v)
         except Exception:
             pass
     return {"kind": "json", "feature": feature,
-            "event_time": latest[0] if latest else None, "value": v}
+            "event_time": latest["event_time"] if latest else None, "value": v}
 
 
 def _modeling_dir():

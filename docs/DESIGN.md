@@ -194,6 +194,26 @@ done, regardless of whether its happy path works:
   everything that invocation wrote. Paired with its runs.jsonl record
   (status/metrics/cost), every trigger has complete observability: what ran,
   what it cost, what it produced.
+
+##### Gated read path — `DataAPI` (the only sanctioned way to retrieve data)
+  Consumers (the dashboard, S2–S4, notebooks, ad-hoc scripts) do **not** open
+  the DB or write raw SQL against `feature_values`. They call one API:
+  `DataAPI(db).get(ticker, signal, time_start, time_end, as_known_at=None)` →
+  `[{event_time, value, ingested_at}, …]`, ascending, one latest-ingested
+  version per event_time (same PIT semantics as `read_asof`). The boundary is
+  enforced, not just documented:
+  - the DB file is **chmod 600** (owner-only) — `FeatureStore` sets it on every
+    open and `DataAPI`/`harden_db_permissions()` re-assert it, so no other user
+    can open the SQLite file directly;
+  - `DataAPI` opens the handle **read-only** (`mode=ro`) — a consumer physically
+    cannot mutate the store through it;
+  - `signal` is validated against the **registry whitelist**, `ticker` is
+    format- and existence-checked, the time range is parsed/ordered, and every
+    query is **parameterized** — no unregistered field, no SQL injection, no
+    query wider than one (ticker, signal). `signals()`/`scopes()` list what is
+    retrievable. Honest limit: SQLite has no engine-level ACL, so for same-user
+    processes this is an application boundary + file-permission lock, not a
+    kernel-enforced one. Tests: `tests/test_data_api.py`.
 - `src/core.py` (trigger half): `Trigger` context manager mints `trigger_id`,
   appends to `runtime/logs/cost_ledger.jsonl` (per billable action) and
   `runtime/logs/runs.jsonl` (per run — **including crashed runs**, logged with
