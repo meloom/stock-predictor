@@ -27,14 +27,18 @@ SIGNAL_LABELS = {
     "fundamental.statements": "Fundmls", "earnings.next_date": "NextEarn",
 }
 # signals shown in the per-ticker drill-down (feature, label)
+# drill-down features -> the SAME typed-table names used by the inspector + coverage
+# matrix (one canonical name per signal, no kind/label drift). `bars` covers OHLCV
+# incl. volume — volume is a column of bars, not its own signal.
 DRILL_FEATURES = [
-    ["price.close", "Bars"], ["price.volume", "Volume"], ["price.current", "Quote"],
-    ["short.pct_float", "Short interest"], ["opt.implied_move", "Implied move"],
-    ["fundamental.analyst_snapshot", "Analyst"], ["fundamental.statements", "Fundamentals"],
-    ["earnings.next_date", "Next earnings date"],       # S1 raw; days_to_earnings is S2
-    ["earnings.report_raw", "Earnings report (raw)"],   # S1 raw; earnings.analysis is S2
-    ["insider.transactions_raw", "Insider transactions"],
-    ["analyst.revisions_raw", "Analyst revisions"],
+    ["price.close", "bars"], ["price.current", "quotes"],
+    ["short.pct_float", "short_interest"], ["opt.implied_move", "options_implied"],
+    ["fundamental.analyst_snapshot", "analyst_snapshot"],
+    ["fundamental.statements", "fundamentals"],
+    ["earnings.next_date", "earnings_calendar"],        # S1 raw; days_to_earnings is S2
+    ["earnings.report_raw", "earnings_reports"],        # S1 raw; earnings.analysis is S2
+    ["insider.transactions_raw", "insider_transactions"],
+    ["analyst.revisions_raw", "analyst_revisions"],
 ]
 
 
