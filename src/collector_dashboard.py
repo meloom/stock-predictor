@@ -117,21 +117,9 @@ def render(report: dict, tickers: list[str]) -> str:
                   f'<td class="detail muted">{k.get("detail","")}</td>'
                   f'<td>{due}{err}</td><td class="mono muted">{last}</td></tr>')
 
-    # heatmap with per-cell time detail — each column colored by its OWN freshness SLA
-    head = "".join(f'<th class="rot"><span>{c["label"]}</span></th>' for c in cols)
-    body = ""
+    # ticker order for the selectors — tickers with data first (the per-ticker timeline
+    # coverage replaced the old tickers×signals freshness heatmap)
     shown = [t for t in tickers if t in mat] + [t for t in tickers if t not in mat]
-    for t in shown:
-        cells = ""; row = mat.get(t, {})
-        for c in cols:
-            cell = row.get(c["label"]); sec = cell["fresh_sec"] if cell else None
-            if cell:
-                span = f'{cell["first"]}→{cell["last"]}' if cell["first"] != cell["last"] else cell["first"]
-                tip = f'{t} · {c["label"]} — {cell["count"]} pts · {span} · collected {_dur(sec)} ago'
-            else:
-                tip = f'{t} · {c["label"]} — no data yet'
-            cells += f'<td class="cell {_fresh_class_sla(sec, c["sla"])}" title="{tip}"></td>'
-        body += f'<tr><th class="tick mono">{t}</th>{cells}</tr>'
 
     # full queue schedule — per signal × ticker × time
     # hourly collection activity per source (last 72h)
@@ -226,12 +214,39 @@ def render(report: dict, tickers: list[str]) -> str:
     drill_json = _json.dumps(DRILL_FEATURES)
     tbl_opts = "".join(f"<option>{t}</option>" for t in TYPED_SCHEMA)
 
+    # ── universe-wide S1 coverage matrix (server-rendered; typed store; weekly) ──
+    sc = report.get("s1_coverage", {"weeks": [], "signals": [], "universe": 0})
+    U = sc["universe"]; wl = sc["weeks"]; nW = len(wl)
+    whead = "".join(
+        f'<i class="s1hc">{wl[i][5:] if (nW - 1 - i) % 3 == 0 else ""}</i>' for i in range(nW))
+    s1rows = ""
+    for s in sc["signals"]:
+        cells = ""
+        for i, f in enumerate(s["cells"]):
+            h = int(f * 120)                                   # 0=red → 120=green
+            lab = ("live" if s["denom"] == 1 else f'{round(f * U)}/{U}')
+            cells += (f'<i class="s1c" style="background:hsl({h},55%,44%)" '
+                      f'title="week of {wl[i]} — {lab} ({f:.0%})"></i>')
+        cov = "market" if s["denom"] == 1 else f'{s["covered"]}/{U}'
+        cov_cls = "ok" if (s["denom"] == 1 or s["covered"] >= 0.9 * U) else \
+                  ("warn" if s["covered"] >= 0.5 * U else "bad")
+        s1rows += (f'<div class="s1row"><div class="s1lab">'
+                   f'<span class="s1feat">{s["kind"]}</span>'
+                   f'<span class="s1cad">{s["cadence"]}·{s["source"]}</span></div>'
+                   f'<div class="s1cov {cov_cls}">{cov}</div>'
+                   f'<div class="s1strip">{cells}</div></div>')
+    s1cov_html = (f'<div class="s1wrap"><div class="s1grid">'
+                  f'<div class="s1row s1head"><div class="s1lab">signal</div>'
+                  f'<div class="s1cov">covered</div><div class="s1strip">{whead}</div></div>'
+                  f'{s1rows}</div></div>')
+
     return f"""{_CSS}
 <main>
   <header>
     <div class="brand"><span class="live"></span>S1 Data Collector</div>
     <div class="gen mono">live · {report["generated_at"][:19].replace("T", " ")} UTC</div>
   </header>
+  {_flow_nav("S1")}
   <section class="cards">{card_html}</section>
   <section class="quota"><span class="lbl">Rate-limit quota</span>{quota}</section>
   <section class="panel"><h2>Download rate &amp; failures per source <span class="muted">— bars = rows collected per hour (last 72h). Strip below each bar: green = attempts ok, <b style="color:#e5484d">red = a collection FAILED that hour</b>, grey = idle (nothing due). Hover for detail.</span></h2>
@@ -246,11 +261,13 @@ def render(report: dict, tickers: list[str]) -> str:
     <th>What we hold vs. expected</th><th>State</th><th>Last run</th></tr></thead><tbody>{qrows}</tbody></table>
   </section>
 
-  <section class="panel"><h2>Coverage &amp; freshness <span class="muted">— {len(shown)} tickers × {len(cols)} signals · each column colored by its OWN freshness SLA (e.g. Quote: ≤5m green, ≤30m amber, then red) · hover for counts, span &amp; age</span></h2>
-    <div class="legend"><span><i class="cell fresh"></i>fresh</span><span><i class="cell aging"></i>aging</span>
-    <span><i class="cell stale"></i>stale</span><span><i class="cell miss"></i>missing</span></div>
-    <div class="heatwrap"><table class="heat"><thead><tr><th class="corner"></th>{head}</tr></thead>
-    <tbody>{body}</tbody></table></div>
+  <section class="panel"><h2>Signal coverage across the universe
+    <span class="muted">— <b>S1 raw collection only</b> (S2+ derived signals live on their own dashboards).
+    Weekly buckets, measured from the typed store. <b>covered</b> = tickers we hold this signal for;
+    each cell = share of the {U} tickers with a record that week (<span style="color:hsl(120,55%,44%)">green</span>=all →
+    <span style="color:hsl(0,55%,44%)">red</span>=none). Event signals are sparse by nature — read their
+    <b>covered</b> count, not weekly density. Hover a cell for counts.</span></h2>
+    {s1cov_html}
   </section>
 
   <section class="panel"><h2>Queue schedule <span class="muted">— every task by ticker × signal × next-run ({len(report["queue"])} tasks)</span></h2>
@@ -392,6 +409,28 @@ td.detail{font-size:12px;color:var(--mut);max-width:340px}
 .cell.fresh{background:var(--fresh)}.cell.aging{background:var(--aging)}.cell.stale{background:var(--stale)}
 .cell.miss{background:var(--miss);border:1px solid var(--line)}
 .filter{width:100%;max-width:340px;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
+/* per-ticker signal timeline coverage */
+.cvg{color:var(--fresh)}.cvr{color:var(--stale)}.cvn{color:var(--mut)}
+.cvctrl{display:flex;gap:14px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.cvctrl .filter{margin-bottom:0;max-width:200px}
+.cvlegend{display:flex;gap:16px;font-size:12px;color:var(--mut);margin-bottom:10px}
+.cvlegend span{display:inline-flex;align-items:center;gap:6px}
+.cvlegend .cvc{width:12px;height:12px;border-radius:2px}
+.cvc.g{background:var(--fresh)}.cvc.r{background:var(--stale)}.cvc.n{background:var(--miss);border:1px solid var(--line)}
+.cvwrap{border:1px solid var(--line);border-radius:8px;max-height:660px;overflow-y:auto;overflow-x:hidden}
+.cvgrid{width:100%}
+.cvrow{display:flex;align-items:stretch;height:16px}
+.cvrow.cvhead{height:22px;position:sticky;top:0;z-index:2;background:var(--panel)}
+.cvlab{flex:0 0 250px;width:250px;display:flex;justify-content:space-between;gap:8px;align-items:center;
+  padding:0 10px;font-size:11px;position:sticky;left:0;background:var(--panel);overflow:hidden}
+.cvfeat{font-family:ui-monospace,monospace;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cvmeta{color:var(--mut);font-size:10px;white-space:nowrap;flex:0 0 auto;font-variant-numeric:tabular-nums}
+.cvstrip{flex:1 1 auto;display:flex;position:relative;min-width:0;align-items:center}
+.cvc{flex:1 1 0;min-width:0;height:12px;background:var(--miss)}
+.cvhc{flex:1 1 0;min-width:0;position:relative}
+.cvstrip.dim .cvc.n{opacity:.4}
+.cvmo{position:absolute;top:3px;left:0;font-size:9px;color:var(--mut);font-family:ui-monospace,monospace;
+  border-left:1px solid var(--line);padding-left:2px;white-space:nowrap;height:15px}
 .hwrap{overflow-x:auto;padding-bottom:4px}
 .hchart{display:block}
 .hgrid{stroke:var(--line);stroke-width:1;stroke-dasharray:2 3}

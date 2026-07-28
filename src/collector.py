@@ -44,6 +44,29 @@ BACKFILL_PRIORITY_BOOST = 1000   # backfill tasks run ahead of every routine ref
 # then keep accruing forward. History-mode fetch ranges and coverage expectations are
 # measured against this start, NOT a rolling window.
 COLLECTION_START = date(2025, 7, 1)
+
+# NYSE full-day closures within the collection window — a real market calendar so a
+# market-open day with no data can be shown RED (weekends + these are simply not
+# expected). Extend this list as the window advances.
+NYSE_HOLIDAYS = {
+    "2025-07-04", "2025-09-01", "2025-11-27", "2025-12-25",
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03",
+}
+
+
+def trading_days(start: date = COLLECTION_START, end: date | None = None) -> list[str]:
+    """Market-open days (ISO strings) in [start, end]: weekdays minus NYSE holidays.
+    Independent of our data, so a full-outage day is still counted as expected."""
+    end = end or date.today()
+    out, d = [], start
+    while d <= end:
+        if d.weekday() < 5 and d.isoformat() not in NYSE_HOLIDAYS:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
 # Native signal FREQUENCY taxonomy. Fixed cadences (5min..weekly) are regular time
 # series measured by depth; 'event' is irregular/undefined (collect all new from the
 # last watermark to now); 'snapshot' is point-in-time state that accrues forward.
@@ -63,6 +86,13 @@ KIND_TABLE = {
     "earn_date": "earnings_calendar", "insider": "insider_transactions",
     "analyst_revisions": "analyst_revisions", "statements": "fundamentals",
     "sec_filings": "sec_filings", "xbrl": "xbrl_financials", "transcript": "transcripts",
+}
+# the per-record DATE column of each typed table — coverage_matrix buckets S1 records by it
+S1_DATECOL = {
+    "bars": "bar_ts", "quote": "quote_ts", "macro": "date", "short": "settlement_date",
+    "implied_move": "snap_date", "earn_report": "report_date", "earn_date": "snap_date",
+    "insider": "txn_date", "analyst_revisions": "revision_date", "statements": "period_end",
+    "sec_filings": "filing_date", "xbrl": "filed", "transcript": "call_date",
 }
 
 _QUEUE_SCHEMA = """
@@ -637,7 +667,66 @@ class Collector:
                             "by_mode": {m: round(sum(v) / len(v)) for m, v in by_mode.items()},
                             "data_points": total_rows, "due_now": self.status()["due_now"]},
                 "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix,
-                "queue": queue, "hourly": self.hourly_sources()}
+                "queue": queue, "hourly": self.hourly_sources(),
+                "s1_coverage": self.coverage_matrix()}
+
+    def coverage_matrix(self, weeks: int = 13) -> dict:
+        """UNIVERSE-WIDE S1 coverage over weekly buckets — the /data-collection view.
+        For every S1 raw-collection signal, per week, the FRACTION of the universe that
+        has ≥1 record, measured from the TYPED store where S1 data actually lands (so it
+        can NEVER disagree with the per-kind 'Coverage vs expectation' table, which reads
+        the same store). S1 only — S2+ are derived/triggered and live on their own
+        dashboards, so they are deliberately excluded here."""
+        end = self._now().date()
+        start = end - timedelta(weeks=weeks)
+        start = start - timedelta(days=start.weekday())        # anchor to Monday
+        n = (end - start).days // 7 + 1
+        week_starts = [start + timedelta(weeks=i) for i in range(n)]
+        labels = [ws.isoformat() for ws in week_starts]
+
+        def bucket(dstr):
+            try:
+                i = (date.fromisoformat(dstr[:10]) - start).days // 7
+            except Exception:
+                return None
+            return i if 0 <= i < n else None
+
+        universe = list(UNIVERSE)
+        U = len(universe)
+        ts = _typed()
+        start_iso = start.isoformat()
+        signals = []
+        for kind, k in self.kinds.items():
+            if k.get("stage") != "S1":
+                continue
+            table, dc = KIND_TABLE.get(kind), S1_DATECOL.get(kind)
+            if not table or not dc:
+                continue
+            market = k["scope"] == "market"
+            id_col = "name" if market else "ticker"
+            buckets = [set() for _ in range(n)]
+            try:
+                for ent, dstr in ts.c.execute(
+                        f"SELECT {id_col}, substr({dc},1,10) FROM {table} "
+                        f"WHERE substr({dc},1,10) >= ?", (start_iso,)):
+                    bi = bucket(dstr)
+                    if bi is not None:
+                        buckets[bi].add(ent)
+            except Exception:
+                pass
+            if market:                                         # market-scope: present/absent
+                cells = [1.0 if buckets[i] else 0.0 for i in range(n)]
+            else:
+                cells = [round(len(buckets[i]) / U, 3) for i in range(n)]
+            covered = len(set().union(*buckets)) if buckets else 0
+            signals.append({"kind": kind, "source": k["source"], "cadence": k["frequency"],
+                            "cells": cells, "covered": covered,
+                            "denom": (1 if market else U)})
+        order = {"5min": 0, "intraday": 0, "hourly": 0, "daily": 1, "weekly": 1,
+                 "snapshot": 2, "event": 3}
+        signals.sort(key=lambda s: (order.get(s["cadence"], 4), s["kind"]))
+        return {"weeks": labels, "n_weeks": n, "universe": U,
+                "window_start": start_iso, "signals": signals}
 
     def hourly_sources(self, hours: int = 72) -> dict:
         """Per-SOURCE collection activity, bucketed by hour (from each source's typed-table
@@ -804,11 +893,24 @@ def _h_short(scope, store, tid):
 def _h_analyst(scope, store, tid):
     import s1_data
     _reg_s1(store)
-    an = s1_data.fetch_analyst_snapshot(scope)
-    if an is None:
-        return 0, 1
-    store.write("fundamental.analyst_snapshot", scope, _today(), an, trigger_id=tid)
-    return 1, 1
+    an = s1_data.fetch_analyst_snapshot(scope) or {}
+    hist = s1_data.fetch_analyst_history(scope) or []
+    n = 0
+    if hist:
+        # ONE consistent recommendation_mean method across the whole series (reconstructed
+        # from `recommendations`), so back-dated months and today don't jump between two
+        # yfinance metrics. Today's point also carries info-only fields (eps, target).
+        today = {k: an.get(k) for k in ("forward_eps", "trailing_eps", "target_mean_price")}
+        today.update(hist[0]["snap"])                      # rec_mean, n_analysts, dist (0m)
+        store.write("fundamental.analyst_snapshot", scope, hist[0]["event_time"], today, tid)
+        n += 1
+        for h in hist[1:]:                                 # earlier months (-1m,-2m,-3m)
+            store.write("fundamental.analyst_snapshot", scope, h["event_time"], h["snap"], tid)
+            n += 1
+    elif an:                                               # fallback: info snapshot only
+        store.write("fundamental.analyst_snapshot", scope, _today(), an, trigger_id=tid)
+        n = 1
+    return (n, 2) if n else (0, 2)
 
 
 def _h_statements(scope, store, tid):

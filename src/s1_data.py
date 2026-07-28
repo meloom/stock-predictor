@@ -298,6 +298,45 @@ def fetch_analyst_snapshot(ticker: str) -> dict | None:
     return snap if any(v is not None for v in snap.values()) else None
 
 
+def fetch_analyst_history(ticker: str) -> list[dict] | None:
+    """EARLIER analyst signal (not just today's snapshot). yfinance `recommendations`
+    gives the consensus distribution for the last 4 monthly buckets (0m,-1m,-2m,-3m);
+    we reconstruct the equivalent `recommendation_mean` (1=strongBuy … 5=strongSell,
+    same scale as info.recommendationMean) for each and BACK-DATE it, so ~4 months of
+    consensus history land immediately instead of only accruing forward. Returns a list
+    of {event_time, snap} newest→oldest, or None."""
+    import datetime as _dt
+    import yfinance as yf
+    try:
+        rec = yf.Ticker(ticker).recommendations
+    except Exception:
+        return None
+    if rec is None or getattr(rec, "empty", True):
+        return None
+    W = {"strongBuy": 1, "buy": 2, "hold": 3, "sell": 4, "strongSell": 5}
+    today = _dt.date.today()
+    out = []
+    for _, row in rec.iterrows():
+        period = str(row.get("period", ""))
+        if not period.endswith("m"):
+            continue
+        try:
+            k = abs(int(period[:-1]))                      # '0m'->0, '-1m'->1 …
+        except ValueError:
+            continue
+        counts = {g: int(row.get(g) or 0) for g in W}
+        n = sum(counts.values())
+        if n == 0:
+            continue
+        rec_mean = sum(W[g] * c for g, c in counts.items()) / n
+        # back-date each bucket ~30*k days ago (month-ago consensus)
+        et = (today - _dt.timedelta(days=30 * k)).isoformat()
+        out.append({"event_time": et, "snap": {
+            "recommendation_mean": round(rec_mean, 3), "n_analysts": n,
+            "dist": counts, "source": "recommendations_history"}})
+    return out or None
+
+
 def fetch_short_interest(ticker: str) -> dict | None:
     """Short-interest snapshot from the latest FINRA bi-monthly print (via yfinance
     .info). Returns event_time = the SETTLEMENT date the print refers to

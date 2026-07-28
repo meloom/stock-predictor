@@ -3,15 +3,28 @@
 | | |
 |---|---|
 | **Collector kind** | `analyst` |
-| **Source** | yfinance `Ticker.info` (`forwardEps`, `numberOfAnalystOpinions`, `recommendationMean`, `targetMeanPrice`) |
+| **Source** | yfinance `Ticker.info` (eps/target) **+ `Ticker.recommendations`** (4-month consensus history) |
 | **Frequency** | `snapshot` · daily poll (priority 40) |
 | **Typed table** | *(none yet — stored as JSON in `feature_values`)* |
 | **S1 raw feature** | `fundamental.analyst_snapshot` |
-| **Source timestamp column** | ingestion day (current-state snapshot) |
+| **Source timestamp column** | `event_time` — today for the live point, **back-dated ~30·k days** for each earlier month |
+
+## EARLIER signal (not just today) — implemented
+The daily `Ticker.info` snapshot is current-state only. To get *earlier* consensus we
+also read yfinance **`Ticker.recommendations`**, which returns the analyst distribution
+(strongBuy/buy/hold/sell/strongSell) for the last **4 monthly buckets** (`0m,-1m,-2m,-3m`).
+We reconstruct a `recommendation_mean` (1=strongBuy … 5=strongSell) from each bucket and
+**back-date** it, so ~3 months of prior consensus land immediately instead of only
+accruing forward (`s1_data.fetch_analyst_history`). The whole `recommendation_mean` series
+uses this ONE reconstructed method (not `info.recommendationMean`, which is a different
+metric) so there is no artificial jump between back-dated and live points.
+
+Deeper history is available from **`Ticker.upgrades_downgrades`** (years of dated
+rating + price-target changes) — collected separately as [`analyst_revisions`](analyst_revisions.md).
 
 ## Downstream consumers
-- Consensus level (target price, recommendation mean) features.
-- A **revision time series** accrues going forward (yfinance can't backfill consensus).
+- Consensus level + **trend** (target price, reconstructed recommendation mean, the raw
+  distribution `dist`) — now with ~4 months of history per ticker on first collection.
 
 ## Schema
 > **Schema debt:** this signal currently writes a JSON blob to `feature_values`, not a
@@ -28,7 +41,14 @@ CREATE TABLE analyst_snapshot (
 
 ## Example collected raw data (current JSON shape)
 ```json
-{"forward_eps":7.42,"n_analysts":41,"recommendation_mean":2.0,"target_mean_price":355.0}
+// today's point (event_time = today): info fields + reconstructed consensus
+{"forward_eps":7.42,"trailing_eps":6.6,"target_mean_price":355.0,
+ "recommendation_mean":2.383,"n_analysts":47,
+ "dist":{"strongBuy":6,"buy":23,"hold":14,"sell":2,"strongSell":2}}
+// a back-dated earlier month (event_time = ~30 days ago):
+{"recommendation_mean":2.333,"n_analysts":48,
+ "dist":{"strongBuy":7,"buy":23,"hold":15,"sell":1,"strongSell":2},
+ "source":"recommendations_history"}
 ```
 
 ## After processing

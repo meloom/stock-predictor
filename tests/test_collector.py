@@ -175,3 +175,30 @@ def test_status_reports_quota_and_counts(col):
     s = col.status()
     assert s["by_status"]["pending"] == 2
     assert "fake" in s["quota"]
+
+# ── trading calendar + per-ticker coverage timeline ─────────────────────────────
+from datetime import date
+from collector import trading_days, NYSE_HOLIDAYS
+
+
+def test_trading_days_excludes_weekends_and_holidays():
+    days = trading_days(date(2026, 1, 1), date(2026, 1, 5))
+    # Jan 1 = New Year holiday, Jan 3/4 = weekend -> only Fri 2nd + Mon 5th
+    assert days == ["2026-01-02", "2026-01-05"]
+    assert "2026-07-03" in NYSE_HOLIDAYS          # Independence Day (observed)
+
+
+def test_coverage_matrix_structure_and_weekly_buckets(col):
+    m = col.coverage_matrix(weeks=4)
+    assert m["universe"] > 0
+    assert m["n_weeks"] == len(m["weeks"]) >= 4
+    assert m["weeks"] == sorted(m["weeks"])           # Monday-anchored, ascending
+
+
+def test_coverage_matrix_is_s1_only(col):
+    # the fixture's fake 'val' kind has no typed table -> never a coverage row;
+    # coverage_matrix only surfaces S1 kinds that map to a typed store table.
+    m = col.coverage_matrix(weeks=4)
+    assert all(s["kind"] != "val" for s in m["signals"])
+    for s in m["signals"]:
+        assert s["cadence"]                          # every row carries its native frequency
