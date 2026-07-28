@@ -37,6 +37,11 @@ SCHEMA = {
                                           "insider", "is_sale"]),
     "analyst_revisions": ("revision_date", ["ticker", "firm", "action",
                                             "from_grade", "to_grade"]),
+    # consensus SNAPSHOT (level + distribution), one row per snapshot date; back-dated
+    # months land here too so the whole series is queryable like every other S1 signal.
+    "analyst_snapshot": ("snap_date", ["ticker", "recommendation_mean", "n_analysts",
+                                       "forward_eps", "trailing_eps", "target_mean_price",
+                                       "dist_json"]),
     "fundamentals": ("publish_date", ["ticker", "period_end", "revenue", "net_income",
                                       "total_equity", "gross_profit", "total_assets",
                                       "free_cash_flow", "trailing_eps",
@@ -59,7 +64,7 @@ _TEXT = {"ticker", "name", "session", "expiry", "position", "insider", "firm",
          "txn_date", "revision_date", "publish_date", "raw_json",
          "cik", "form", "period_of_report", "accession", "url", "raw_text",
          "filing_date", "concept", "fp", "unit", "filed", "call_date", "quarter",
-         "source"}
+         "source", "dist_json"}
 # per-table PRIMARY KEY (entity + timestamp, plus disambiguators for lists)
 _PK = {
     "bars": ["ticker", "bar_ts"], "quotes": ["ticker", "quote_ts"],
@@ -69,6 +74,7 @@ _PK = {
     "earnings_calendar": ["ticker", "snap_date"],
     "insider_transactions": ["ticker", "txn_date", "insider", "value"],
     "analyst_revisions": ["ticker", "revision_date", "firm", "action"],
+    "analyst_snapshot": ["ticker", "snap_date"],
     "fundamentals": ["ticker", "publish_date"],
     "sec_filings": ["ticker", "accession"],
     "xbrl_financials": ["ticker", "concept", "period_end", "form"],

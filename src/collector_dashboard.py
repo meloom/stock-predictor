@@ -231,7 +231,7 @@ def render(report: dict, tickers: list[str]) -> str:
         cov_cls = "ok" if (s["denom"] == 1 or s["covered"] >= 0.9 * U) else \
                   ("warn" if s["covered"] >= 0.5 * U else "bad")
         s1rows += (f'<div class="s1row"><div class="s1lab">'
-                   f'<span class="s1feat">{s["kind"]}</span>'
+                   f'<span class="s1feat">{s["signal"]}</span>'
                    f'<span class="s1cad">{s["cadence"]}·{s["source"]}</span></div>'
                    f'<div class="s1cov {cov_cls}">{cov}</div>'
                    f'<div class="s1strip">{cells}</div></div>')

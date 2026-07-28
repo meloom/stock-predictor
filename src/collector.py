@@ -86,6 +86,7 @@ KIND_TABLE = {
     "earn_date": "earnings_calendar", "insider": "insider_transactions",
     "analyst_revisions": "analyst_revisions", "statements": "fundamentals",
     "sec_filings": "sec_filings", "xbrl": "xbrl_financials", "transcript": "transcripts",
+    "analyst": "analyst_snapshot",
 }
 # the per-record DATE column of each typed table — coverage_matrix buckets S1 records by it
 S1_DATECOL = {
@@ -93,6 +94,7 @@ S1_DATECOL = {
     "implied_move": "snap_date", "earn_report": "report_date", "earn_date": "snap_date",
     "insider": "txn_date", "analyst_revisions": "revision_date", "statements": "period_end",
     "sec_filings": "filing_date", "xbrl": "filed", "transcript": "call_date",
+    "analyst": "snap_date",
 }
 
 _QUEUE_SCHEMA = """
@@ -719,12 +721,14 @@ class Collector:
             else:
                 cells = [round(len(buckets[i]) / U, 3) for i in range(n)]
             covered = len(set().union(*buckets)) if buckets else 0
-            signals.append({"kind": kind, "source": k["source"], "cadence": k["frequency"],
-                            "cells": cells, "covered": covered,
+            # display name = the TYPED TABLE name, so this matches the Raw-data-inspector
+            # dropdown and the typed store exactly (no kind-vs-table name drift).
+            signals.append({"signal": table, "kind": kind, "source": k["source"],
+                            "cadence": k["frequency"], "cells": cells, "covered": covered,
                             "denom": (1 if market else U)})
         order = {"5min": 0, "intraday": 0, "hourly": 0, "daily": 1, "weekly": 1,
                  "snapshot": 2, "event": 3}
-        signals.sort(key=lambda s: (order.get(s["cadence"], 4), s["kind"]))
+        signals.sort(key=lambda s: (order.get(s["cadence"], 4), s["signal"]))
         return {"weeks": labels, "n_weeks": n, "universe": U,
                 "window_start": start_iso, "signals": signals}
 
@@ -891,26 +895,35 @@ def _h_short(scope, store, tid):
 
 
 def _h_analyst(scope, store, tid):
+    import json as _json
     import s1_data
     _reg_s1(store)
     an = s1_data.fetch_analyst_snapshot(scope) or {}
     hist = s1_data.fetch_analyst_history(scope) or []
-    n = 0
+    # Build the series (today + back-dated months) ONCE, then write to BOTH the typed
+    # `analyst_snapshot` table (so it shows up like every other S1 signal — inspector,
+    # coverage matrix) AND feature_values (so S2 reads it). One consistent method.
+    points = []                                            # (event_time, merged_snap)
     if hist:
-        # ONE consistent recommendation_mean method across the whole series (reconstructed
-        # from `recommendations`), so back-dated months and today don't jump between two
-        # yfinance metrics. Today's point also carries info-only fields (eps, target).
         today = {k: an.get(k) for k in ("forward_eps", "trailing_eps", "target_mean_price")}
-        today.update(hist[0]["snap"])                      # rec_mean, n_analysts, dist (0m)
-        store.write("fundamental.analyst_snapshot", scope, hist[0]["event_time"], today, tid)
-        n += 1
-        for h in hist[1:]:                                 # earlier months (-1m,-2m,-3m)
-            store.write("fundamental.analyst_snapshot", scope, h["event_time"], h["snap"], tid)
-            n += 1
-    elif an:                                               # fallback: info snapshot only
-        store.write("fundamental.analyst_snapshot", scope, _today(), an, trigger_id=tid)
-        n = 1
-    return (n, 2) if n else (0, 2)
+        today.update(hist[0]["snap"])
+        points.append((hist[0]["event_time"], today))
+        points += [(h["event_time"], h["snap"]) for h in hist[1:]]
+    elif an:
+        points.append((_today(), an))
+    if not points:
+        return 0, 2
+    typed = [{"ticker": scope, "snap_date": et,
+              "recommendation_mean": s.get("recommendation_mean"),
+              "n_analysts": s.get("n_analysts"), "forward_eps": s.get("forward_eps"),
+              "trailing_eps": s.get("trailing_eps"),
+              "target_mean_price": s.get("target_mean_price"),
+              "dist_json": _json.dumps(s["dist"]) if s.get("dist") else None}
+             for et, s in points]
+    _typed().put_many("analyst_snapshot", typed)           # TYPED (consistent with all S1)
+    for et, s in points:                                   # feature_values (S2 consumer)
+        store.write("fundamental.analyst_snapshot", scope, et, s, trigger_id=tid)
+    return len(points), 2
 
 
 def _h_statements(scope, store, tid):
