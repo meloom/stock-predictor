@@ -114,3 +114,17 @@ def test_read_panel_all_scopes(store):
     store.write("price.close", "MSFT", "2026-07-24", 2.0, trigger_id="t")
     panel = store.read_panel("price.close", "2026-07-24")
     assert set(panel) == {"AAPL", "MSFT"}
+
+
+def test_write_if_changed_dedups(store):
+    _register_close(store)
+    assert store.write_if_changed("price.close", "AAPL", "2026-07-24", 100.0, "t") is True
+    # same value, same event_time -> skipped (no new bitemporal row)
+    assert store.write_if_changed("price.close", "AAPL", "2026-07-24", 100.0, "t") is False
+    # changed value -> written
+    assert store.write_if_changed("price.close", "AAPL", "2026-07-24", 101.0, "t") is True
+    assert store.read_asof("price.close", "AAPL", "2026-07-24")["value"] == 101.0
+    n = store._conn.execute(
+        "SELECT COUNT(*) FROM feature_values WHERE feature='price.close' AND scope='AAPL'"
+    ).fetchone()[0]
+    assert n == 2   # two distinct values, not three writes

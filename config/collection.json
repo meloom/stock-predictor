@@ -1,0 +1,22 @@
+{
+  "_comment": "S1 collection policy — the SINGLE source of truth for per-signal cadence + scheduling. collector.py reads this at startup; reconcile() re-syncs live tasks to it every 5 min, so editing here changes cadence with no code change. interval_sec = seconds between polls.",
+  "collection_window_local": [9, 23],
+  "timezone": "Europe/London",
+  "live_only": ["quote"],
+  "signals": {
+    "quote":             {"interval_sec": 3600,  "fresh_sla": [3600, 7200], "note": "live session-aware price; LIVE-only, highest priority"},
+    "bars":              {"interval_sec": 3600,  "note": "OHLCV incl. volume (daily EOD on the basic plan; hourly when available)"},
+    "short":             {"interval_sec": 3600,  "note": "short interest; upstream is bi-monthly, polled hourly to catch a new print fast (handler dedups)"},
+    "statements":        {"interval_sec": 3600,  "note": "fundamentals; upstream is quarterly, polled hourly to catch a new filing fast (handler dedups)"},
+    "analyst":           {"interval_sec": 3600,  "note": "analyst consensus snapshot + back-dated history"},
+    "insider":           {"interval_sec": 86400, "note": "insider transactions; event-driven, daily"},
+    "sec_filings":       {"interval_sec": 86400, "note": "SEC filings text; event-driven, daily"},
+    "macro":             {"interval_sec": 86400, "note": "market-level macro series, daily"},
+    "implied_move":      {"interval_sec": 86400, "note": "options-implied move snapshot, daily"},
+    "analyst_revisions": {"interval_sec": 86400, "note": "dated rating/PT changes, daily"},
+    "earn_date":         {"interval_sec": 86400, "note": "next-earnings date snapshot, daily"},
+    "earn_report":       {"interval_sec": 86400, "note": "earnings report raw, event-driven, daily"},
+    "xbrl":              {"interval_sec": 86400, "note": "XBRL financials, event-driven, daily"},
+    "transcript":        {"interval_sec": 86400, "note": "earnings-call transcripts (PAID, blocked until key set)"}
+  }
+}

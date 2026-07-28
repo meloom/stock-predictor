@@ -23,7 +23,7 @@ def isolated(tmp_path, monkeypatch):
 
 @pytest.fixture
 def col(tmp_path):
-    clock = Clock(datetime(2026, 7, 1, tzinfo=timezone.utc))
+    clock = Clock(datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc))  # 14:00 London: in-window
     store = FeatureStore(tmp_path / "f.db")
     store.register("test.value", "float", "ticker", "S1", "daily", "pit")
     c = Collector(tmp_path / "f.db", store=store, now_fn=clock)
@@ -202,3 +202,33 @@ def test_coverage_matrix_is_s1_only(col):
     assert all(s["kind"] != "val" for s in m["signals"])
     for s in m["signals"]:
         assert s["cadence"]                          # every row carries its native frequency
+
+
+def test_cadence_comes_from_config():
+    import collector as C
+    d = C.default_collector()
+    # config/collection.json sets these; the live kinds must match it exactly.
+    assert d.kinds["quote"]["interval"] == C.SIGNAL_CFG["quote"]["interval_sec"] == 3600
+    assert d.kinds["insider"]["interval"] == C.SIGNAL_CFG["insider"]["interval_sec"] == 86400
+    assert "quote" in C.LIVE_ONLY
+
+
+def test_collection_window_gate_offhours_runs_only_backfill(col):
+    # 03:00 Europe/London (BST) == 02:00 UTC -> OUTSIDE the 09:00-23:00 window
+    col.clock.t = datetime(2026, 7, 1, 2, 0, tzinfo=timezone.utc)
+    col.seed(["AAPL"])                                # next_due = 02:00 (due now)
+    col.c.execute("UPDATE collection_tasks SET last_ok='2026-06-30' WHERE kind='val'")
+    col.c.commit()                                   # mark already-collected (not a gap)
+    assert col._in_window(col.clock()) is False
+    assert col.tick() is None                        # off-hours + not a gap -> skipped
+    # 14:00 London (13:00 UTC) is INSIDE the window -> the still-due refresh runs
+    col.clock.t = datetime(2026, 7, 1, 13, 0, tzinfo=timezone.utc)
+    assert col._in_window(col.clock()) is True
+    assert col.tick() is not None
+
+
+def test_offhours_still_backfills_never_collected_gap(col):
+    col.clock.t = datetime(2026, 7, 1, 2, 0, tzinfo=timezone.utc)   # off-hours FIRST
+    col.seed(["AAPL"])                               # fresh tasks due now, last_ok IS NULL
+    assert col._in_window(col.clock()) is False
+    assert col.tick() is not None                   # never-collected gap DOES backfill off-hours

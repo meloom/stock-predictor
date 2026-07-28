@@ -221,6 +221,8 @@ def render(report: dict, tickers: list[str]) -> str:
     # ── universe-wide S1 coverage matrix (server-rendered; typed store; weekly) ──
     sc = report.get("s1_coverage", {"weeks": [], "signals": [], "universe": 0})
     U = sc["universe"]; wl = sc["weeks"]; nW = len(wl)
+    _cwin = sc.get("collect_window", [9, 23])
+    cw = f'{_cwin[0]:02d}:00–{_cwin[1]:02d}:00 local'
     whead = "".join(
         f'<i class="s1hc">{wl[i][5:] if (nW - 1 - i) % 3 == 0 else ""}</i>' for i in range(nW))
     s1rows = ""
@@ -266,11 +268,13 @@ def render(report: dict, tickers: list[str]) -> str:
   </section>
 
   <section class="panel"><h2>Signal coverage across the universe
-    <span class="muted">— <b>S1 raw collection only</b> (S2+ derived signals live on their own dashboards).
-    Weekly buckets, measured from the typed store. <b>covered</b> = tickers we hold this signal for;
-    each cell = share of the {U} tickers with a record that week (<span style="color:hsl(120,55%,44%)">green</span>=all →
+    <span class="muted">— <b>S1 raw collection only</b> (S2+ live on their own dashboards).
+    Each row's cadence (<code>1h</code>/<code>1d</code>…) is the configured poll interval
+    (<code>config/collection.json</code>); collection window {cw}. Weekly buckets from the typed store.
+    <b>covered</b> = tickers we hold this signal for; each cell = share of the {U} tickers with a record
+    that week (<span style="color:hsl(120,55%,44%)">green</span>=all →
     <span style="color:hsl(0,55%,44%)">red</span>=none). Event signals are sparse by nature — read their
-    <b>covered</b> count, not weekly density. Hover a cell for counts.</span></h2>
+    <b>covered</b> count, not weekly density.</span></h2>
     {s1cov_html}
   </section>
 

@@ -43,51 +43,57 @@ A task only starts if `available(source) >= est_calls`. On success it is resched
 `next_due = now + interval_sec`. On failure it backs off (attempts++, `next_due`
 pushed out) and records `last_error` — an errored task **does not** count as collected.
 
-### 1.2 Priorities & the prioritized backfill band
+### 1.2 Per-signal cadence — driven by `config/collection.json`
 
-Lower number = runs first. Routine refresh priorities:
+Poll cadence is **configuration, not code.** `config/collection.json` is the single
+source of truth; `collector.py` reads it at startup and `reconcile()` re-syncs every
+live task to it every 5 minutes — so **editing the JSON changes cadence with no code
+change and no restart wait.**
 
-| Kind                | Source   | Poll interval | Priority | Frequency |
-|---------------------|----------|---------------|----------|-----------|
-| `macro`             | yfinance | 1 day         | 10       | daily     |
-| `bars`              | polygon  | 1 day sweep   | 20       | hourly    |
-| `implied_move`      | polygon  | 1 day         | 25       | snapshot  |
-| `quote`             | yfinance | **5 min**     | 30       | snapshot  |
-| `analyst`           | yfinance | 1 day         | 40       | snapshot  |
-| `analyst_revisions` | yfinance | 1 day         | 41       | event     |
-| `short`             | yfinance | 3 days        | 42       | snapshot  |
-| `insider`           | yfinance | 3 days        | 44       | event     |
-| `earn_date`         | yfinance | 1 day         | 45       | snapshot  |
-| `earn_report`       | yfinance | 1 day         | 46       | event     |
-| `statements`        | yfinance | 1 day         | 50       | event     |
-| `earn_analysis` (S2)| process  | 1 day         | 55       | —         |
-| `days_to_earn` (S2) | process  | 1 day         | 56       | —         |
+```jsonc
+{
+  "collection_window_local": [9, 23],     // only fire NEW jobs 09:00–23:00 local (London)
+  "live_only": ["quote"],                 // live-only signals collected first, always
+  "signals": {
+    "quote":  {"interval_sec": 3600, "fresh_sla": [3600, 7200]},
+    "bars":   {"interval_sec": 3600},
+    "short":  {"interval_sec": 3600},
+    ...
+  }
+}
+```
 
-### Native frequency per signal
+Current cadences:
 
-Every signal declares a **native frequency** (`register_kind(..., frequency=...)`); the
-poll interval, coverage mode, and freshness SLA all derive from it:
+| Signal(s) | Poll cadence | Why |
+|-----------|--------------|-----|
+| `quote` (LIVE) | **1 h** | live session-aware price — highest priority, never recoverable later |
+| `bars` | **1 h** | OHLCV incl. volume (daily EOD on the basic plan; hourly if the entitlement allows) |
+| `short`, `statements`, `analyst` | **1 h** | upstream updates bi-monthly/quarterly, but polled hourly to catch a new print fast; handlers **dedup** so identical values aren't re-stored |
+| `insider`, `sec_filings` | **1 d** | event-driven |
+| `macro`, `implied_move`, `analyst_revisions`, `earn_date`, `earn_report`, `xbrl`, `transcript` | **1 d** | daily default |
 
-| Signal | Frequency | Poll cadence | Coverage measured as |
-|--------|-----------|--------------|----------------------|
-| `bars` | **hourly** | daily backfill sweep | fraction of expected hourly points since Jul 1 2025 (~7/trading-day) |
-| `macro` | **daily** | daily | fraction of expected trading-day points |
-| `quote` | **snapshot** | **every 5 min** | tickers with a current value; freshness ≤5m green / ≤30m amber / >30m red |
-| `implied_move`, `analyst`, `earn_date` | **snapshot** | daily | tickers with a current value (accrues forward) |
-| `short` | **snapshot** | 3-day | tickers with the latest print (yfinance gives current only) |
-| `earn_report`, `statements`, `analyst_revisions`, `insider` | **event** | daily / 3-day | tickers covered + **all** records from source + span |
+### 1.2b Scheduling policy — live-first, latest, then backfill; windowed
 
-- **Fixed cadences** (`5min/hourly/daily/weekly`) are regular time series; coverage is a
-  true depth % against the expected point count.
-- **`event`** is irregular/undefined — collect **all new records from the last-collected
-  watermark to now** (e.g. earnings = every reported quarter, ~4–8 per stock, not just
-  the latest). Coverage is "covered + record count + span", never a fake fixed depth.
+`tick()` selects due tasks in this order (see the `ORDER BY`):
+
+1. **LIVE-only** signals (`live_only` in config) — first, because they can never be
+   recovered later.
+2. **Latest refresh** — already-collected tasks coming due (`last_ok` set): the newest
+   data for each signal.
+3. **Backfill** — never-collected gaps (`last_ok IS NULL`): filled last, with spare
+   capacity.
+
+**Collection window.** New routine jobs fire only inside `collection_window_local`
+(default **09:00–23:00**, machine-local = London; env `STOCK_COLLECT_WINDOW="9-23"`
+overrides). **Outside the window we shoot nothing new** — `tick()` runs *only* gap
+backfill (`last_ok IS NULL`), so idle overnight hours are spent completing earlier
+missing signals rather than re-polling unchanged data.
+
+- **`event`** signals collect **all new records from the last-collected watermark to
+  now** (e.g. earnings = every reported quarter). Coverage = "covered + record count +
+  span", never a fake fixed depth.
 - **`snapshot`** is point-in-time state re-sampled each poll; history accrues forward.
-
-**Backfill is a priority band, not a separate queue.** A backfill task is the same row
-with its priority boosted by `BACKFILL_PRIORITY_BOOST = 1000` (i.e. `priority - 1000`),
-so it runs **ahead of every routine refresh**. On first successful collection the
-priority is **restored to its routine base**, so it rejoins the normal cadence.
 
 ### 1.3 Declarative self-reconciliation (add a signal → auto-backfill)
 

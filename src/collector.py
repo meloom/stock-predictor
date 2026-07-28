@@ -29,6 +29,7 @@ Run modes:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone, date
@@ -40,6 +41,71 @@ from universe import UNIVERSE                             # noqa: E402
 
 DAY = 86400
 BACKFILL_PRIORITY_BOOST = 1000   # backfill tasks run ahead of every routine refresh
+
+# ── collection scheduling policy (config-driven) ─────────────────────────────
+# Per-signal cadence + policy live in config/collection.json (the single source of
+# truth); reconcile() re-syncs live tasks to it every 5 min, so editing the JSON changes
+# cadence with no code change. Defaults below apply only if the file is missing/broken.
+_CFG_PATH = Path(__file__).resolve().parents[1] / "config" / "collection.json"
+_DEFAULT_CFG = {"collection_window_local": [9, 23], "live_only": ["quote"], "signals": {}}
+
+
+def _load_collection_config() -> dict:
+    try:
+        cfg = json.loads(_CFG_PATH.read_text())
+        return {**_DEFAULT_CFG, **cfg}
+    except Exception:
+        return dict(_DEFAULT_CFG)
+
+
+COLLECTION_CFG = _load_collection_config()
+SIGNAL_CFG = COLLECTION_CFG.get("signals", {})
+# LIVE-only signals can never be recovered later, so they are always collected first.
+LIVE_ONLY = set(COLLECTION_CFG.get("live_only", ["quote"]))
+# New jobs fire only inside the local collection WINDOW (machine-local = London).
+# Env STOCK_COLLECT_WINDOW="9-23" overrides the config value if set.
+def _window():
+    env = os.environ.get("STOCK_COLLECT_WINDOW")
+    if env:
+        try:
+            a, b = (int(x) for x in env.split("-")); return a, b
+        except Exception:
+            pass
+    w = COLLECTION_CFG.get("collection_window_local", [9, 23])
+    return int(w[0]), int(w[1])
+COLLECT_WINDOW = _window()
+
+
+def _collect_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(COLLECTION_CFG.get("timezone", "Europe/London"))
+    except Exception:
+        return None                                        # fall back to machine-local
+COLLECT_TZ = _collect_tz()
+
+
+def _sig_interval(kind, default=None):
+    """Per-signal poll interval from config/collection.json (falls back to `default`)."""
+    return SIGNAL_CFG.get(kind, {}).get("interval_sec", default)
+
+
+def _sig_sla(kind, default=None):
+    v = SIGNAL_CFG.get(kind, {}).get("fresh_sla")
+    return tuple(v) if v else default
+
+
+def _cadence_label(iv) -> str:
+    """Human poll cadence from an interval in seconds, e.g. 3600 -> '1h', 86400 -> '1d'."""
+    if not iv:
+        return "?"
+    if iv < 3600:
+        return f"{iv // 60}m"
+    if iv < DAY:
+        return f"{iv // 3600}h"
+    if iv < 7 * DAY:
+        return f"{iv // DAY}d"
+    return f"{iv // (7 * DAY)}w"
 # Fixed history horizon: collect every backfillable signal from this date until now,
 # then keep accruing forward. History-mode fetch ranges and coverage expectations are
 # measured against this start, NOT a rolling window.
@@ -339,18 +405,39 @@ class Collector:
         return armed
 
     # ── worker ────────────────────────────────────────────────────────────────
+    def _in_window(self, now) -> bool:
+        """Are we inside the local collection window (default 09:00–23:00 machine-local)?
+        Outside it we shoot no new routine jobs — only complete missing gaps."""
+        lo, hi = COLLECT_WINDOW
+        try:
+            h = now.astimezone(COLLECT_TZ).hour            # -> configured tz (Europe/London)
+        except Exception:
+            h = now.hour
+        return lo <= h < hi
+
     def tick(self):
         """Run at most one due task whose source has quota. Returns a summary
-        dict, or None if nothing is runnable right now."""
+        dict, or None if nothing is runnable right now.
+
+        Scheduling policy: LIVE-only signals first (can't be recovered later), then the
+        LATEST refresh (already-collected tasks), then BACKFILL of never-collected gaps.
+        Outside the collection window we run ONLY gap backfill — no new routine jobs."""
         now = self._now()
         # ALL due tasks are candidates (no LIMIT): a rate-limited source at the top
         # of the priority order (e.g. 109 polygon tasks) must not starve the fast
         # sources below it — when its quota is spent we fall through to the next
         # source that still has quota.
-        rows = self.c.execute(
-            "SELECT task_id, source, kind, scope, interval_sec, attempts FROM collection_tasks "
-            "WHERE status='pending' AND next_due<=? ORDER BY priority ASC, next_due ASC",
-            (now.isoformat(),)).fetchall()
+        live_ph = ",".join("?" for _ in LIVE_ONLY) or "''"
+        q = ("SELECT task_id, source, kind, scope, interval_sec, attempts FROM collection_tasks "
+             "WHERE status='pending' AND next_due<=?")
+        params = [now.isoformat()]
+        if not self._in_window(now):
+            q += " AND last_ok IS NULL"                    # off-hours: only fill missing gaps
+        q += (f" ORDER BY CASE WHEN kind IN ({live_ph}) THEN 0 ELSE 1 END, "  # live-only first
+              "(last_ok IS NULL) ASC, "                    # latest refresh before old backfill
+              "priority ASC, next_due ASC")
+        params += list(LIVE_ONLY)
+        rows = self.c.execute(q, params).fetchall()
         for task_id, source, kind, scope, interval, attempts in rows:
             est = self.kinds.get(kind, {}).get("est_calls", 1)
             if self.available(source) < est:
@@ -722,15 +809,17 @@ class Collector:
                 cells = [round(len(buckets[i]) / U, 3) for i in range(n)]
             covered = len(set().union(*buckets)) if buckets else 0
             # display name = the TYPED TABLE name, so this matches the Raw-data-inspector
-            # dropdown and the typed store exactly (no kind-vs-table name drift).
+            # dropdown and the typed store exactly (no kind-vs-table name drift). cadence =
+            # the CONFIGURED poll interval (config/collection.json), the real expectation.
+            iv = k.get("interval")
             signals.append({"signal": table, "kind": kind, "source": k["source"],
-                            "cadence": k["frequency"], "cells": cells, "covered": covered,
+                            "cadence": _cadence_label(iv), "interval": iv or 10 ** 12,
+                            "cells": cells, "covered": covered,
                             "denom": (1 if market else U)})
-        order = {"5min": 0, "intraday": 0, "hourly": 0, "daily": 1, "weekly": 1,
-                 "snapshot": 2, "event": 3}
-        signals.sort(key=lambda s: (order.get(s["cadence"], 4), s["signal"]))
+        signals.sort(key=lambda s: (s["interval"], s["signal"]))  # fastest cadence first
         return {"weeks": labels, "n_weeks": n, "universe": U,
-                "window_start": start_iso, "signals": signals}
+                "window_start": start_iso, "signals": signals,
+                "collect_window": list(COLLECT_WINDOW)}
 
     def hourly_sources(self, hours: int = 72) -> dict:
         """Per-SOURCE collection activity, bucketed by hour (from each source's typed-table
@@ -887,10 +976,11 @@ def _h_short(scope, store, tid):
     _typed().put("short_interest", {"ticker": scope, "settlement_date": et,
                  "shares_short": si["shares_short"], "pct_float": si["pct_float"],
                  "days_to_cover": si["days_to_cover"], "change_pct": si["change_pct"]})
+    # dedup: bi-monthly print polled hourly — only write when the value actually changed
     for feat, key in (("short.shares", "shares_short"), ("short.pct_float", "pct_float"),
                       ("short.days_to_cover", "days_to_cover"), ("short.change_pct", "change_pct")):
         if si[key] is not None:
-            store.write(feat, scope, et, si[key], trigger_id=tid)
+            store.write_if_changed(feat, scope, et, si[key], trigger_id=tid)
     return 1, 1
 
 
@@ -933,7 +1023,8 @@ def _h_statements(scope, store, tid):
     sh = s1_data.fetch_shares_outstanding(scope)
     n = 0
     if sh is not None:
-        store.write("fundamental.shares_outstanding", scope, _today(), sh, trigger_id=tid); n += 1
+        # dedup: quarterly data polled hourly — write only when it changes
+        store.write_if_changed("fundamental.shares_outstanding", scope, _today(), sh, tid); n += 1
     if st is not None:
         # shares_outstanding travels WITH the statement at its publish_date, so S2 can
         # read a PIT-correct market cap at any historical date (the standalone snapshot
@@ -945,7 +1036,7 @@ def _h_statements(scope, store, tid):
             "total_equity": st.get("total_equity"), "gross_profit": st.get("gross_profit"),
             "total_assets": st.get("total_assets"), "free_cash_flow": st.get("free_cash_flow"),
             "trailing_eps": st.get("trailing_eps"), "shares_outstanding": sh})
-        store.write("fundamental.statements", scope, st["event_time"], st, trigger_id=tid); n += 1
+        store.write_if_changed("fundamental.statements", scope, st["event_time"], st, tid); n += 1
     return n, 1
 
 
@@ -1307,23 +1398,36 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
     col.register_source("transcript", limit=5, window_sec=60)   # paid transcript API
     # kind, source, interval, priority, handler, scope, est_calls
     # kind, source, priority, handler, frequency=…  (poll interval defaults to cadence)
-    col.register_kind("macro", "yfinance", 10, _h_macro, frequency="daily", scope="market", est_calls=3)
-    col.register_kind("bars", "polygon", 20, _h_bars_polygon, frequency="hourly", est_calls=1)  # intraday OHLCV
-    col.register_kind("implied_move", "polygon", 25, _h_implied_move, frequency="snapshot", est_calls=4)
-    # quote polled every 5 min; fresh ≤5m green, ≤30m yellow, >30m red
+    # Per-signal poll cadence comes from config/collection.json via _sig_interval().
+    col.register_kind("macro", "yfinance", 10, _h_macro, frequency="daily", scope="market",
+                      est_calls=3, interval_sec=_sig_interval("macro"))
+    col.register_kind("bars", "polygon", 20, _h_bars_polygon, frequency="hourly",
+                      est_calls=1, interval_sec=_sig_interval("bars"))
+    col.register_kind("implied_move", "polygon", 25, _h_implied_move, frequency="snapshot",
+                      est_calls=4, interval_sec=_sig_interval("implied_move"))
     col.register_kind("quote", "yfinance", 30, _h_quote, frequency="snapshot",
-                      interval_sec=300, fresh_sla=(300, 1800))
-    col.register_kind("analyst", "yfinance", 40, _h_analyst, frequency="snapshot")
-    col.register_kind("analyst_revisions", "yfinance", 41, _h_analyst_revisions, frequency="event")
-    col.register_kind("short", "yfinance", 42, _h_short, frequency="snapshot", interval_sec=3 * DAY)
-    col.register_kind("insider", "yfinance", 44, _h_insider, frequency="event", interval_sec=3 * DAY)
-    col.register_kind("earn_date", "yfinance", 45, _h_earn_date, frequency="snapshot")   # next-earnings date/time
-    col.register_kind("earn_report", "yfinance", 46, _h_earn_report, frequency="event")
-    col.register_kind("statements", "yfinance", 50, _h_statements, frequency="event")
+                      interval_sec=_sig_interval("quote", 3600), fresh_sla=_sig_sla("quote", (3600, 7200)))
+    col.register_kind("analyst", "yfinance", 40, _h_analyst, frequency="snapshot",
+                      interval_sec=_sig_interval("analyst"))
+    col.register_kind("analyst_revisions", "yfinance", 41, _h_analyst_revisions,
+                      frequency="event", interval_sec=_sig_interval("analyst_revisions"))
+    col.register_kind("short", "yfinance", 42, _h_short, frequency="snapshot",
+                      interval_sec=_sig_interval("short"))
+    col.register_kind("insider", "yfinance", 44, _h_insider, frequency="event",
+                      interval_sec=_sig_interval("insider"))
+    col.register_kind("earn_date", "yfinance", 45, _h_earn_date, frequency="snapshot",
+                      interval_sec=_sig_interval("earn_date"))
+    col.register_kind("earn_report", "yfinance", 46, _h_earn_report, frequency="event",
+                      interval_sec=_sig_interval("earn_report"))
+    col.register_kind("statements", "yfinance", 50, _h_statements, frequency="event",
+                      interval_sec=_sig_interval("statements"))
     # the REAL earnings report as document text + full financials (SEC EDGAR, free)
-    col.register_kind("sec_filings", "sec", 47, _h_sec_filings, frequency="event", est_calls=12)
-    col.register_kind("xbrl", "sec", 48, _h_xbrl, frequency="event", est_calls=1)
-    col.register_kind("transcript", "transcript", 49, _h_transcript, frequency="event")  # PAID, blocked until key set
+    col.register_kind("sec_filings", "sec", 47, _h_sec_filings, frequency="event",
+                      est_calls=12, interval_sec=_sig_interval("sec_filings"))
+    col.register_kind("xbrl", "sec", 48, _h_xbrl, frequency="event", est_calls=1,
+                      interval_sec=_sig_interval("xbrl"))
+    col.register_kind("transcript", "transcript", 49, _h_transcript, frequency="event",
+                      interval_sec=_sig_interval("transcript"))  # PAID, blocked until key set
     # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
     # they don't show on the data-collection dashboard. Each reads raw S1 data.
     col.register_kind("earn_analysis", "process", 55, _h_earn_analysis, frequency="daily", stage="S2")

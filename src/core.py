@@ -216,6 +216,21 @@ class FeatureStore:
              json.dumps(value), trigger_id))
         self._conn.commit()
 
+    def write_if_changed(self, feature: str, scope: str, event_time: str, value: Any,
+                         trigger_id: str, ingested_at: Optional[str] = None) -> bool:
+        """Write ONLY if the latest stored value for this exact (feature, scope,
+        event_time) differs — so polling slow-changing data (short interest, statements)
+        hourly doesn't accrue identical bitemporal rows. Returns True iff it wrote."""
+        if feature not in self._registry_cache:
+            raise UnregisteredFeatureError(f"{feature!r} is not registered")
+        row = self._conn.execute(
+            "SELECT value FROM feature_values WHERE feature=? AND scope=? AND event_time=? "
+            "ORDER BY ingested_at DESC LIMIT 1", (feature, scope, event_time)).fetchone()
+        if row is not None and row[0] == json.dumps(value):
+            return False
+        self.write(feature, scope, event_time, value, trigger_id, ingested_at)
+        return True
+
     def write_many(self, rows: list[tuple], trigger_id: str,
                    ingested_at: Optional[str] = None) -> int:
         """rows: [(feature, scope, event_time, value), ...] — one transaction."""
