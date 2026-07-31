@@ -17,6 +17,6 @@
     "earn_date":         {"interval_sec": 86400, "note": "next-earnings date snapshot, daily"},
     "earn_report":       {"interval_sec": 86400, "note": "earnings report raw, event-driven, daily"},
     "xbrl":              {"interval_sec": 86400, "note": "XBRL financials, event-driven, daily"},
-    "transcript":        {"interval_sec": 86400, "note": "earnings-call transcripts (PAID, blocked until key set)"}
+    "transcript":        {"interval_sec": 86400, "enabled": false, "note": "earnings-call transcripts (PAID, blocked). enabled=false => not collected, no failures. Set true once TRANSCRIPT_API_KEY exists."}
   }
 }

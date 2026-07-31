@@ -90,6 +90,13 @@ def _sig_interval(kind, default=None):
     return SIGNAL_CFG.get(kind, {}).get("interval_sec", default)
 
 
+def _sig_enabled(kind) -> bool:
+    """False if config/collection.json marks the signal disabled (e.g. blocked paid
+    source) — such kinds are not registered and their tasks are retired, so they stop
+    generating failures."""
+    return SIGNAL_CFG.get(kind, {}).get("enabled", True)
+
+
 def _sig_sla(kind, default=None):
     v = SIGNAL_CFG.get(kind, {}).get("fresh_sla")
     return tuple(v) if v else default
@@ -343,6 +350,15 @@ class Collector:
         tickers = tickers or list(UNIVERSE)
         now = self._now().isoformat()
         armed = 0
+        # retire tasks for kinds we no longer register (e.g. transcript disabled in
+        # config): mark them 'disabled' so they stop being selected and never fail again.
+        active = list(self.kinds)
+        if active:
+            self.c.execute(
+                f"UPDATE collection_tasks SET status='disabled', last_error='kind disabled' "
+                f"WHERE status='pending' AND kind NOT IN ({','.join('?' * len(active))})",
+                tuple(active))
+            self.c.commit()
         # entities actually present in the typed store, per kind (real coverage).
         # Only built for kinds that HAVE a typed table, so tests with plain kinds
         # never touch the typed store.
@@ -542,6 +558,45 @@ class Collector:
         errs = self.c.execute("SELECT task_id, last_error FROM collection_tasks "
                               "WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 5").fetchall()
         return {"by_status": by_status, "due_now": due, "quota": quota, "recent_errors": errs}
+
+    def doctor(self) -> dict:
+        """One-glance health for a human owner: is it collecting, if quiet WHY, and the
+        exact command to resume. Distinguishes 'healthy', 'idle off-hours' (normal), and
+        'stalled' (needs a resume) — so 'quiet' is never mistaken for 'dead'."""
+        import subprocess
+        now = self._now()
+
+        def age_min(ts):
+            try:
+                return (now - datetime.fromisoformat(ts)).total_seconds() / 60
+            except Exception:
+                return None
+        last_ok = self.c.execute("SELECT MAX(ts) FROM collection_events WHERE ok=1").fetchone()[0]
+        ok_age = age_min(last_ok)
+        in_win = self._in_window(now)
+        due = self.status()["due_now"]
+        alive = None
+        try:
+            out = subprocess.run(["launchctl", "list", "com.stockpredictor.collector"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            alive = '"PID"' in out
+        except Exception:
+            pass
+        if in_win and ok_age is not None and ok_age < 30:
+            verdict, why = "HEALTHY", f"collecting now — last success {ok_age:.0f} min ago"
+        elif not in_win:
+            verdict, why = "IDLE-OFFHOURS", (
+                f"outside the {COLLECT_WINDOW[0]:02d}:00-{COLLECT_WINDOW[1]:02d}:00 London window "
+                "— only completing backfill gaps. This is normal, not a failure.")
+        else:
+            verdict, why = "STALLED", (
+                f"in-window but no successful collection for "
+                f"{('∞' if ok_age is None else int(ok_age))} min — needs a resume.")
+        return {"verdict": verdict, "why": why, "daemon_running": alive,
+                "last_success": last_ok,
+                "last_success_min_ago": round(ok_age) if ok_age is not None else None,
+                "in_window": in_win, "window_london": list(COLLECT_WINDOW), "due_now": due,
+                "resume_cmd": "launchctl kickstart -k gui/$(id -u)/com.stockpredictor.collector"}
 
     def signal_detail(self, scope: str, feature: str, day_limit: int = 90, ts_limit: int = 300) -> dict:
         """Drill-down for one ticker × signal: daily density (points per event
@@ -822,52 +877,38 @@ class Collector:
                 "collect_window": list(COLLECT_WINDOW)}
 
     def hourly_sources(self, hours: int = 72) -> dict:
-        """Per-SOURCE collection activity, bucketed by hour (from each source's typed-table
-        `ingested_at` — the real record, since source_calls is a rolling rate window). Rows
-        collected per hour per source, for the last `hours`."""
+        """Per-SOURCE rows collected per hour, for the last `hours`.
+
+        Sourced from the IMMUTABLE `collection_events` log (one row per attempt, its own
+        `ts`), NOT from typed `ingested_at`: the typed store uses INSERT OR REPLACE, which
+        overwrites `ingested_at` to 'now' on every re-fetch, so a full re-collection stamps
+        the ENTIRE history with one timestamp and the ingested_at-based chart shows
+        'empty for days, then one giant spike'. The event log records what was actually
+        collected each hour and is never rewritten."""
         now = self._now()
         labels = [(now - timedelta(hours=h)).strftime("%m-%d %Hh") for h in range(hours - 1, -1, -1)]
         keys = [(now - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours - 1, -1, -1)]
+        idx = {k: i for i, k in enumerate(keys)}
         cutoff = (now - timedelta(hours=hours)).isoformat()
-        SRC = {"polygon": ["bars", "options_implied"],
-               "yfinance": ["quotes", "macro", "short_interest", "earnings_reports",
-                            "earnings_calendar", "insider_transactions", "analyst_revisions",
-                            "fundamentals"],
-               "sec": ["sec_filings", "xbrl_financials"]}
-        ts = _typed()
-        out = {}
-        for src, tables in SRC.items():
-            counts = {k: 0 for k in keys}
-            for tb in tables:
-                try:
-                    for hk, n in ts.c.execute(
-                            f"SELECT substr(ingested_at,1,13), COUNT(*) FROM {tb} "
-                            f"WHERE ingested_at > ? GROUP BY substr(ingested_at,1,13)", (cutoff,)):
-                        if hk in counts:
-                            counts[hk] += n
-                except Exception:
-                    pass
-            out[src] = [counts[k] for k in keys]
-
-        # per-hour FAILURE + attempt counts from the persistent event log — this is what
-        # colors the chart red. (Rows-written above stays typed-derived so history before
-        # the event log existed still renders.) A source with no events table yet -> zeros.
-        fails = {s: {k: 0 for k in keys} for s in SRC}
-        attempts = {s: {k: 0 for k in keys} for s in SRC}
+        SRC = ["polygon", "yfinance", "sec"]
+        out = {s: [0] * hours for s in SRC}
+        fails = {s: [0] * hours for s in SRC}
+        attempts = {s: [0] * hours for s in SRC}
         try:
-            for src, hk, nfail, natt in self.c.execute(
-                    "SELECT source, substr(ts,1,13), SUM(ok=0), COUNT(*) FROM collection_events "
-                    "WHERE ts > ? GROUP BY source, substr(ts,1,13)", (cutoff,)):
-                if src in fails and hk in fails[src]:
-                    fails[src][hk] = nfail or 0
-                    attempts[src][hk] = natt or 0
+            for src, hk, nrows, nfail, natt in self.c.execute(
+                    "SELECT source, substr(ts,1,13), SUM(CASE WHEN ok=1 THEN rows ELSE 0 END), "
+                    "SUM(ok=0), COUNT(*) FROM collection_events WHERE ts > ? "
+                    "GROUP BY source, substr(ts,1,13)", (cutoff,)):
+                i = idx.get(hk)
+                if src in out and i is not None:
+                    out[src][i] = nrows or 0
+                    fails[src][i] = nfail or 0
+                    attempts[src][i] = natt or 0
         except Exception:
             pass
-        fails_l = {s: [fails[s][k] for k in keys] for s in SRC}
-        attempts_l = {s: [attempts[s][k] for k in keys] for s in SRC}
-        return {"labels": labels, "sources": out, "fails": fails_l, "attempts": attempts_l,
+        return {"labels": labels, "sources": out, "fails": fails, "attempts": attempts,
                 "totals": {s: sum(v) for s, v in out.items()},
-                "fail_totals": {s: sum(v) for s, v in fails_l.items()}}
+                "fail_totals": {s: sum(v) for s, v in fails.items()}}
 
 
 # ═══════════════ handlers — one unit of work each -> (n_rows, n_calls) ═════════
@@ -1426,8 +1467,9 @@ def default_collector(db_path=DEFAULT_DB, store=None, now_fn=None) -> Collector:
                       est_calls=12, interval_sec=_sig_interval("sec_filings"))
     col.register_kind("xbrl", "sec", 48, _h_xbrl, frequency="event", est_calls=1,
                       interval_sec=_sig_interval("xbrl"))
-    col.register_kind("transcript", "transcript", 49, _h_transcript, frequency="event",
-                      interval_sec=_sig_interval("transcript"))  # PAID, blocked until key set
+    if _sig_enabled("transcript"):                             # PAID, blocked until key set
+        col.register_kind("transcript", "transcript", 49, _h_transcript, frequency="event",
+                          interval_sec=_sig_interval("transcript"))
     # PROCESSED (derived) — S2 signal generation, NOT S1 collection. Tagged S2 so
     # they don't show on the data-collection dashboard. Each reads raw S1 data.
     col.register_kind("earn_analysis", "process", 55, _h_earn_analysis, frequency="daily", stage="S2")
@@ -1460,9 +1502,21 @@ def _cli():
     p_dr = sub.add_parser("drain"); p_dr.add_argument("--seconds", type=float, default=55)
     sub.add_parser("run")
     sub.add_parser("status")
+    sub.add_parser("doctor")
     sub.add_parser("coverage")
     args = ap.parse_args()
     col = default_collector()
+    if args.cmd == "doctor":
+        d = col.doctor()
+        icon = {"HEALTHY": "OK ", "IDLE-OFFHOURS": "IDLE", "STALLED": "!! "}.get(d["verdict"], "?")
+        print(f"\n  [{icon}] {d['verdict']} — {d['why']}\n")
+        print(f"  daemon running : {d['daemon_running']}")
+        print(f"  last success   : {d['last_success']}  ({d['last_success_min_ago']} min ago)")
+        print(f"  window (London): {d['window_london'][0]:02d}:00-{d['window_london'][1]:02d}:00"
+              f"   ·   in-window now: {d['in_window']}")
+        print(f"  tasks due now  : {d['due_now']}")
+        print(f"\n  To resume if STALLED:\n    {d['resume_cmd']}\n")
+        sys.exit(0 if d["verdict"] != "STALLED" else 1)
     if args.cmd in ("seed", "reconcile"):
         n = col.reconcile()
         print(f"reconciled: armed {n} prioritized backfill task(s)")

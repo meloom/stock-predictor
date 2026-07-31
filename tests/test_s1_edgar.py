@@ -23,11 +23,14 @@ def test_xbrl_concepts_cover_the_core_statements():
 
 
 def test_sec_signals_registered_as_event_frequency():
-    from collector import default_collector, KIND_TABLE
+    from collector import default_collector, KIND_TABLE, _sig_enabled
     col = default_collector()
-    for kind, table in (("sec_filings", "sec_filings"), ("xbrl", "xbrl_financials"),
-                        ("transcript", "transcripts")):
+    for kind, table in (("sec_filings", "sec_filings"), ("xbrl", "xbrl_financials")):
         assert col.kinds[kind]["frequency"] == "event"
         assert KIND_TABLE[kind] == table
     assert col.kinds["sec_filings"]["source"] == "sec"
-    assert col.kinds["transcript"]["source"] == "transcript"   # paid, separate source
+    # transcript is a PAID/blocked source, disabled in config -> NOT registered (so it
+    # can't spam failures). KIND_TABLE still maps it for when it's re-enabled.
+    assert KIND_TABLE["transcript"] == "transcripts"
+    assert _sig_enabled("transcript") is False
+    assert "transcript" not in col.kinds
