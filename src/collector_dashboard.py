@@ -125,68 +125,8 @@ def render(report: dict, tickers: list[str]) -> str:
     # coverage replaced the old tickers×signals freshness heatmap)
     shown = [t for t in tickers if t in mat] + [t for t in tickers if t not in mat]
 
-    # full queue schedule — per signal × ticker × time
-    # hourly collection activity per source (last 72h)
-    hy = report.get("hourly", {"labels": [], "sources": {}, "totals": {}})
-    SRC_CLS = {"polygon": "#3b82c4", "yfinance": "#3fb27f", "sec": "#c9930b"}
-    RED, OKC, IDLE = "#e5484d", "#3fb27f", "var(--line)"
-    hlabels = hy["labels"]
-    srcs = list(hy["sources"].keys())
-    n_h = len(hlabels)
-    fails = hy.get("fails", {s: [0] * n_h for s in srcs})
-    attempts = hy.get("attempts", {s: [0] * n_h for s in srcs})
-    totals_h = [sum(hy["sources"][s][i] for s in srcs) for i in range(n_h)]
-    fail_h = [sum(fails.get(s, [0] * n_h)[i] for s in srcs) for i in range(n_h)]
-    att_h = [sum(attempts.get(s, [0] * n_h)[i] for s in srcs) for i in range(n_h)]
-    hmax = max(totals_h + [1])
-    BW, GAP, PLOT_H, PAD_L, PAD_T = 12, 3, 190, 52, 12
-    STRIP_Y, STRIP_H, PAD_B = PLOT_H + 8, 9, 62          # status strip sits below the bars
-    plot_w = n_h * (BW + GAP)
-    svg_w = PAD_L + plot_w + 12
-    svg_h = PAD_T + PLOT_H + PAD_B
-
-    def _fmt(n):
-        return f"{n/1000:.0f}k" if n >= 1000 else str(n)
-    grid = ""
-    for f in (0, .25, .5, .75, 1):
-        y = PAD_T + PLOT_H - f * PLOT_H
-        grid += (f'<line x1="{PAD_L}" y1="{y:.1f}" x2="{PAD_L+plot_w}" y2="{y:.1f}" '
-                 f'class="hgrid"/><text x="{PAD_L-8}" y="{y+3:.1f}" class="hyl">{_fmt(int(f*hmax))}</text>')
-    grid += f'<text x="{PAD_L-8}" y="{PAD_T+STRIP_Y+STRIP_H}" class="hyl">ok?</text>'
-    bars = ""
-    for i in range(n_h):
-        x = PAD_L + i * (BW + GAP)
-        y0 = PAD_T + PLOT_H
-        # green volume bars (rows written), stacked per source
-        vol = " · ".join(f'{s} {hy["sources"][s][i]:,}' for s in srcs if hy["sources"][s][i])
-        state = "FAILING" if fail_h[i] else ("ok" if (att_h[i] or totals_h[i]) else "idle (nothing due)")
-        tip = (f'{hlabels[i]} — {state}'
-               f'{" · rows: " + vol if vol else ""}'
-               f'{f" · {fail_h[i]}/{att_h[i]} attempts FAILED" if fail_h[i] else ""}')
-        seg = f'<title>{tip}</title>'
-        for s in srcs:
-            v = hy["sources"][s][i]
-            if v <= 0:
-                continue
-            h = v / hmax * PLOT_H
-            y0 -= h
-            seg += f'<rect x="{x}" y="{y0:.1f}" width="{BW}" height="{h:.1f}" fill="{SRC_CLS[s]}"/>'
-        # status strip: red = a failure this hour, green = attempts all ok, grey = idle
-        sc = RED if fail_h[i] else (OKC if (att_h[i] or totals_h[i]) else IDLE)
-        seg += (f'<rect x="{x}" y="{PAD_T+STRIP_Y}" width="{BW}" height="{STRIP_H}" rx="1.5" '
-                f'fill="{sc}"/>')
-        bars += f'<g class="hbar">{seg}</g>'
-        if (n_h - 1 - i) % 6 == 0:
-            bars += (f'<text x="{x+BW/2:.1f}" y="{PAD_T+STRIP_Y+STRIP_H+14}" class="hxl">{hlabels[i]}</text>')
-    fail_total = sum(fail_h)
-    legend = "".join(f'<span class="hleg"><i style="background:{SRC_CLS[s]}"></i>{s} '
-                     f'<b>{hy["totals"].get(s,0):,}</b></span>' for s in srcs)
-    legend += (f'<span class="hleg"><i style="background:{OKC}"></i>ok hr</span>'
-               f'<span class="hleg"><i style="background:{RED}"></i>failing hr '
-               f'<b>{fail_total}</b></span>'
-               f'<span class="hleg"><i style="background:{IDLE}"></i>idle hr</span>')
-    hchart_svg = (f'<svg viewBox="0 0 {svg_w} {svg_h}" width="{svg_w}" height="{svg_h}" '
-                  f'class="hchart" role="img">{grid}{bars}</svg>')
+    # The hourly success/error chart is now client-rendered (period-selectable, hourly
+    # bars, per-hour success/error/idle composition) via /api/hourly — see the JS below.
 
     def _ts(iso):   # ISO -> 'YYYY-MM-DD HH:MM' (minute level)
         return iso[:16].replace("T", " ") if iso else "—"
@@ -298,9 +238,20 @@ def render(report: dict, tickers: list[str]) -> str:
     <th>Ticker</th><th>Rows</th><th>Status</th></tr></thead><tbody>{areq}</tbody></table></div>
   </section>
   <section class="quota"><span class="lbl">Rate-limit quota</span>{quota}</section>
-  <section class="panel"><h2>Download rate &amp; failures per source <span class="muted">— bars = rows collected per hour (last 72h). Strip below each bar: green = attempts ok, <b style="color:#e5484d">red = a collection FAILED that hour</b>, grey = idle (nothing due). Hover for detail.</span></h2>
-    <div class="hlegend">{legend}</div>
-    <div class="hwrap">{hchart_svg}</div></section>
+  <section class="panel"><h2>Collection success/error per hour
+    <span class="muted">— one bar per hour; each bar shows the % of attempts that <b class="cvg">succeeded</b> /
+    <b class="cvr">failed</b> / were <b class="cvn">idle</b> that hour. Pick a period. Hover for counts.</span></h2>
+    <div class="hbtns">
+      <button class="hbtn on" data-h="24" onclick="loadHourly(24,this)">1 day</button>
+      <button class="hbtn" data-h="168" onclick="loadHourly(168,this)">7 days</button>
+      <button class="hbtn" data-h="336" onclick="loadHourly(336,this)">2 weeks</button>
+      <button class="hbtn" data-h="672" onclick="loadHourly(672,this)">4 weeks</button>
+      <button class="hbtn" data-h="2160" onclick="loadHourly(2160,this)">90 days</button>
+      <span id="hsum" class="muted"></span>
+    </div>
+    <div class="hlegend"><span><i class="cvc g"></i>success</span><span><i class="cvc r"></i>error</span>
+      <span><i class="cvc n"></i>idle (no attempts)</span></div>
+    <div id="hout" class="hwrap"><div class="muted" style="padding:12px">loading…</div></div></section>
 
   <section class="panel"><h2>Coverage vs expectation
     <span class="muted">— <b class="hist">history</b> = % of the expected daily window backfilled ·
@@ -396,7 +347,32 @@ async function showTyped(){{
   out.innerHTML='<div class="dmeta mono">'+esc(table)+(ticker?' \\u00b7 '+esc(ticker):'')+' \\u2014 '+d.rows.length+' rows \\u00b7 source-timestamp column: <b>'+esc(d.ts_col)+'</b></div>'+
     '<div class="tswrap"><table class="ts"><thead><tr>'+th+'</tr></thead><tbody>'+tr+'</tbody></table></div>';
 }}
-document.addEventListener('DOMContentLoaded',function(){{loadTicker();showTyped();}});
+async function loadHourly(hours, btn){{
+  document.querySelectorAll('.hbtn').forEach(function(b){{b.classList.remove('on');}});
+  (btn||document.querySelector('.hbtn[data-h="'+hours+'"]')||{{classList:{{add:function(){{}}}}}}).classList.add('on');
+  var out=document.getElementById('hout');
+  out.innerHTML='<div class="muted" style="padding:12px">loading '+hours+'h of download activity\\u2026</div>';
+  var d=await (await fetch('/api/hourly?hours='+hours)).json();
+  var labels=d.labels, n=labels.length, srcs=Object.keys(d.sources);
+  var CW = n>500?3:(n>200?4:(n>72?7:14));
+  var bars='', okHrs=0, failHrs=0, idleHrs=0;
+  for(var i=0;i<n;i++){{
+    var a=0,f=0,rw=0;
+    srcs.forEach(function(s){{a+=(d.attempts[s]||[])[i]||0; f+=(d.fails[s]||[])[i]||0; rw+=(d.sources[s]||[])[i]||0;}});
+    var ok=a-f, segs, tip;
+    if(a===0){{ idleHrs++; segs='<i class="hc n" style="height:100%"></i>'; tip=labels[i]+' \\u2014 idle (no download attempts)'; }}
+    else {{
+      if(f>0) failHrs++; else okHrs++;
+      segs='<i class="hc r" style="height:'+(100*f/a).toFixed(1)+'%"></i>'+
+           '<i class="hc g" style="height:'+(100*ok/a).toFixed(1)+'%"></i>';
+      tip=labels[i]+' (download time) \\u2014 '+ok+'/'+a+' ok'+(f?', '+f+' FAILED':'')+' \\u00b7 '+rw.toLocaleString()+' rows';
+    }}
+    bars+='<div class="hcol" style="width:'+CW+'px" title="'+tip+'">'+segs+'</div>';
+  }}
+  document.getElementById('hsum').textContent=n+' hours \\u00b7 '+okHrs+' ok \\u00b7 '+failHrs+' with errors \\u00b7 '+idleHrs+' idle';
+  out.innerHTML='<div class="hcomp">'+bars+'</div>';
+}}
+document.addEventListener('DOMContentLoaded',function(){{loadTicker();showTyped();loadHourly(24);}});
 </script>"""
 
 
@@ -460,6 +436,16 @@ td.detail{font-size:12px;color:var(--mut);max-width:340px}
 .cell.fresh{background:var(--fresh)}.cell.aging{background:var(--aging)}.cell.stale{background:var(--stale)}
 .cell.miss{background:var(--miss);border:1px solid var(--line)}
 .filter{width:100%;max-width:340px;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
+/* hourly success/error composition chart */
+.hbtns{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.hbtn{padding:4px 11px;border-radius:6px;border:1px solid var(--line);background:var(--bg);
+  color:var(--mut);font-size:12px;cursor:pointer;font-family:inherit}
+.hbtn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.hwrap{overflow-x:auto;padding-bottom:4px}
+.hcomp{display:flex;align-items:flex-end;gap:1px;height:180px;min-width:max-content}
+.hcol{height:100%;display:flex;flex-direction:column;background:var(--miss);border-radius:1px;overflow:hidden}
+.hc{display:block;width:100%}
+.hc.g{background:var(--fresh)}.hc.r{background:var(--stale)}.hc.n{background:var(--miss)}
 /* liveness banner + API quota */
 .livebanner{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;margin-bottom:18px;
   font-weight:600;font-size:14px;border:1px solid var(--line)}
@@ -1317,6 +1303,14 @@ def serve(port=8787):
                 q = parse_qs(parsed.query)
                 payload = _json.dumps(col.typed_rows(
                     q.get("table", [""])[0], q.get("ticker", [""])[0] or None)).encode()
+                ctype = "application/json"
+            elif path == "/api/hourly":                # hourly success/error composition (period-selectable)
+                q = parse_qs(parsed.query)
+                try:
+                    hrs = max(1, min(2160, int(q.get("hours", ["24"])[0])))
+                except Exception:
+                    hrs = 24
+                payload = _json.dumps(col.hourly_sources(hours=hrs), default=str).encode()
                 ctype = "application/json"
             elif path == "/data-collection":          # THIS pipeline step's dashboard
                 payload = _page(col.coverage_report(), UNIVERSE, auto_refresh=0).encode()
