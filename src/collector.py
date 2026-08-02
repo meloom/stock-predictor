@@ -999,6 +999,51 @@ class Collector:
                 "window_start": start_iso, "signals": signals,
                 "collect_window": list(COLLECT_WINDOW)}
 
+    def coverage_stock(self, ticker: str, weeks: int = 13) -> dict:
+        """Per-STOCK coverage by DATA timestamp (event_time, NOT collection time): for one
+        ticker, each S1 signal × week bucket = how many records we hold dated in that week
+        (from the typed store's data-date column). Answers 'how much data do we actually
+        have for this stock at each point in time'."""
+        ticker = (ticker or "").upper()
+        end = self._now().date()
+        start = end - timedelta(weeks=weeks)
+        start = start - timedelta(days=start.weekday())
+        n = (end - start).days // 7 + 1
+        labels = [(start + timedelta(weeks=i)).isoformat() for i in range(n)]
+
+        def bucket(dstr):
+            try:
+                i = (date.fromisoformat(dstr[:10]) - start).days // 7
+            except Exception:
+                return None
+            return i if 0 <= i < n else None
+        ts = _typed()
+        start_iso = start.isoformat()
+        signals = []
+        for kind, k in self.kinds.items():
+            if k.get("stage") != "S1" or k["scope"] == "market":   # per-stock skips macro
+                continue
+            table, dc = KIND_TABLE.get(kind), S1_DATECOL.get(kind)
+            if not table or not dc:
+                continue
+            cells = [0] * n
+            try:
+                for dstr, cnt in ts.c.execute(
+                        f"SELECT substr({dc},1,10), COUNT(*) FROM {table} "
+                        f"WHERE ticker=? AND substr({dc},1,10) >= ? GROUP BY substr({dc},1,10)",
+                        (ticker, start_iso)):
+                    bi = bucket(dstr)
+                    if bi is not None:
+                        cells[bi] += cnt
+            except Exception:
+                pass
+            iv = k.get("interval")
+            signals.append({"signal": table, "kind": kind, "source": k["source"],
+                            "cadence": _cadence_label(iv), "interval": iv or 10 ** 12,
+                            "cells": cells, "total": sum(cells)})
+        signals.sort(key=lambda s: (s["interval"], s["signal"]))
+        return {"ticker": ticker, "weeks": labels, "n_weeks": n, "signals": signals}
+
     def hourly_sources(self, hours: int = 72) -> dict:
         """Per-SOURCE rows collected per hour, for the last `hours`.
 

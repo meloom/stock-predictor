@@ -269,7 +269,11 @@ def render(report: dict, tickers: list[str]) -> str:
     that week (<span style="color:hsl(120,55%,44%)">green</span>=all →
     <span style="color:hsl(0,55%,44%)">red</span>=none). Event signals are sparse by nature — read their
     <b>covered</b> count, not weekly density.</span></h2>
-    {s1cov_html}
+    <div class="cvctrl"><label class="muted" style="font-size:12px">view:</label>
+      <select id="covtk" class="filter" onchange="loadStockCov()">
+        <option value="__all__">All tickers (universe)</option>{drill_opts}</select>
+      <span id="covsum" class="muted"></span></div>
+    <div id="s1cov">{s1cov_html}</div>
   </section>
 
   <section class="panel"><h2>Queue schedule <span class="muted">— every task by ticker × signal × next-run ({len(report["queue"])} tasks)</span></h2>
@@ -371,6 +375,35 @@ async function loadHourly(hours, btn){{
   }}
   document.getElementById('hsum').textContent=n+' hours \\u00b7 '+okHrs+' ok \\u00b7 '+failHrs+' with errors \\u00b7 '+idleHrs+' idle';
   out.innerHTML='<div class="hcomp">'+bars+'</div>';
+}}
+var _UNIV_COV=null;
+async function loadStockCov(){{
+  var tk=document.getElementById('covtk').value;
+  var host=document.getElementById('s1cov'), sum=document.getElementById('covsum');
+  if(_UNIV_COV===null) _UNIV_COV=host.innerHTML;         // stash the server universe matrix
+  if(tk==='__all__'){{ host.innerHTML=_UNIV_COV; sum.textContent=''; return; }}
+  host.innerHTML='<div class="muted" style="padding:12px">loading '+tk+'\\u2026</div>';
+  var d=await (await fetch('/api/coverage-stock?ticker='+encodeURIComponent(tk))).json();
+  var wl=d.weeks, n=wl.length;
+  var mx=1; d.signals.forEach(function(s){{s.cells.forEach(function(v){{if(v>mx)mx=v;}});}});
+  var whead=''; for(var i=0;i<n;i++) whead+='<i class="s1hc">'+((n-1-i)%3===0?wl[i].slice(5):'')+'</i>';
+  var rows='';
+  d.signals.forEach(function(s){{
+    var cells='';
+    for(var i=0;i<n;i++){{
+      var v=s.cells[i];
+      var bg = v>0 ? 'hsl(140,55%,'+(44-Math.min(18,Math.round(18*v/mx)))+'%)' : 'var(--miss)';
+      cells+='<i class="s1c" style="background:'+bg+'" title="week of '+wl[i]+' \\u2014 '+v+' record(s)"></i>';
+    }}
+    rows+='<div class="s1row"><div class="s1lab"><span class="s1feat">'+s.signal+'</span>'+
+      '<span class="s1cad">'+s.cadence+'\\u00b7'+s.source+'</span></div>'+
+      '<div class="s1cov '+(s.total>0?'ok':'bad')+'">'+s.total+'</div>'+
+      '<div class="s1strip">'+cells+'</div></div>';
+  }});
+  sum.textContent=tk+': data counts by the DATA timestamp (not collection time)';
+  host.innerHTML='<div class="s1wrap"><div class="s1grid"><div class="s1row s1head">'+
+    '<div class="s1lab">signal</div><div class="s1cov">records</div>'+
+    '<div class="s1strip">'+whead+'</div></div>'+rows+'</div></div>';
 }}
 document.addEventListener('DOMContentLoaded',function(){{loadTicker();showTyped();loadHourly(24);}});
 </script>"""
@@ -1303,6 +1336,11 @@ def serve(port=8787):
                 q = parse_qs(parsed.query)
                 payload = _json.dumps(col.typed_rows(
                     q.get("table", [""])[0], q.get("ticker", [""])[0] or None)).encode()
+                ctype = "application/json"
+            elif path == "/api/coverage-stock":        # per-stock coverage by DATA timestamp
+                q = parse_qs(parsed.query)
+                tk = (q.get("ticker", [""])[0] or UNIVERSE[0]).upper()
+                payload = _json.dumps(col.coverage_stock(tk), default=str).encode()
                 ctype = "application/json"
             elif path == "/api/hourly":                # hourly success/error composition (period-selectable)
                 q = parse_qs(parsed.query)
