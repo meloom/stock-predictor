@@ -202,7 +202,23 @@ CREATE TABLE IF NOT EXISTS collection_events (  -- persistent per-attempt outcom
 );
 CREATE INDEX IF NOT EXISTS idx_events ON collection_events (ts);
 CREATE INDEX IF NOT EXISTS idx_events_src ON collection_events (source, ts);
+CREATE TABLE IF NOT EXISTS daemon_state (   -- single-row liveness heartbeat (always fresh)
+    id INTEGER PRIMARY KEY CHECK (id=1),
+    ts TEXT NOT NULL, state TEXT, note TEXT
+);
+CREATE TABLE IF NOT EXISTS source_health (  -- per-source circuit breaker for flaky APIs
+    source TEXT PRIMARY KEY,
+    consec_fails INTEGER NOT NULL DEFAULT 0,
+    breaker_until TEXT,                     -- if set and in the future, the source is skipped
+    last_error TEXT, updated_at TEXT
+);
 """
+
+# ── flaky-API circuit breaker ────────────────────────────────────────────────
+BREAKER_THRESHOLD = 5        # consecutive failures on a source before the breaker opens
+BREAKER_BASE = 120           # first cooldown 2 min, doubling per extra failure …
+BREAKER_CAP = 1800           # … capped at 30 min
+HEARTBEAT_STALE_S = 180      # daemon heartbeat older than this ⇒ treated as not-alive
 
 
 def load_secret(name: str) -> str | None:
@@ -458,6 +474,8 @@ class Collector:
             est = self.kinds.get(kind, {}).get("est_calls", 1)
             if self.available(source) < est:
                 continue                                   # strict: don't start without quota
+            if self._breaker_open(source, now):
+                continue                                   # source quarantined (flaky) — skip it
             handler = self.handlers.get((source, kind))
             if handler is None:
                 self._set(task_id, status="disabled", last_error="no handler"); continue
@@ -465,6 +483,7 @@ class Collector:
             try:
                 n_rows, n_calls = handler(scope, self.store, tid)
                 self._record_calls(source, n_calls)
+                self._breaker_record(source, True, now)    # success closes the breaker
                 # on success, restore the kind's BASE priority (a backfill task
                 # drops back to routine-refresh priority once it has data).
                 base_prio = self.kinds.get(kind, {}).get("priority")
@@ -475,6 +494,7 @@ class Collector:
                 self._record_calls(source, 1)
                 err = f"{type(e).__name__}: {e}"
                 self._backoff(task_id, attempts, now, err)
+                self._breaker_record(source, False, now, err)   # trip the breaker if it keeps failing
                 self._log_event(now, source, kind, scope, 0, 0, err)
                 return {"task": task_id, "error": str(e)}
         return None
@@ -512,13 +532,71 @@ class Collector:
             # network hiccup, or a bad handler must be swallowed so it self-recovers and
             # keeps draining. (Handlers already back off per-task; this is the last line.)
             try:
-                idle = self.tick() is None
+                r = self.tick()
+                idle = r is None
             except Exception as e:                           # noqa: BLE001
                 sys.stderr.write(f"[collector] tick error (recovering): {e!r}\n")
                 sys.stderr.flush()
                 idle = True
+            # ALWAYS beat, even when idle — so the daemon proves it is alive overnight
+            # (idle-by-design) instead of looking dead. This is the signal doctor/health
+            # and the dashboard read to distinguish 'quiet' from 'stopped'.
+            try:
+                if idle:
+                    state = "idle-offhours" if not self._in_window(self._now()) else "idle-caught-up"
+                    self._heartbeat(state, "no work due" if state == "idle-caught-up"
+                                    else f"outside {COLLECT_WINDOW[0]:02d}-{COLLECT_WINDOW[1]:02d} window")
+                else:
+                    self._heartbeat("collecting")
+            except Exception:                                # noqa: BLE001
+                pass
             if idle:
                 time.sleep(sleep)
+
+    # ── liveness heartbeat (proves the daemon is alive even when idle) ─────────
+    def _heartbeat(self, state: str, note: str = "") -> None:
+        self.c.execute("INSERT OR REPLACE INTO daemon_state VALUES (1,?,?,?)",
+                       (self._now().isoformat(), state, note))
+        self.c.commit()
+
+    def heartbeat(self) -> dict | None:
+        row = self.c.execute("SELECT ts, state, note FROM daemon_state WHERE id=1").fetchone()
+        if not row:
+            return None
+        try:
+            age = (self._now() - datetime.fromisoformat(row[0])).total_seconds()
+        except Exception:
+            age = None
+        return {"ts": row[0], "state": row[1], "note": row[2], "age_s": age,
+                "alive": age is not None and age < HEARTBEAT_STALE_S}
+
+    # ── circuit breaker: quarantine a source that keeps failing (flaky API) ────
+    def _breaker_open(self, source: str, now) -> bool:
+        row = self.c.execute("SELECT breaker_until FROM source_health WHERE source=?",
+                             (source,)).fetchone()
+        return bool(row and row[0] and row[0] > now.isoformat())
+
+    def _breaker_record(self, source: str, ok: bool, now, err: str | None = None) -> None:
+        if ok:                                             # success closes the breaker
+            self.c.execute("INSERT OR REPLACE INTO source_health VALUES (?,0,NULL,NULL,?)",
+                           (source, now.isoformat()))
+        else:
+            row = self.c.execute("SELECT consec_fails FROM source_health WHERE source=?",
+                                 (source,)).fetchone()
+            fails = (row[0] if row else 0) + 1
+            until = None
+            if fails >= BREAKER_THRESHOLD:                  # OPEN the breaker with backoff
+                cd = min(BREAKER_CAP, BREAKER_BASE * (2 ** (fails - BREAKER_THRESHOLD)))
+                until = (now + timedelta(seconds=cd)).isoformat()
+            self.c.execute("INSERT OR REPLACE INTO source_health VALUES (?,?,?,?,?)",
+                           (source, fails, until, (err or "")[:200], now.isoformat()))
+        self.c.commit()
+
+    def source_health(self) -> list[dict]:
+        return [{"source": s, "consec_fails": cf, "breaker_until": bu,
+                 "open": bool(bu and bu > self._now().isoformat()), "last_error": le}
+                for s, cf, bu, le in self.c.execute(
+                    "SELECT source, consec_fails, breaker_until, last_error FROM source_health")]
 
     # ── task state transitions ────────────────────────────────────────────────
     def _reschedule(self, task_id, interval, now, n_rows, base_priority=None):
@@ -575,27 +653,35 @@ class Collector:
         ok_age = age_min(last_ok)
         in_win = self._in_window(now)
         due = self.status()["due_now"]
-        alive = None
-        try:
-            out = subprocess.run(["launchctl", "list", "com.stockpredictor.collector"],
-                                 capture_output=True, text=True, timeout=5).stdout
-            alive = '"PID"' in out
-        except Exception:
-            pass
-        if in_win and ok_age is not None and ok_age < 30:
-            verdict, why = "HEALTHY", f"collecting now — last success {ok_age:.0f} min ago"
+        hb = self.heartbeat()                              # the always-on liveness pulse
+        beating = bool(hb and hb["alive"])
+        breakers = [s for s in self.source_health() if s["open"]]
+        # Verdict is driven by the HEARTBEAT (alive?) first, then whether it should be
+        # collecting. A fresh heartbeat while idle overnight = healthy, NOT stopped.
+        if not beating:
+            verdict, why = "STALLED", (
+                f"no heartbeat for {('∞' if not hb else int(hb['age_s'] // 60))} min — the "
+                "daemon is not running. Resume it (below). The health agent also auto-recovers this.")
         elif not in_win:
             verdict, why = "IDLE-OFFHOURS", (
-                f"outside the {COLLECT_WINDOW[0]:02d}:00-{COLLECT_WINDOW[1]:02d}:00 London window "
-                "— only completing backfill gaps. This is normal, not a failure.")
+                f"ALIVE (heartbeat {int(hb['age_s'])}s ago), idle by design — outside the "
+                f"{COLLECT_WINDOW[0]:02d}:00-{COLLECT_WINDOW[1]:02d}:00 London window. Normal, not a failure.")
+        elif ok_age is not None and ok_age < 30:
+            verdict, why = "HEALTHY", f"collecting now — last success {ok_age:.0f} min ago"
+        elif due == 0:
+            verdict, why = "IDLE-CAUGHT-UP", (
+                f"ALIVE (heartbeat {int(hb['age_s'])}s ago), in-window but nothing due — all "
+                "caught up. Normal.")
         else:
             verdict, why = "STALLED", (
-                f"in-window but no successful collection for "
-                f"{('∞' if ok_age is None else int(ok_age))} min — needs a resume.")
-        return {"verdict": verdict, "why": why, "daemon_running": alive,
+                f"ALIVE but stuck — in-window, {due} tasks due, no success for "
+                f"{('∞' if ok_age is None else int(ok_age))} min. Resume it.")
+        return {"verdict": verdict, "why": why,
+                "heartbeat": hb, "beating": beating,
                 "last_success": last_ok,
                 "last_success_min_ago": round(ok_age) if ok_age is not None else None,
                 "in_window": in_win, "window_london": list(COLLECT_WINDOW), "due_now": due,
+                "open_breakers": breakers,
                 "resume_cmd": "launchctl kickstart -k gui/$(id -u)/com.stockpredictor.collector"}
 
     def signal_detail(self, scope: str, feature: str, day_limit: int = 90, ts_limit: int = 300) -> dict:
@@ -1508,14 +1594,20 @@ def _cli():
     col = default_collector()
     if args.cmd == "doctor":
         d = col.doctor()
-        icon = {"HEALTHY": "OK ", "IDLE-OFFHOURS": "IDLE", "STALLED": "!! "}.get(d["verdict"], "?")
+        hb = d.get("heartbeat") or {}
+        icon = {"HEALTHY": "OK ", "IDLE-OFFHOURS": "IDLE", "IDLE-CAUGHT-UP": "IDLE",
+                "STALLED": "!! "}.get(d["verdict"], "?")
         print(f"\n  [{icon}] {d['verdict']} — {d['why']}\n")
-        print(f"  daemon running : {d['daemon_running']}")
+        print(f"  heartbeat      : {'ALIVE' if d['beating'] else 'NO PULSE'} "
+              f"({'—' if hb.get('age_s') is None else str(int(hb['age_s']))+'s ago'}, "
+              f"state={hb.get('state')})")
         print(f"  last success   : {d['last_success']}  ({d['last_success_min_ago']} min ago)")
         print(f"  window (London): {d['window_london'][0]:02d}:00-{d['window_london'][1]:02d}:00"
-              f"   ·   in-window now: {d['in_window']}")
-        print(f"  tasks due now  : {d['due_now']}")
-        print(f"\n  To resume if STALLED:\n    {d['resume_cmd']}\n")
+              f"   ·   in-window now: {d['in_window']}   ·   tasks due: {d['due_now']}")
+        if d["open_breakers"]:
+            print(f"  FLAKY sources  : {', '.join(b['source']+' (open)' for b in d['open_breakers'])}")
+        print(f"\n  To resume if STALLED:\n    {d['resume_cmd']}")
+        print("  (the health agent also AUTO-recovers a stalled daemon every 5 min)\n")
         sys.exit(0 if d["verdict"] != "STALLED" else 1)
     if args.cmd in ("seed", "reconcile"):
         n = col.reconcile()

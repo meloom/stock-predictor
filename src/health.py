@@ -9,6 +9,7 @@ recency). Detects STALLS, records them to a persistent SQL log, and fires an ale
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -110,9 +111,38 @@ def _notify(title, msg):
         pass
 
 
+def watchdog(db_path=DEFAULT_DB) -> dict:
+    """AUTO-RECOVERY. Reads the collector's own verdict (doctor); if the daemon is STALLED
+    (no heartbeat, or alive-but-stuck in-window), kickstart it via launchd. Runs from the
+    health agent every 5 min, so the collector self-heals with NO human and NO Claude."""
+    try:
+        import collector as C
+        d = C.default_collector(db_path).doctor()
+    except Exception as e:                                       # noqa: BLE001
+        return {"verdict": "UNKNOWN", "action": None, "error": str(e)}
+    action = None
+    if d["verdict"] == "STALLED":
+        try:
+            subprocess.run(["launchctl", "kickstart", "-k",
+                            f"gui/{os.getuid()}/com.stockpredictor.collector"],
+                           timeout=15, capture_output=True)
+            action = "auto-kickstarted the collector daemon"
+            c = _conn(db_path)
+            c.execute("INSERT INTO health_alerts VALUES (?,?,?,?)",
+                      (datetime.now(timezone.utc).isoformat(), "critical", "STALLED",
+                       f"watchdog {action}: {d['why']}"))
+            c.commit()
+            _notify("stock-predictor: watchdog recovered collector", d["why"])
+        except Exception as e:                                   # noqa: BLE001
+            action = f"kickstart failed: {e}"
+    return {"verdict": d["verdict"], "action": action, "beating": d.get("beating")}
+
+
 def alert(db_path=DEFAULT_DB) -> dict:
     """Check health; on a change into DEGRADED/STALLED (or recovery) record it to the SQL
-    alert log and fire a notification. Idempotent — only fires on state TRANSITIONS."""
+    alert log and fire a notification. Idempotent — only fires on state TRANSITIONS. Also
+    runs the watchdog so a stalled daemon is auto-recovered."""
+    watchdog(db_path)                                            # auto-recover if stalled
     c = _conn(db_path)
     h = health(db_path)
     prev = c.execute("SELECT verdict FROM health_alerts ORDER BY rowid DESC LIMIT 1").fetchone()
