@@ -218,6 +218,40 @@ def render(report: dict, tickers: list[str]) -> str:
     drill_json = _json.dumps(DRILL_FEATURES)
     tbl_opts = "".join(f"<option>{t}</option>" for t in TYPED_SCHEMA)
 
+    # ── liveness banner (always answers 'is it alive') ──────────────────────────
+    hb = report.get("heartbeat") or {}
+    alive = bool(hb.get("alive"))
+    hb_age = hb.get("age_s")
+    hb_state = hb.get("state", "?")
+    live_cls = "ok" if alive else "bad"
+    live_txt = (f"COLLECTOR ALIVE — pulse {int(hb_age)}s ago · {hb_state}"
+                if alive else "COLLECTOR NOT RESPONDING — no heartbeat (watchdog will auto-recover)")
+    live_banner = f'<div class="livebanner {live_cls}"><span class="livedot"></span>{live_txt}</div>'
+
+    # ── API quota per source ────────────────────────────────────────────────────
+    qrows_api = ""
+    for q in report.get("quota_status", []):
+        w = f"{q['window_s']}s"
+        bar_cls = "hi" if q["pct"] >= 90 else ("mid" if q["pct"] >= 60 else "lo")
+        brk = ' <span class="chip crit">breaker OPEN</span>' if q["breaker_open"] else ""
+        qrows_api += (
+            f'<tr><td class="mono">{q["source"]}</td>'
+            f'<td class="mono">{q["used_now"]}/{q["limit"]} per {w}</td>'
+            f'<td><div class="qbar"><i class="{bar_cls}" style="width:{min(100,q["pct"])}%"></i></div></td>'
+            f'<td class="mono num">{q["req_24h"]:,}</td>'
+            f'<td class="mono num">{q["ok_24h"]:,}</td>'
+            f'<td class="mono num">{q["fail_24h"]:,}{brk}</td></tr>')
+
+    # ── recent API request log ──────────────────────────────────────────────────
+    areq = ""
+    for a in report.get("api_access", []):
+        st = "ok" if a["ok"] else "err"
+        err = f' · <span class="muted">{(a["error"] or "")[:60]}</span>' if not a["ok"] else ""
+        areq += (f'<tr class="{st}"><td class="mono muted">{a["ts"][11:19]}</td>'
+                 f'<td class="mono">{a["source"]}</td><td class="mono">{a["kind"]}</td>'
+                 f'<td class="mono">{a["ticker"]}</td><td class="mono num">{a["rows"]}</td>'
+                 f'<td><span class="tag {"done" if a["ok"] else "err"}">{"ok" if a["ok"] else "FAIL"}</span>{err}</td></tr>')
+
     # ── universe-wide S1 coverage matrix (server-rendered; typed store; weekly) ──
     sc = report.get("s1_coverage", {"weeks": [], "signals": [], "universe": 0})
     U = sc["universe"]; wl = sc["weeks"]; nW = len(wl)
@@ -253,7 +287,16 @@ def render(report: dict, tickers: list[str]) -> str:
     <div class="gen mono">live · {report["generated_at"][:19].replace("T", " ")} UTC</div>
   </header>
   {_flow_nav("S1")}
+  {live_banner}
   <section class="cards">{card_html}</section>
+  <section class="panel"><h2>API quota per source <span class="muted">— rate limit, live usage, and 24h request volume/health per provider (yahoo, polygon, sec…)</span></h2>
+    <table class="queue"><thead><tr><th>Source</th><th>Limit &amp; usage now</th><th></th>
+    <th>Req 24h</th><th>OK</th><th>Fail</th></tr></thead><tbody>{qrows_api}</tbody></table>
+  </section>
+  <section class="panel"><h2>Recent download requests <span class="muted">— last 6h, newest first · each API request logged (source · signal · ticker · rows · status)</span></h2>
+    <div class="qwrap"><table class="qsched"><thead><tr><th>Time</th><th>Source</th><th>Signal</th>
+    <th>Ticker</th><th>Rows</th><th>Status</th></tr></thead><tbody>{areq}</tbody></table></div>
+  </section>
   <section class="quota"><span class="lbl">Rate-limit quota</span>{quota}</section>
   <section class="panel"><h2>Download rate &amp; failures per source <span class="muted">— bars = rows collected per hour (last 72h). Strip below each bar: green = attempts ok, <b style="color:#e5484d">red = a collection FAILED that hour</b>, grey = idle (nothing due). Hover for detail.</span></h2>
     <div class="hlegend">{legend}</div>
@@ -417,6 +460,16 @@ td.detail{font-size:12px;color:var(--mut);max-width:340px}
 .cell.fresh{background:var(--fresh)}.cell.aging{background:var(--aging)}.cell.stale{background:var(--stale)}
 .cell.miss{background:var(--miss);border:1px solid var(--line)}
 .filter{width:100%;max-width:340px;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);font-size:13px;font-family:ui-monospace,monospace}
+/* liveness banner + API quota */
+.livebanner{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;margin-bottom:18px;
+  font-weight:600;font-size:14px;border:1px solid var(--line)}
+.livebanner.ok{background:color-mix(in srgb,var(--fresh) 14%,var(--panel));color:var(--fresh)}
+.livebanner.bad{background:color-mix(in srgb,var(--stale) 16%,var(--panel));color:var(--stale)}
+.livedot{width:10px;height:10px;border-radius:50%;background:currentColor;animation:pulse 2.4s infinite}
+.qbar{width:120px;height:10px;border-radius:5px;background:var(--miss);overflow:hidden}
+.qbar i{display:block;height:100%}
+.qbar i.lo{background:var(--fresh)}.qbar i.mid{background:var(--aging)}.qbar i.hi{background:var(--stale)}
+.qsched tr.err td{background:color-mix(in srgb,var(--stale) 8%,transparent)}
 /* universe-wide S1 coverage matrix */
 .s1wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;max-height:600px;overflow-y:auto}
 .s1grid{min-width:620px}

@@ -598,6 +598,40 @@ class Collector:
                 for s, cf, bu, le in self.c.execute(
                     "SELECT source, consec_fails, breaker_until, last_error FROM source_health")]
 
+    # ── API quota + access log (per source: yahoo, polygon, sec …) ─────────────
+    def quota_status(self) -> list[dict]:
+        """Per-source rate limit + live usage + recent request volume/health. `used` is the
+        calls in the current rolling window (the same ledger the limiter enforces)."""
+        now = self._now()
+        bh = self.source_health()
+        bmap = {b["source"]: b for b in bh}
+        out = []
+        for src, (limit, window) in sorted(self.limits.items()):
+            used = limit - self.available(src)
+            since24 = (now - timedelta(hours=24)).isoformat()
+            row = self.c.execute(
+                "SELECT COUNT(*), SUM(ok=1), SUM(ok=0), MAX(ts) FROM collection_events "
+                "WHERE source=? AND ts>?", (src, since24)).fetchone()
+            out.append({"source": src, "limit": limit, "window_s": window,
+                        "used_now": used, "pct": round(100 * used / limit) if limit else 0,
+                        "req_24h": row[0] or 0, "ok_24h": row[1] or 0, "fail_24h": row[2] or 0,
+                        "last_req": row[3], "breaker_open": bmap.get(src, {}).get("open", False)})
+        return out
+
+    def api_access(self, hours: int = 6, source: str | None = None, limit: int = 400) -> list[dict]:
+        """Recent per-request access log (one row per collection attempt) from the persistent
+        event log — ts, source, kind, ticker, rows, ok/fail, error. Newest first."""
+        cut = (self._now() - timedelta(hours=hours)).isoformat()
+        q = ("SELECT ts, source, kind, scope, ok, rows, error FROM collection_events "
+             "WHERE ts>?")
+        params: list = [cut]
+        if source:
+            q += " AND source=?"; params.append(source)
+        q += " ORDER BY ts DESC LIMIT ?"; params.append(limit)
+        return [{"ts": ts, "source": s, "kind": k, "ticker": sc, "ok": bool(ok),
+                 "rows": r, "error": e}
+                for ts, s, k, sc, ok, r, e in self.c.execute(q, params)]
+
     # ── task state transitions ────────────────────────────────────────────────
     def _reschedule(self, task_id, interval, now, n_rows, base_priority=None):
         nowi = now.isoformat()
@@ -898,7 +932,10 @@ class Collector:
                             "data_points": total_rows, "due_now": self.status()["due_now"]},
                 "kinds": kinds, "signals": signals, "matrix_cols": cols, "matrix": matrix,
                 "queue": queue, "hourly": self.hourly_sources(),
-                "s1_coverage": self.coverage_matrix()}
+                "s1_coverage": self.coverage_matrix(),
+                "quota_status": self.quota_status(),
+                "api_access": self.api_access(hours=6, limit=150),
+                "heartbeat": self.heartbeat()}
 
     def coverage_matrix(self, weeks: int = 13) -> dict:
         """UNIVERSE-WIDE S1 coverage over weekly buckets — the /data-collection view.
